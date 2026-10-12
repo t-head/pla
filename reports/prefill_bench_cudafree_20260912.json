@@ -1,0 +1,621 @@
+{
+  "provenance": {
+    "timestamp": "2026-09-12 23:55:57 +0800",
+    "device_name": "ZW-M890P",
+    "device_count": 1,
+    "torch_version": "2.11.0",
+    "python_version": "3.12.3",
+    "hostname": "sz01t-swu450.eng.t-head.cn",
+    "git_commit": "343274ec0b8b25d0c69b78192dff3f5ee8738e01",
+    "dtype": "bfloat16",
+    "warmup": 5,
+    "repeat": 20,
+    "head_dim": 128,
+    "gdn_gate": "relative L2 <= 0.02",
+    "kda_gate": "assert_close(atol=0.02, rtol=0.01)"
+  },
+  "records": [
+    {
+      "family": "gdn",
+      "batch": 1,
+      "num_v_heads": 16,
+      "num_k_heads": 8,
+      "seq_len": 2048,
+      "total_tokens": 2048,
+      "triton_ms": 0.3547700047492981,
+      "pla_ms": 0.3016750067472458,
+      "speedup": 1.1760006524058428,
+      "output_rel_err": 0.00602037413045764,
+      "state_rel_err": 0.005142497830092907,
+      "within_tol": true
+    },
+    {
+      "family": "gdn",
+      "batch": 1,
+      "num_v_heads": 16,
+      "num_k_heads": 8,
+      "seq_len": 4096,
+      "total_tokens": 4096,
+      "triton_ms": 0.5934049785137177,
+      "pla_ms": 0.4698050022125244,
+      "speedup": 1.263087825202169,
+      "output_rel_err": 0.006074653007090092,
+      "state_rel_err": 0.005158901214599609,
+      "within_tol": true
+    },
+    {
+      "family": "gdn",
+      "batch": 1,
+      "num_v_heads": 16,
+      "num_k_heads": 8,
+      "seq_len": 8192,
+      "total_tokens": 8192,
+      "triton_ms": 1.0234249830245972,
+      "pla_ms": 0.7896250188350677,
+      "speedup": 1.2960898636854923,
+      "output_rel_err": 0.006094531621783972,
+      "state_rel_err": 0.005138034466654062,
+      "within_tol": true
+    },
+    {
+      "family": "gdn",
+      "batch": 4,
+      "num_v_heads": 16,
+      "num_k_heads": 8,
+      "seq_len": 2048,
+      "total_tokens": 8192,
+      "triton_ms": 0.9012849926948547,
+      "pla_ms": 0.4587250053882599,
+      "speedup": 1.9647609833957425,
+      "output_rel_err": 0.006035847123712301,
+      "state_rel_err": 0.005174620077013969,
+      "within_tol": true
+    },
+    {
+      "family": "gdn",
+      "batch": 4,
+      "num_v_heads": 16,
+      "num_k_heads": 8,
+      "seq_len": 4096,
+      "total_tokens": 16384,
+      "triton_ms": 1.7259250283241272,
+      "pla_ms": 0.8666050136089325,
+      "speedup": 1.9915936340324183,
+      "output_rel_err": 0.006094749551266432,
+      "state_rel_err": 0.00518384762108326,
+      "within_tol": true
+    },
+    {
+      "family": "gdn",
+      "batch": 8,
+      "num_v_heads": 16,
+      "num_k_heads": 8,
+      "seq_len": 2048,
+      "total_tokens": 16384,
+      "triton_ms": 1.7038699984550476,
+      "pla_ms": 0.8696649968624115,
+      "speedup": 1.9592256841453797,
+      "output_rel_err": 0.006036699749529362,
+      "state_rel_err": 0.005188680253922939,
+      "within_tol": true
+    },
+    {
+      "family": "gdn",
+      "batch": 1,
+      "num_v_heads": 32,
+      "num_k_heads": 16,
+      "seq_len": 2048,
+      "total_tokens": 2048,
+      "triton_ms": 0.48223499953746796,
+      "pla_ms": 0.3712100088596344,
+      "speedup": 1.2990894319334354,
+      "output_rel_err": 0.006039795000106096,
+      "state_rel_err": 0.005169596988707781,
+      "within_tol": true
+    },
+    {
+      "family": "gdn",
+      "batch": 1,
+      "num_v_heads": 32,
+      "num_k_heads": 16,
+      "seq_len": 4096,
+      "total_tokens": 4096,
+      "triton_ms": 0.7979350090026855,
+      "pla_ms": 0.6549649834632874,
+      "speedup": 1.2182865178278834,
+      "output_rel_err": 0.006092154886573553,
+      "state_rel_err": 0.0051492732018232346,
+      "within_tol": true
+    },
+    {
+      "family": "gdn",
+      "batch": 1,
+      "num_v_heads": 32,
+      "num_k_heads": 16,
+      "seq_len": 8192,
+      "total_tokens": 8192,
+      "triton_ms": 1.4842649698257446,
+      "pla_ms": 1.2596500515937805,
+      "speedup": 1.1783153328559537,
+      "output_rel_err": 0.006114027928560972,
+      "state_rel_err": 0.005162516608834267,
+      "within_tol": true
+    },
+    {
+      "family": "gdn",
+      "batch": 1,
+      "num_v_heads": 32,
+      "num_k_heads": 16,
+      "seq_len": 16384,
+      "total_tokens": 16384,
+      "triton_ms": 2.943915009498596,
+      "pla_ms": 2.4678049087524414,
+      "speedup": 1.1929285816141943,
+      "output_rel_err": 0.006117543205618858,
+      "state_rel_err": 0.005153618287295103,
+      "within_tol": true
+    },
+    {
+      "family": "gdn",
+      "batch": 4,
+      "num_v_heads": 32,
+      "num_k_heads": 16,
+      "seq_len": 2048,
+      "total_tokens": 8192,
+      "triton_ms": 1.499364972114563,
+      "pla_ms": 0.8680349886417389,
+      "speedup": 1.7273093731632871,
+      "output_rel_err": 0.006043223198503256,
+      "state_rel_err": 0.005187650211155415,
+      "within_tol": true
+    },
+    {
+      "family": "gdn",
+      "batch": 4,
+      "num_v_heads": 32,
+      "num_k_heads": 16,
+      "seq_len": 4096,
+      "total_tokens": 16384,
+      "triton_ms": 2.944445013999939,
+      "pla_ms": 1.696839988231659,
+      "speedup": 1.735252018116603,
+      "output_rel_err": 0.006090265233069658,
+      "state_rel_err": 0.005180850625038147,
+      "within_tol": true
+    },
+    {
+      "family": "gdn",
+      "batch": 8,
+      "num_v_heads": 32,
+      "num_k_heads": 16,
+      "seq_len": 2048,
+      "total_tokens": 16384,
+      "triton_ms": 2.8348499536514282,
+      "pla_ms": 1.6404699683189392,
+      "speedup": 1.7280718381918458,
+      "output_rel_err": 0.006039845757186413,
+      "state_rel_err": 0.005176139995455742,
+      "within_tol": true
+    },
+    {
+      "family": "kda",
+      "tp": 1,
+      "num_heads": 96,
+      "batch": 1,
+      "seq_lens": [
+        512
+      ],
+      "ragged": false,
+      "total_tokens": 512,
+      "triton_ms": 0.6202600002288818,
+      "pla_ms": 0.9270800054073334,
+      "speedup": 0.669046896288478,
+      "output_rel_err": 0.06490135937929153,
+      "state_rel_err": 0.00432923249900341,
+      "within_tol": true
+    },
+    {
+      "family": "kda",
+      "tp": 1,
+      "num_heads": 96,
+      "batch": 1,
+      "seq_lens": [
+        1024
+      ],
+      "ragged": false,
+      "total_tokens": 1024,
+      "triton_ms": 1.0860349535942078,
+      "pla_ms": 1.7607150077819824,
+      "speedup": 0.6168147308304673,
+      "output_rel_err": 0.06479806452989578,
+      "state_rel_err": 0.00436860928311944,
+      "within_tol": true
+    },
+    {
+      "family": "kda",
+      "tp": 1,
+      "num_heads": 96,
+      "batch": 1,
+      "seq_lens": [
+        2048
+      ],
+      "ragged": false,
+      "total_tokens": 2048,
+      "triton_ms": 2.002205014228821,
+      "pla_ms": 3.4289849996566772,
+      "speedup": 0.5839060288771427,
+      "output_rel_err": 0.06431026011705399,
+      "state_rel_err": 0.004607210401445627,
+      "within_tol": true
+    },
+    {
+      "family": "kda",
+      "tp": 1,
+      "num_heads": 96,
+      "batch": 1,
+      "seq_lens": [
+        4096
+      ],
+      "ragged": false,
+      "total_tokens": 4096,
+      "triton_ms": 3.9428999423980713,
+      "pla_ms": 6.771704912185669,
+      "speedup": 0.5822610396538147,
+      "output_rel_err": 0.06446214765310287,
+      "state_rel_err": 0.004499233793467283,
+      "within_tol": true
+    },
+    {
+      "family": "kda",
+      "tp": 1,
+      "num_heads": 96,
+      "batch": 1,
+      "seq_lens": [
+        8192
+      ],
+      "ragged": false,
+      "total_tokens": 8192,
+      "triton_ms": 8.06923532485962,
+      "pla_ms": 13.465049743652344,
+      "speedup": 0.5992725967212706,
+      "output_rel_err": 0.06446117162704468,
+      "state_rel_err": 0.004542948212474585,
+      "within_tol": true
+    },
+    {
+      "family": "kda",
+      "tp": 1,
+      "num_heads": 96,
+      "batch": 4,
+      "seq_lens": [
+        4096,
+        137,
+        2048,
+        63
+      ],
+      "ragged": true,
+      "total_tokens": 6344,
+      "triton_ms": 6.168085098266602,
+      "pla_ms": 10.347970008850098,
+      "speedup": 0.5960671603214301,
+      "output_rel_err": 0.06537747383117676,
+      "state_rel_err": 0.004237149842083454,
+      "within_tol": true
+    },
+    {
+      "family": "kda",
+      "tp": 2,
+      "num_heads": 48,
+      "batch": 1,
+      "seq_lens": [
+        512
+      ],
+      "ragged": false,
+      "total_tokens": 512,
+      "triton_ms": 0.3746800124645233,
+      "pla_ms": 0.4978349953889847,
+      "speedup": 0.7526188715836782,
+      "output_rel_err": 0.06464871764183044,
+      "state_rel_err": 0.0039845858700573444,
+      "within_tol": true
+    },
+    {
+      "family": "kda",
+      "tp": 2,
+      "num_heads": 48,
+      "batch": 1,
+      "seq_lens": [
+        1024
+      ],
+      "ragged": false,
+      "total_tokens": 1024,
+      "triton_ms": 0.630744993686676,
+      "pla_ms": 0.9234099984169006,
+      "speedup": 0.6830606066298056,
+      "output_rel_err": 0.06428391486406326,
+      "state_rel_err": 0.0043549141846597195,
+      "within_tol": true
+    },
+    {
+      "family": "kda",
+      "tp": 2,
+      "num_heads": 48,
+      "batch": 1,
+      "seq_lens": [
+        2048
+      ],
+      "ragged": false,
+      "total_tokens": 2048,
+      "triton_ms": 1.101235032081604,
+      "pla_ms": 1.7872450351715088,
+      "speedup": 0.6161634305370592,
+      "output_rel_err": 0.065089650452137,
+      "state_rel_err": 0.004165558144450188,
+      "within_tol": true
+    },
+    {
+      "family": "kda",
+      "tp": 2,
+      "num_heads": 48,
+      "batch": 1,
+      "seq_lens": [
+        4096
+      ],
+      "ragged": false,
+      "total_tokens": 4096,
+      "triton_ms": 2.053225040435791,
+      "pla_ms": 3.511975049972534,
+      "speedup": 0.5846354291303546,
+      "output_rel_err": 0.06430234760046005,
+      "state_rel_err": 0.004483336582779884,
+      "within_tol": true
+    },
+    {
+      "family": "kda",
+      "tp": 2,
+      "num_heads": 48,
+      "batch": 1,
+      "seq_lens": [
+        8192
+      ],
+      "ragged": false,
+      "total_tokens": 8192,
+      "triton_ms": 4.061254978179932,
+      "pla_ms": 7.4256250858306885,
+      "speedup": 0.5469243237083802,
+      "output_rel_err": 0.0637212023139,
+      "state_rel_err": 0.0039047168102115393,
+      "within_tol": true
+    },
+    {
+      "family": "kda",
+      "tp": 2,
+      "num_heads": 48,
+      "batch": 4,
+      "seq_lens": [
+        4096,
+        137,
+        2048,
+        63
+      ],
+      "ragged": true,
+      "total_tokens": 6344,
+      "triton_ms": 3.091889977455139,
+      "pla_ms": 6.279124975204468,
+      "speedup": 0.4924077781003965,
+      "output_rel_err": 0.06483733654022217,
+      "state_rel_err": 0.004270902369171381,
+      "within_tol": true
+    },
+    {
+      "family": "kda",
+      "tp": 4,
+      "num_heads": 24,
+      "batch": 1,
+      "seq_lens": [
+        512
+      ],
+      "ragged": false,
+      "total_tokens": 512,
+      "triton_ms": 0.26876001060009,
+      "pla_ms": 0.43363000452518463,
+      "speedup": 0.6197910840933998,
+      "output_rel_err": 0.0643501803278923,
+      "state_rel_err": 0.004162563942372799,
+      "within_tol": true
+    },
+    {
+      "family": "kda",
+      "tp": 4,
+      "num_heads": 24,
+      "batch": 1,
+      "seq_lens": [
+        1024
+      ],
+      "ragged": false,
+      "total_tokens": 1024,
+      "triton_ms": 0.368695005774498,
+      "pla_ms": 0.7927149832248688,
+      "speedup": 0.4651041213761322,
+      "output_rel_err": 0.06358986347913742,
+      "state_rel_err": 0.004324582405388355,
+      "within_tol": true
+    },
+    {
+      "family": "kda",
+      "tp": 4,
+      "num_heads": 24,
+      "batch": 1,
+      "seq_lens": [
+        2048
+      ],
+      "ragged": false,
+      "total_tokens": 2048,
+      "triton_ms": 0.6259450018405914,
+      "pla_ms": 1.5154699683189392,
+      "speedup": 0.41303688949701295,
+      "output_rel_err": 0.06372052431106567,
+      "state_rel_err": 0.004013929050415754,
+      "within_tol": true
+    },
+    {
+      "family": "kda",
+      "tp": 4,
+      "num_heads": 24,
+      "batch": 1,
+      "seq_lens": [
+        4096
+      ],
+      "ragged": false,
+      "total_tokens": 4096,
+      "triton_ms": 1.0912449955940247,
+      "pla_ms": 2.9704400300979614,
+      "speedup": 0.36736812880818764,
+      "output_rel_err": 0.06478594988584518,
+      "state_rel_err": 0.00398151995614171,
+      "within_tol": true
+    },
+    {
+      "family": "kda",
+      "tp": 4,
+      "num_heads": 24,
+      "batch": 1,
+      "seq_lens": [
+        8192
+      ],
+      "ragged": false,
+      "total_tokens": 8192,
+      "triton_ms": 2.0387450456619263,
+      "pla_ms": 5.892065048217773,
+      "speedup": 0.3460153662557755,
+      "output_rel_err": 0.06454338133335114,
+      "state_rel_err": 0.004179243464022875,
+      "within_tol": true
+    },
+    {
+      "family": "kda",
+      "tp": 4,
+      "num_heads": 24,
+      "batch": 4,
+      "seq_lens": [
+        4096,
+        137,
+        2048,
+        63
+      ],
+      "ragged": true,
+      "total_tokens": 6344,
+      "triton_ms": 1.6050049662590027,
+      "pla_ms": 5.856435060501099,
+      "speedup": 0.2740583562659145,
+      "output_rel_err": 0.0650714710354805,
+      "state_rel_err": 0.004269114229828119,
+      "within_tol": true
+    },
+    {
+      "family": "kda",
+      "tp": 8,
+      "num_heads": 12,
+      "batch": 1,
+      "seq_lens": [
+        512
+      ],
+      "ragged": false,
+      "total_tokens": 512,
+      "triton_ms": 0.20632000267505646,
+      "pla_ms": 0.2286200001835823,
+      "speedup": 0.9024582386028391,
+      "output_rel_err": 0.0648309662938118,
+      "state_rel_err": 0.004425498191267252,
+      "within_tol": true
+    },
+    {
+      "family": "kda",
+      "tp": 8,
+      "num_heads": 12,
+      "batch": 1,
+      "seq_lens": [
+        1024
+      ],
+      "ragged": false,
+      "total_tokens": 1024,
+      "triton_ms": 0.3049999922513962,
+      "pla_ms": 0.4135650098323822,
+      "speedup": 0.7374898383570037,
+      "output_rel_err": 0.06259419769048691,
+      "state_rel_err": 0.0046460190787911415,
+      "within_tol": true
+    },
+    {
+      "family": "kda",
+      "tp": 8,
+      "num_heads": 12,
+      "batch": 1,
+      "seq_lens": [
+        2048
+      ],
+      "ragged": false,
+      "total_tokens": 2048,
+      "triton_ms": 0.3992599993944168,
+      "pla_ms": 0.7865049839019775,
+      "speedup": 0.5076382318820458,
+      "output_rel_err": 0.06483039259910583,
+      "state_rel_err": 0.0034399584401398897,
+      "within_tol": true
+    },
+    {
+      "family": "kda",
+      "tp": 8,
+      "num_heads": 12,
+      "batch": 1,
+      "seq_lens": [
+        4096
+      ],
+      "ragged": false,
+      "total_tokens": 4096,
+      "triton_ms": 0.6782949864864349,
+      "pla_ms": 1.5209200382232666,
+      "speedup": 0.4459767571205234,
+      "output_rel_err": 0.064141646027565,
+      "state_rel_err": 0.003292446257546544,
+      "within_tol": true
+    },
+    {
+      "family": "kda",
+      "tp": 8,
+      "num_heads": 12,
+      "batch": 1,
+      "seq_lens": [
+        8192
+      ],
+      "ragged": false,
+      "total_tokens": 8192,
+      "triton_ms": 1.1962199807167053,
+      "pla_ms": 2.2427600622177124,
+      "speedup": 0.5333695747791429,
+      "output_rel_err": 0.06488968431949615,
+      "state_rel_err": 0.004331742879003286,
+      "within_tol": true
+    },
+    {
+      "family": "kda",
+      "tp": 8,
+      "num_heads": 12,
+      "batch": 4,
+      "seq_lens": [
+        4096,
+        137,
+        2048,
+        63
+      ],
+      "ragged": true,
+      "total_tokens": 6344,
+      "triton_ms": 0.8647550046443939,
+      "pla_ms": 3.0781149864196777,
+      "speedup": 0.2809365499533327,
+      "output_rel_err": 0.06559539586305618,
+      "state_rel_err": 0.004417912103235722,
+      "within_tol": true
+    }
+  ]
+}

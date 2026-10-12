@@ -1,0 +1,453 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>KDA Decode Fusion — Optimization Summary & Performance Comparison</title>
+<style>
+:root {
+  --bg: #0d1117; --panel: #161b22; --panel2: #1c2230; --border: #30363d;
+  --fg: #e6edf3; --dim: #8b949e; --muted: #6e7681;
+  --accent: #58a6ff; --accent-dim: #1f6feb;
+  --green: #3fb950; --green-dim: #1b3d24;
+  --yellow: #d29922; --yellow-dim: #3d2f10;
+  --red: #f85149; --red-dim: #3d1a1a;
+  --code: #79c0ff; --key: #ffa657; --str: #a5d6ff;
+}
+* { box-sizing: border-box; }
+html, body { background: var(--bg); color: var(--fg); font-family: -apple-system, "Helvetica Neue", "PingFang SC", "Microsoft YaHei", Arial, sans-serif; margin: 0; padding: 0; line-height: 1.55; }
+.wrap { max-width: 1200px; margin: 0 auto; padding: 32px 24px 96px; }
+h1 { font-size: 26px; margin: 0 0 4px; letter-spacing: 0.3px; }
+h2 { font-size: 20px; margin: 32px 0 12px; padding-bottom: 6px; border-bottom: 1px solid var(--border); color: var(--accent); }
+h3 { font-size: 16px; margin: 20px 0 8px; color: var(--fg); }
+h4 { font-size: 14px; margin: 14px 0 6px; color: var(--dim); text-transform: uppercase; letter-spacing: 0.6px; }
+p, li { font-size: 14px; }
+.sub { color: var(--dim); font-size: 13px; margin: 0 0 20px; }
+.card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 18px 20px; margin: 12px 0; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin: 12px 0 4px; }
+.kpi { background: var(--panel2); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; }
+.kpi .k { color: var(--dim); font-size: 12px; letter-spacing: 0.4px; text-transform: uppercase; }
+.kpi .v { color: var(--fg); font-size: 22px; font-weight: 600; margin-top: 2px; }
+.kpi .v.small { font-size: 15px; font-weight: 500; }
+.kpi .v.green { color: var(--green); }
+code, pre, .mono { font-family: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace; font-size: 12.5px; }
+code { background: #0b0f14; border: 1px solid var(--border); padding: 1px 5px; border-radius: 4px; color: var(--code); }
+pre { background: #0b0f14; border: 1px solid var(--border); border-radius: 6px; padding: 12px 14px; overflow-x: auto; color: var(--fg); }
+table { width: 100%; border-collapse: collapse; margin: 8px 0; font-size: 13px; }
+th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+th { background: var(--panel2); color: var(--dim); font-weight: 500; letter-spacing: 0.3px; text-transform: uppercase; font-size: 11.5px; }
+td .dim, .dim { color: var(--muted); }
+.tag { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px; letter-spacing: 0.3px; background: var(--panel2); border: 1px solid var(--border); color: var(--dim); margin-right: 4px; }
+.tag.ppu { color: var(--green); border-color: var(--green-dim); background: rgba(63,185,80,0.08); }
+.tag.ref { color: var(--yellow); border-color: var(--yellow-dim); background: rgba(210,153,34,0.08); }
+.tag.fla { color: var(--accent); border-color: var(--accent-dim); background: rgba(88,166,255,0.08); }
+td.fast { color: var(--green); font-weight: 600; }
+td.neutral { color: var(--yellow); }
+td.slow { color: var(--red); }
+table.perf td:nth-child(1), table.perf td:nth-child(2) { width: 56px; color: var(--dim); font-variant-numeric: tabular-nums; }
+table.perf td { font-variant-numeric: tabular-nums; }
+table.cmp td:first-child { width: 220px; color: var(--dim); }
+ul { padding-left: 22px; margin: 6px 0 10px; }
+ul li { margin: 4px 0; }
+.footer { color: var(--muted); font-size: 12px; margin-top: 40px; padding-top: 12px; border-top: 1px solid var(--border); }
+.note { background: rgba(88,166,255,0.06); border-left: 3px solid var(--accent-dim); padding: 8px 12px; border-radius: 4px; margin: 10px 0; font-size: 13px; }
+.warn { background: rgba(210,153,34,0.06); border-left: 3px solid var(--yellow); padding: 8px 12px; border-radius: 4px; margin: 10px 0; font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Kimi K3 KDA Decode Fusion — Optimization Summary &amp; Performance Comparison</h1>
+<p class="sub">
+  <span class="tag ppu">PPU mega</span>
+  <span class="tag ref">NVIDIA ref</span>
+  <span class="tag fla">FLA k_last (predecessor)</span>
+  &nbsp;· single-token decode · HV = H · D = 128 · bf16/fp16 activations · f32 state · generated 2026-07-30
+</p>
+
+<div class="card">
+  <h3 style="margin-top:0">Overview</h3>
+  <p style="margin:0 0 8px">
+    Kimi K3 KDA decode fusion fuses short-conv → Q/K L2norm → per-channel decay gate → delta-rule recurrence →
+    gated RMSNorm entirely into one CTA (1 CTA = 1 token × 1 v-head). This repository maintains three implementations side by side for development, regression and cross-checking:
+  </p>
+  <ul>
+    <li><span class="tag ppu">PPU mega</span>
+      <code>fused_kda_decode_ppu_kernel</code> (<code>src/fused_kda_decode_mega_kernel.cuh:118</code>)
+      —— the production version optimized for PPU1.5, pybind entry
+      <code>fused_kda_decode_mega_forward</code>.</li>
+    <li><span class="tag ref">NVIDIA ref</span>
+      <code>kda_decode_fusion_many_heads_kernel</code> (<code>src/fused_kda_decode_kernel_ref.cu:286</code>)
+      —— the NV upstream CUDA reference implementation ported back to the PPU platform, with signature/semantics identical to mega,
+      dispatched internally from the same pybind entry via the environment variable <code>KDA_DECODE_IMPL=ref</code>.</li>
+    <li><span class="tag fla">FLA k_last</span>
+      <code>fused_sigmoid_gating_delta_kernel</code> (<code>src/fused_sigmoid_gating_k_last_kernel.cuh:16</code>)
+      and its packed version —— the K3 predecessor from flash-linear-attention, doing only the recurrence (no short-conv,
+      no RMSNorm); the "skeleton ancestor" of the mega kernel.</li>
+  </ul>
+  <div class="grid">
+    <div class="kpi"><div class="k">Fusion scope</div><div class="v small">short-conv + SiLU + L2 + gate + Δrule + gRMSNorm</div></div>
+    <div class="kpi"><div class="k">Grid</div><div class="v small">dim3(1, H, B), CTA count = B·H</div></div>
+    <div class="kpi"><div class="k">Activation dtype</div><div class="v small">bf16 &amp; fp16 (template dispatch)</div></div>
+    <div class="kpi"><div class="k">Main config</div><div class="v small">WN=8 · SN=4 · CORE_ROWS ∈ {2,4}</div></div>
+  </div>
+</div>
+
+<h2>§1 PPU mega vs NVIDIA ref — optimizations made</h2>
+<p class="sub">
+  The two have exactly the same fusion scope and grid granularity; the differences lie mainly in the memory hierarchy, warp specialization,
+  the structure of the recurrence inner loop, and the use of PPU1.5-specific hardware instructions.
+</p>
+
+<h3>1.1 Launch geometry &amp; grid map</h3>
+<table class="cmp">
+  <thead><tr><th>Item</th><th>ref</th><th>PPU mega</th></tr></thead>
+  <tbody>
+    <tr><td>Threads / block</td><td><code>256</code> (<code>kThreads=256</code>, <code>kWarps=8</code>, ref:32-33), fixed</td><td><code>dim3(32, WARP_NUM)</code>; production WN=8 (256 threads), bench can choose WN=4 via <code>KDA_WN</code></td></tr>
+    <tr><td>Grid</td><td><code>dim3(B, kHeads)</code> (ref:757) —— H ∈ {12,24,48,96} must be enumerated statically</td><td><code>dim3(1, H, B)</code> (mega.cu:54), natively supports non-power-of-2 H</td></tr>
+    <tr><td>launch_bounds</td><td><code>(256, 2)</code> forces 2 CTA / SM</td><td>not set; occupancy is determined by smem size</td></tr>
+    <tr><td>CTA count</td><td>B · H</td><td>B · H (same)</td></tr>
+  </tbody>
+</table>
+
+<h3>1.2 Memory hierarchy — state prefetch</h3>
+<table class="cmp">
+  <thead><tr><th></th><th>ref</th><th>PPU mega</th></tr></thead>
+  <tbody>
+    <tr><td>State smem structure</td>
+      <td>2-stage double buffer <code>s_state[2][kChunkV][kDimK]</code>, <code>kNumChunks=kDimV/kChunkV=4</code>, one whole chunk (32 rows) copied in at a time</td>
+      <td>STAGE_NUM-deep software pipeline <code>smem_h_flat[SN·K·WN]</code>, SN∈{3,4,5,6}, 1 row / warp / stage at a time</td></tr>
+    <tr><td>Copy instruction</td>
+      <td>SM80 <code>cp.async.cg.shared.global 16B</code> + <code>cp.async.commit_group</code> / <code>wait_group 1</code>; 256 threads cooperate</td>
+      <td>PPU AIU 2D bulk-tensor load <code>ppu_aiu_load&lt;C=128, W=SN·WN, N=1&gt;</code>, issued by warp 0 alone; non-PPU falls back to cp.async</td></tr>
+    <tr><td>Prefetch depth</td>
+      <td>+1 chunk lookahead (<code>kPrefetchNextStateChunk=true</code>, ref:525)</td>
+      <td>SN-1-row-deep pipeline; AIU covers <code>SN·WN</code> rows (mega_kernel.cuh:212-226)</td></tr>
+    <tr><td>Consume barrier</td>
+      <td><code>__syncthreads()</code> (all 8 warps wait together)</td>
+      <td>a single deferred barrier <code>__ppu_barrier_sync_defer(0, WN·32, 1)</code>, letting the compiler push producer instructions past the barrier</td></tr>
+  </tbody>
+</table>
+
+<h3>1.3 Stage-A (conv + L2 + gate) —— the biggest difference</h3>
+<p style="margin:0 0 6px">
+  ref's Stage-A only involves warps 0-3 (first <code>if (tid &lt; kDimK)</code> computes q/k/decay, then <code>if (tid &lt; kDimV)</code> computes v),
+  leaving warps 4-7 idle for long stretches; PPU mega introduces <b>WN8 warp specialization</b> (<i>P9</i>):
+</p>
+<ul>
+  <li>Warps 0-3 handle the q + k channels (128 channels), while warps 4-7 <b>simultaneously</b> handle the v channels + per-channel decay. All 256 threads have work in Stage-A. (<code>mega_kernel.cuh:265, 315</code>)</li>
+  <li>The Q/K sum-of-squares reduction only runs on <code>QK_WARPS = (WN8 ? 4 : WN)</code> (<code>:354</code>); partials are stored in smem as <b>float2 pairs</b> (<i>P6</i>), so the later summation does 4 vectorized 8B loads instead of 8 scalar ones.</li>
+  <li>Only the q/k owner threads execute the final <code>rsqrtf</code>/scale, sparing the remaining 4 warps that work.</li>
+  <li>Sigmoid uses the <b>PPU hardware instruction</b> <code>__ppu_sgmdf</code> (<code>ppu_sigmoid</code>, <code>mega_kernel.cuh:80-86</code>); ref uses <code>1/(1+__expf(-x))</code>.</li>
+  <li>The 3-tap conv-state writeback is fully equivalent to ref (compare <code>kernel_ref.cu:404-409</code> vs <code>mega_kernel.cuh:288-294</code>).</li>
+</ul>
+
+<h3>1.4 Stage-B (recurrence core) —— algorithmic differences</h3>
+<table class="cmp">
+  <thead><tr><th></th><th>ref</th><th>PPU mega</th></tr></thead>
+  <tbody>
+    <tr><td>Outer loop</td>
+      <td>4 chunks × 4 rows / warp per chunk, paired-row (2 rows / iter)</td>
+      <td>template parameter <code>CORE_ROWS ∈ {2, 4}</code>; quad-row (4 rows / iter) enabled when <code>B·H ≥ 6144</code> (<code>mega.cu:170</code>)</td></tr>
+    <tr><td>Butterfly</td>
+      <td><code>warp_reduce_sum_pair</code>: a single XOR butterfly reduces 2 rows at once</td>
+      <td><code>__shfl_xor_sync</code>, reducing 2 or 4 rows each time; the result is ready in <b>all lanes</b>, no second broadcast needed</td></tr>
+    <tr><td>Legacy k_last pain point</td>
+      <td>—</td>
+      <td>both ref and k_last need a second <code>__shfl_sync(..., 0)</code> broadcast (the down-butterfly only gives the sum to lane 0); mega's xor-butterfly gives the sum to every lane, saving the broadcast outright</td></tr>
+    <tr><td>Output</td>
+      <td>H is stored first, then <code>q · H</code> is computed</td>
+      <td><code>o = q·S</code> is computed immediately after <code>S += k⊗v_new</code>; the state is written back with the PPU wide store <code>Global v4float</code> (<code>mega_kernel.cuh:495, 583</code>)</td></tr>
+    <tr><td>Prefetch overlap</td>
+      <td>issued once at the chunk boundary</td>
+      <td><code>issue_async_stage</code> for the next stage inside each pair (or quad) iter, fully overlapping this round's FMAs (<code>:484, 567-570</code>)</td></tr>
+  </tbody>
+</table>
+
+<h3>1.5 Stage-C (gated RMSNorm epilogue) —— fewer barriers</h3>
+<ul>
+  <li>ref: <code>kAccumulateOnormSumsq=false</code> (launched instance) first stores <code>s_o[tid]</code>, then <code>block_reduce_sum</code>, for <b>3 barriers</b> total. <code>kPreloadOnormParams=true</code> loads gate·sigmoid and norm_weight early in Stage-A to hide global latency.</li>
+  <li>mega (<i>P3</i>): each warp writes the sum of squares of its own <code>o_reg[]</code> to <code>smem_reduction[warp_id]</code>, does one <code>__syncthreads()</code>, and then each consumer thread <b>redundantly recomputes</b> the sum from the 8 partials in registers —— in exchange for <b>1 barrier</b>. gate / norm_weight are not preloaded; they are read at writeback time and rely on L1/L2 hits. (<code>mega_kernel.cuh:615-676</code>)</li>
+</ul>
+
+<h3>1.6 Data type / numerical details</h3>
+<table class="cmp">
+  <thead><tr><th></th><th>ref</th><th>PPU mega</th></tr></thead>
+  <tbody>
+    <tr><td>Activation dtype</td><td>bf16 only (hard-coded <code>__nv_bfloat16</code>)</td><td>bf16 &amp; fp16, template dispatch (<code>mega.cu:465-469</code>)</td></tr>
+    <tr><td>State / weight dtype</td><td>float32</td><td>float32 (same)</td></tr>
+    <tr><td>Q/K L2 eps</td><td><code>1.0e-6f</code></td><td><code>1.0e-6f</code> (bit-identical)</td></tr>
+    <tr><td>Scale</td><td><code>0.08838834764831845f</code> = 1/√128</td><td>same constant</td></tr>
+    <tr><td>Sigmoid</td><td>software <code>1/(1+__expf(-x))</code></td><td>PPU HW <code>__ppu_sgmdf</code></td></tr>
+    <tr><td>Beta sigmoid</td><td>template <code>kApplyBetaSigmoid</code>, can be turned off</td><td><code>ppu_sigmoid</code> always applied</td></tr>
+  </tbody>
+</table>
+
+<h3>1.7 Tunable parameters (mega production menu)</h3>
+<p style="margin:0 0 6px">
+  mega can be overridden via the <code>KDA_WN / KDA_SN / KDA_CR / KDA_PE</code> env vars; when unset it selects automatically:
+</p>
+<ul>
+  <li><b>WN</b> ∈ {4, 8}, default 8.</li>
+  <li><b>SN</b> (pipeline stages) ∈ {3, 4, 5, 6}, default 4; 3 when <code>B·H ≥ 1536</code>; 4 when <code>CORE_ROWS=4</code>.</li>
+  <li><b>CORE_ROWS</b> ∈ {2, 4}, default 4 if and only if <code>B·H ≥ 6144</code>, otherwise 2.</li>
+  <li><b>PE</b> (parallel epilogue) defaults to the P7 parallel version, unless <code>APPLY_ONORM &amp;&amp; num_ctas=384</code>.</li>
+  <li>Instantiated combinations (<code>mega.cu:185-193</code>): <code>{8,4,2}</code>, <code>{8,3,2}</code>, <code>{8,5,2}</code>, <code>{8,6,2}</code>, <code>{8,4,4}</code>, <code>{4,3,2}</code>, <code>{4,4,2}</code>, <code>{4,5,2}</code>, <code>{4,6,2}</code>.</li>
+</ul>
+
+<h3>1.8 PPU1.5 hardware specifics</h3>
+<ul>
+  <li><code>__ppu_barrier_sync_defer(0, WN·32, 1)</code> —— a "deferrable" barrier for the recurrence, used at the AIU consume point to avoid a whole-block <code>__syncthreads</code> (<code>mega_kernel.cuh:449, 536</code>).</li>
+  <li><code>Global v4float</code> wide store —— the PPU uncached global store form, used to store <code>h0</code> (<code>:495, 583-587</code>).</li>
+  <li>AIU is <b>issued by warp 0 alone</b> with bulk-load semantics (<code>:222, 644</code>); the other warps keep computing during the DMA.</li>
+  <li>The <code>PPU_KDA_USE_AIU</code> macro brings PPU1.0 onto the AIU path as well (arch-100 asm variant); only non-PPU CUDA takes the cp.async fallback.</li>
+  <li>No <code>__launch_bounds__</code>: the quad-row core uses 80 registers / 75% occupancy, which a large grid more than offsets.</li>
+</ul>
+
+<h3>1.9 Template switches ref has but mega deliberately drops</h3>
+<p>ref has 15 <code>k*</code> template bools (<code>kernel_ref.cu:276-284</code>); mega keeps only 4 (<code>APPLY_ONORM, USE_LOWER_BOUND, PARALLEL_EPILOGUE, CORE_ROWS</code>) + runtime-tuned <code>WARP_NUM, BV, STAGE_NUM</code>. Key items dropped:</p>
+<ul>
+  <li><code>kUpdateConvState=false</code> —— the "do not write the conv cache" codepath is no longer provided.</li>
+  <li><code>kApplyBetaSigmoid=false</code> —— raw beta is no longer provided.</li>
+  <li>Specialization switches such as <code>kUseStaticDecodeLayout</code>, <code>kFixedHeads</code> and <code>kUseHeadGrid</code> are all folded into hard-coded dispatch.</li>
+</ul>
+
+<h2>§2 PPU mega vs original FLA k_last —— list of changes</h2>
+<p class="sub">
+  FLA's <code>fused_sigmoid_gating_delta_kernel(_packed)</code> is mega's direct ancestor;
+  the recurrence inner-loop skeleton is nearly identical, and everything else is new or replaced.
+</p>
+
+<h3>2.1 Expanded fusion scope</h3>
+<table class="cmp">
+  <thead><tr><th>Operator</th><th>k_last</th><th>k_last packed</th><th>PPU mega</th></tr></thead>
+  <tbody>
+    <tr><td>QKV linear projection</td><td>not fused</td><td>not fused</td><td>not fused (same)</td></tr>
+    <tr><td>Short conv + SiLU</td><td class="slow">not fused (external pre-conv)</td><td class="slow">not fused (mixed_qkv is already post-conv)</td><td class="fast">fused (mega_kernel.cuh:266-347), with pre-conv read + taps + weights + biases + SiLU</td></tr>
+    <tr><td>Conv-state 3-tap writeback</td><td class="slow">none</td><td class="slow">none</td><td class="fast">fused (<code>:288-294, 331-334, 411-413</code>)</td></tr>
+    <tr><td>Q/K L2-norm</td><td>in kernel (<code>use_qk_l2norm</code>, k_last:287-333)</td><td>in kernel</td><td>in kernel (<code>:361-391</code>), bit-exact</td></tr>
+    <tr><td>Per-channel decay gate</td><td>in kernel (<code>compute_bg</code>)</td><td>in kernel</td><td>in kernel (<code>:301-346</code>), supports both softplus / lower_bound branches</td></tr>
+    <tr><td>Delta-rule recurrence</td><td class="fast">✅ core (<code>:340-429</code>)</td><td class="fast">✅ (packed:307-398)</td><td class="fast">✅ (<code>:432-613</code>)</td></tr>
+    <tr><td>Gated RMSNorm</td><td class="slow">none (<code>o</code> written straight to global, <code>:418-420</code>)</td><td class="slow">none</td><td class="fast">fused (<code>:615-676</code>), single-barrier P3 epilogue</td></tr>
+  </tbody>
+</table>
+
+<h3>2.2 Layout / interface changes</h3>
+<ul>
+  <li><b>Input layout</b>: k_last uses separate <code>q[B,T,H,K] / k[B,T,H,K] / v[B,T,HV,V]</code>; k_last_packed uses <code>mixed_qkv[B, 3·H·K]</code>; mega uses the <b>pre-conv</b> <code>x[B, 3·H·128]</code> plus a taps tensor.</li>
+  <li><b>New tensors</b>: <code>weight[3,4,H·128]</code> (short-conv weights), <code>conv_state[slots, 3·H·128, 3]</code> (conv history, tap-major), <code>dt_bias[H·128]</code>, <code>output_gate[B,H,128]</code>, <code>norm_weight[128]</code>, <code>norm_eps</code>.</li>
+  <li><b>In-place contract</b>: mega allocates no outputs and writes <code>conv_state / state / out</code> entirely in place (<code>mega.cu:353-355</code>); k_last calls <code>torch::empty(...)</code> itself.</li>
+  <li><b>State sharing</b>: <code>state_indices</code> addresses both the conv state and the recurrent state (<code>mega_kernel.cuh:36-37</code>); this is part of the vLLM paged cache contract.</li>
+  <li><b>H = HV</b> (the single K3 scenario): mega assumes <code>HV_PER_CTA=1</code>; k_last keeps the multi-v-head-per-CTA v-tiling.</li>
+  <li><b>Grid indexing</b>: k_last uses <code>divide_by_power_of_two(blockIdx.z, H)</code> (assuming H is a power of 2); mega uses <code>blockIdx.z = batch, blockIdx.y = head</code> directly, supporting K3's 12/24/48/96.</li>
+</ul>
+
+<h3>2.3 Algorithmic differences in the recurrence core (Stage-B)</h3>
+<pre>k_last single-row core (k_last_kernel.cuh:344-429, simplified):
+  for hv_step:
+    for v_i in 0..V_ITERS:              # &lt;- 1 row / iter
+      cp_async_wait&lt;SN-1&gt;
+      h *= bg; v_delta = h · k          # &lt;- single-row dot product
+      __shfl_down_sync butterfly
+      v_delta = __shfl_sync(..., 0)     # &lt;- needs a second broadcast from lane 0
+      h += k * v_new
+      global store h
+      o = h · q
+      __shfl_down_sync butterfly
+      if (lane_id == 0) o[...] = o_val  # &lt;- only lane 0 writes
+
+mega Stage-B (CORE_ROWS=2, mega_kernel.cuh:521-613, simplified):
+  for hv_step:
+    for v_pair in 0..V_ITERS step 2:    # &lt;- 2 rows / iter (P5)
+      cp_async_wait&lt;SN-2&gt;
+      h_a, h_b = smem[stage_a], smem[stage_b]
+      h_a *= bg; h_b *= bg
+      vd_a, vd_b = h_a·k, h_b·k
+      __shfl_xor_sync reduces 2 rows at once  # &lt;- XOR-butterfly: result ready in all lanes
+      v_new_a, v_new_b = (v - vd) * b_beta
+      issue_async_stage(next_a, next_b) # &lt;- recurrence overlaps prefetch
+      Global v4float store h_a, h_b     # &lt;- PPU wide store
+      o_reg[v_pair]   = h_a · q         # every lane has o
+      o_reg[v_pair+1] = h_b · q         # consumed directly by the RMSNorm sumsq</pre>
+<p>Key differences:</p>
+<ul>
+  <li><b>Paired-row / quad-row</b>: mega processes 2 or 4 rows per iter, cutting the butterfly and barrier counts to 1/2 or 1/4.</li>
+  <li><b>XOR butterfly instead of down butterfly</b>: the result stays in all 32 lanes and is reused directly by the subsequent <code>q·S</code> and RMSNorm sumsq, saving one <code>__shfl_sync(..., 0)</code>.</li>
+  <li><b>Register-resident o (<code>o_reg[V_ITERS]</code>)</b>: k_last global-stores at every step, while mega buffers it in registers for the P3 epilogue.</li>
+  <li><b>P7 parallel epilogue</b>: staged into <code>smem_o[BV]</code>, with a 128-way parallel Stage-C write (k_last has lane 0 write alone at every step).</li>
+  <li><b>Cheaper deferred barrier</b>: k_last uses <code>__ppu_barrier_sync_defer</code> at single-row granularity; mega uses it at pair/quad granularity, cutting the number of triggers within a CTA to 1/2 or 1/4.</li>
+  <li><b>AIU CUBE_N=1</b>: because mega has <code>HV_PER_CTA=1</code>, CUBE_N is always 1 and the AIU descriptor is simpler.</li>
+</ul>
+
+<h3>2.4 FLA codepaths removed / replaced</h3>
+<ul>
+  <li><b>MTP_VERIFY branch</b> (k_last_kernel.cuh:435-863, ≈430 lines) —— the whole Eagle-tree parent-token state cache / <code>retrieve_parent_token_ptr</code> path is obsolete in KDA decode fusion; mega only supports T = 1.</li>
+  <li><b>Generated dispatch headers</b> (<code>fused_sigmoid_gating_dispatch_k_last.h</code>, <code>get_tuned_k_last(_packed/_mtp)</code>) —— replaced in mega by the hand-written <code>KDA_DISPATCH_CFG</code> macro (<code>mega.cu:185-193</code>).</li>
+  <li><b>bf16 ↔ f32 state conversion</b> (<code>fused_sigmoid_gating_cuda_k_last_packed.cu:86-97</code>) —— mega requires the state to be f32 and updates it in place.</li>
+  <li><b>Template switches</b> <code>use_qk_l2norm</code>, <code>disable_state_update</code> —— in the K3 scenario L2 is always on and the state is always updated, so they were hard-coded away.</li>
+  <li><b>PAD_SLOT_ID=-1 early exit</b> (k_last_packed_kernel.cuh:59-71) —— mega instead relies on the caller guaranteeing valid <code>state_indices</code>.</li>
+</ul>
+
+<h2>§3 PPU vs ref — final E2E performance comparison</h2>
+<p class="sub">
+  Card: PPU1.5 card6, container <code>hp_ppu15_sglang0.5.10</code>; tool:
+  <code>scripts/kda_fusion/bench_ppu_vs_ref.py</code>; same pybind entry
+  <code>fused_kda_decode_mega_forward</code>, with dispatch switched via the <code>KDA_DECODE_IMPL</code> env var;
+  <code>iters=100 warmup=20</code>, CUDA Event median (p90 attached as corroboration);
+  <code>lower_bound=-5.0, fuse_output_norm=True</code>.
+</p>
+
+<div class="grid">
+  <div class="kpi"><div class="k">cells</div><div class="v">28</div></div>
+  <div class="kpi"><div class="k">geomean(ref / PPU)</div><div class="v green">×1.10</div></div>
+  <div class="kpi"><div class="k">min speedup</div><div class="v small">×1.02 (H=96 B=8)</div></div>
+  <div class="kpi"><div class="k">max speedup</div><div class="v small">×1.35 (H=24 B=16)</div></div>
+</div>
+
+<div class="card" style="padding:0">
+<table class="perf">
+  <thead>
+    <tr>
+      <th>H</th><th>B</th>
+      <th>PPU us (med)</th><th>PPU p90</th>
+      <th>ref us (med)</th><th>ref p90</th>
+      <th>ref / PPU</th>
+    </tr>
+  </thead>
+  <tbody>
+<tr><td>12</td><td>1</td><td>11.98</td><td class="dim">12.89</td><td>13.14</td><td class="dim">13.43</td><td class="neutral">x1.10</td></tr>
+<tr><td>12</td><td>2</td><td>12.11</td><td class="dim">12.38</td><td>13.28</td><td class="dim">13.50</td><td class="neutral">x1.10</td></tr>
+<tr><td>12</td><td>4</td><td>13.45</td><td class="dim">13.77</td><td>14.72</td><td class="dim">14.91</td><td class="neutral">x1.09</td></tr>
+<tr><td>12</td><td>8</td><td>14.90</td><td class="dim">15.18</td><td>17.18</td><td class="dim">17.58</td><td class="fast">x1.15</td></tr>
+<tr><td>12</td><td>16</td><td>18.81</td><td class="dim">19.11</td><td>21.95</td><td class="dim">22.47</td><td class="fast">x1.17</td></tr>
+<tr><td>12</td><td>32</td><td>36.56</td><td class="dim">37.46</td><td>38.63</td><td class="dim">39.37</td><td class="neutral">x1.06</td></tr>
+<tr><td>12</td><td>64</td><td>58.66</td><td class="dim">59.52</td><td>60.77</td><td class="dim">61.58</td><td class="neutral">x1.04</td></tr>
+<tr><td>24</td><td>1</td><td>12.10</td><td class="dim">12.34</td><td>13.11</td><td class="dim">13.34</td><td class="neutral">x1.08</td></tr>
+<tr><td>24</td><td>2</td><td>13.39</td><td class="dim">13.62</td><td>14.53</td><td class="dim">14.77</td><td class="neutral">x1.09</td></tr>
+<tr><td>24</td><td>4</td><td>15.11</td><td class="dim">15.40</td><td>16.94</td><td class="dim">17.44</td><td class="fast">x1.12</td></tr>
+<tr><td>24</td><td>8</td><td>18.94</td><td class="dim">19.39</td><td>21.71</td><td class="dim">30.16</td><td class="fast">x1.15</td></tr>
+<tr><td>24</td><td>16</td><td>48.70</td><td class="dim">71.26</td><td>65.84</td><td class="dim">102.23</td><td class="fast">x1.35</td></tr>
+<tr><td>24</td><td>32</td><td>58.72</td><td class="dim">59.60</td><td>60.60</td><td class="dim">61.88</td><td class="neutral">x1.03</td></tr>
+<tr><td>24</td><td>64</td><td>95.62</td><td class="dim">96.47</td><td>102.58</td><td class="dim">103.93</td><td class="neutral">x1.07</td></tr>
+<tr><td>48</td><td>1</td><td>13.61</td><td class="dim">13.98</td><td>14.70</td><td class="dim">15.08</td><td class="neutral">x1.08</td></tr>
+<tr><td>48</td><td>2</td><td>15.21</td><td class="dim">15.50</td><td>17.14</td><td class="dim">17.48</td><td class="fast">x1.13</td></tr>
+<tr><td>48</td><td>4</td><td>19.15</td><td class="dim">19.55</td><td>21.90</td><td class="dim">22.60</td><td class="fast">x1.14</td></tr>
+<tr><td>48</td><td>8</td><td>33.64</td><td class="dim">37.20</td><td>38.65</td><td class="dim">39.21</td><td class="fast">x1.15</td></tr>
+<tr><td>48</td><td>16</td><td>58.93</td><td class="dim">59.79</td><td>60.77</td><td class="dim">61.66</td><td class="neutral">x1.03</td></tr>
+<tr><td>48</td><td>32</td><td>95.40</td><td class="dim">96.11</td><td>102.11</td><td class="dim">103.31</td><td class="neutral">x1.07</td></tr>
+<tr><td>48</td><td>64</td><td>174.74</td><td class="dim">176.09</td><td>186.98</td><td class="dim">188.39</td><td class="neutral">x1.07</td></tr>
+<tr><td>96</td><td>1</td><td>15.09</td><td class="dim">15.38</td><td>16.72</td><td class="dim">17.13</td><td class="fast">x1.11</td></tr>
+<tr><td>96</td><td>2</td><td>19.18</td><td class="dim">19.49</td><td>21.92</td><td class="dim">22.42</td><td class="fast">x1.14</td></tr>
+<tr><td>96</td><td>4</td><td>33.43</td><td class="dim">37.33</td><td>38.25</td><td class="dim">38.93</td><td class="fast">x1.14</td></tr>
+<tr><td>96</td><td>8</td><td>58.74</td><td class="dim">59.45</td><td>60.14</td><td class="dim">61.19</td><td class="slow">x1.02</td></tr>
+<tr><td>96</td><td>16</td><td>95.47</td><td class="dim">96.62</td><td>101.66</td><td class="dim">103.09</td><td class="neutral">x1.06</td></tr>
+<tr><td>96</td><td>32</td><td>175.11</td><td class="dim">176.69</td><td>185.53</td><td class="dim">187.03</td><td class="neutral">x1.06</td></tr>
+<tr><td>96</td><td>64</td><td>331.24</td><td class="dim">332.66</td><td>350.51</td><td class="dim">351.99</td><td class="neutral">x1.06</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p style="margin-top:12px">
+  <b>Observations:</b>
+</p>
+<ul>
+  <li>PPU ≥ ref in all 28 cells; geometric mean <b>×1.10</b>. In the small H·B range (H=12/24 · B=1-4) the gain is ~1.08-1.10 (dominated by Stage-A WN8 warp specialization + PPU sigmoid).</li>
+  <li>Medium scale (H·B ≈ 200-400, e.g. H=12 B=16 / H=48 B=8 / H=96 B=4) gives the largest gain <b>×1.13-1.17</b>; here the quad/pair recurrence core and the SN pipeline land right at the optimal issue rate.</li>
+  <li>The ×1.35 at H=24 B=16 is an outlier caused by a large p90 spread in that region (ppu p90 71 us / ref p90 102 us) —— treat it as an upper bound of occasional jitter; the geometric mean is not dominated by a single point.</li>
+  <li>In the large CTA-count range (<code>B·H ≥ 512</code>, e.g. H=96 B=32/64 / H=48 B=64) the gain falls back to ×1.03-×1.07; quad-row (CORE_ROWS=4) is already in effect here and the main bottleneck becomes HBM / the sequential dependency of the recurrence, so further optimization would need sequence prefix parallelism or cross-CTA splitting.</li>
+</ul>
+
+<div class="note">
+  <b>Reproduction command:</b><br>
+  <code>CUDA_VISIBLE_DEVICES=6 PPU_VISIBLE_DEVICES=6 python scripts/kda_fusion/bench_ppu_vs_ref.py \<br>
+  &nbsp;&nbsp;--heads 12,24,48,96 --batches 1,2,4,8,16,32,64 --iters 100 --warmup 20 \<br>
+  &nbsp;&nbsp;--json kda_ppu_vs_ref_full.json</code>
+</div>
+
+<div class="warn">
+  <b>Accuracy regression:</b>
+  <code>scripts/kda_fusion/compare_kda_decode_fusion.py --dtype bf16</code> 5/5 PASS
+  (atol/rtol = 3e-2, conv 0/0 —— the same criterion as vllm test_kda);
+  <code>--dtype fp16</code> 5/5 PASS (atol=1e-3, rtol=1e-2, torch-naive f32 golden reference).
+</div>
+
+<h2>§4 Key file index</h2>
+<table class="cmp">
+  <thead><tr><th>File</th><th>Role</th><th>Key anchors</th></tr></thead>
+  <tbody>
+    <tr><td><code>src/fused_kda_decode_mega.cu</code></td>
+      <td>Host layer of the PPU production kernel + env-selected ref dispatch</td>
+      <td>launch dispatch <code>:37-216</code>; host <code>fused_kda_decode_mega_forward:269-475</code></td></tr>
+    <tr><td><code>src/fused_kda_decode_mega_kernel.cuh</code></td>
+      <td>Complete PPU device kernel implementation</td>
+      <td>template signature <code>:116-150</code>; Stage-A <code>:251-422</code>; Stage-B(2) <code>:521-613</code>; Stage-B(4) <code>:444-519</code>; Stage-C(P3) <code>:615-676</code></td></tr>
+    <tr><td><code>src/fused_kda_decode_kernel_ref.cu</code></td>
+      <td>NVIDIA reference implementation (correctness cross-check and baseline on PPU)</td>
+      <td>device <code>:286-735</code>; smem <code>:354-361</code>; Stage-A <code>:367-522</code>; Stage-B <code>:553-659</code>; Stage-C <code>:660-728</code>; host <code>:959-1127</code></td></tr>
+    <tr><td><code>src/fused_sigmoid_gating_k_last_kernel.cuh</code></td>
+      <td>Original FLA decode kernel (predecessor)</td>
+      <td>decode single-row core <code>:344-429</code>; MTP-verify (obsolete) <code>:435-863</code></td></tr>
+    <tr><td><code>src/fused_sigmoid_gating_k_last_packed_kernel.cuh</code></td>
+      <td>FLA packed variant (predecessor)</td>
+      <td>packed decode core <code>:316-398</code></td></tr>
+    <tr><td><code>scripts/kda_fusion/_vllm_triton_ref.py</code></td>
+      <td>Verbatim inlining of the vllm triton reference chain (<code>causal_conv1d_update</code> + <code>fused_recurrent_kda_packed_decode</code>), zero vllm dependency</td>
+      <td>—</td></tr>
+    <tr><td><code>scripts/kda_fusion/compare_kda_decode_fusion.py</code></td>
+      <td>Main accuracy cross-check script, <code>--dtype {bf16,fp16}</code> switch</td>
+      <td>—</td></tr>
+    <tr><td><code>scripts/kda_fusion/bench_ppu_vs_ref.py</code></td>
+      <td>PPU vs ref E2E performance comparison (same pybind entry, dispatch switched via env)</td>
+      <td>—</td></tr>
+  </tbody>
+</table>
+
+<h2>§5 Exploration log: H-static-templating + kPreloadOnormParams (reverted)</h2>
+<p class="sub">2026-07-30 · card6 · 3 independent benches · conclusion: neither change brings a positive gain; both have been fully reverted.</p>
+
+<div class="card">
+<h3>5.1 Motivation</h3>
+<p>Two design patterns borrowed from the ref kernel:</p>
+<ul>
+  <li><b>kFixedHeads (H-static-templating)</b>: promote <code>H</code> from a runtime parameter to a compile-time template parameter <code>kFixedHeads ∈ {12,24,48,96}</code>,
+      so that <code>dim = H×128</code> folds into <code>constexpr kDim</code> and the conv tap stride <code>3*dim</code> folds into <code>constexpr kPackedDim</code>;
+      the host side gains a four-way <code>switch(H)</code> dispatch. The expectation was that the compiler would use constant propagation + loop unrolling to optimize address computation and the AIU descriptor more aggressively.</li>
+  <li><b>kPreloadOnormParams</b>: preload <code>sigmoid(output_gate)</code> and <code>norm_weight[v]</code> into smem (2×128×4B = 1KB) during the spare bandwidth window of Stage-A (conv + SiLU),
+      so that the Stage-C epilogue no longer issues gmem loads + sigmoid instructions, shortening the tail critical path.
+      Modeled on the ref kernel's <code>kPreloadOnormParams=true</code> pattern —— but ref can preload directly into registers (the same thread owns the v-channel),
+      whereas in PPU mega the WN8 Stage-A threads (tid 128-255) differ from the P7 epilogue threads (tid 0-127), so it has to relay through smem.</li>
+</ul>
+
+<h3>5.2 Measurements</h3>
+<table class="cmp">
+  <thead><tr><th>Config</th><th>geomean(ref/PPU)</th><th>min</th><th>max</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td>Baseline (no change)</td><td class="fast">×1.10</td><td>×1.02</td><td>×1.35</td><td>PPU≥ref in all 28 cells</td></tr>
+    <tr><td>H-template only</td><td class="neutral">×1.08</td><td class="slow">×0.95</td><td>×1.22</td><td>regression point at H=24 B=2</td></tr>
+    <tr><td>H-template + preload</td><td class="neutral">×1.08</td><td>×1.01</td><td>×1.15</td><td>preload fixes the regression but compresses max</td></tr>
+    <tr><td>Rerun after revert</td><td class="fast">×1.08</td><td>×1.02</td><td>×1.16</td><td>back to normal (run-to-run noise explains the 1.10↔1.08 difference)</td></tr>
+  </tbody>
+</table>
+
+<h3>5.3 Root cause analysis</h3>
+<ul>
+  <li><b>H-template brings no gain</b>: on the critical path of the PPU mega kernel (the Stage-B recurrence), <code>dim</code> only appears in address offset computation (<code>conv_w(w,hk,tap,dim)</code>, the <code>3*dim</code> stride of the conv state writeback) and does not affect loop trip counts or register allocation.
+      <code>constexpr</code> folding saves 1 integer multiply (<code>H*128</code>), which is invisible in a memory-bound kernel.
+      Instead it introduces a new template instantiation axis (4 H values × the existing WN×SN×CR×ONORM×LB×PE), significantly increasing compile time and .so size.</li>
+  <li><b>kPreloadOnormParams brings no gain</b>: the smem relay path needs an extra store + barrier + load, whose latency roughly cancels out loading directly from gmem (L2 hot).
+      The ref kernel benefits because the same thread does a zero-overhead register-to-register preload; PPU mega's WN8 thread mapping does not allow that path.</li>
+</ul>
+
+<h3>5.4 Conclusion</h3>
+<p>As attempts to "align with the ref design patterns", both changes are <b>not applicable</b> on PPU1.5. The root cause is that PPU mega's thread mapping and memory-bound nature keep the theoretical advantages of both from materializing.
+  Everything has been reverted to the baseline code. If a future PPU architecture offers wider L1/smem bandwidth or supports cross-warp register sharing, kPreloadOnormParams can be re-evaluated.</p>
+</div>
+
+<div class="footer">
+  Latest E2E data: 2026-07-30 (card6, PPU1.5, hp_ppu15_sglang0.5.10) ·
+  fla branch: <code>develop_vllm_kimi_k3_kda_mega_fusion</code> · commit 55259a6 ·
+  author: gino.whp
+</div>
+
+</div>
+</body>
+</html>

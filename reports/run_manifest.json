@@ -1,0 +1,436 @@
+{
+  "cards": [
+    0,
+    1,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "case_file_count": 31,
+  "case_files": [
+    {
+      "path": "caselist/decode/GLM-5.3-Flash_decode_tp16_kvlimit_200GB_model_len_128K_kda_op.list",
+      "raw_case_count": 259
+    },
+    {
+      "path": "caselist/decode/GLM-5.3-Flash_decode_tp1_kvlimit_200GB_model_len_128K_kda_op.list",
+      "raw_case_count": 203
+    },
+    {
+      "path": "caselist/decode/GLM-5.3-Flash_decode_tp2_kvlimit_200GB_model_len_128K_kda_op.list",
+      "raw_case_count": 221
+    },
+    {
+      "path": "caselist/decode/GLM-5.3-Flash_decode_tp4_kvlimit_200GB_model_len_128K_kda_op.list",
+      "raw_case_count": 234
+    },
+    {
+      "path": "caselist/decode/GLM-5.3-Flash_decode_tp8_kvlimit_200GB_model_len_128K_kda_op.list",
+      "raw_case_count": 249
+    },
+    {
+      "path": "caselist/decode/Kimi-K3_decode_tp16_kvlimit_200GB_model_len_128K_kda_op.list",
+      "raw_case_count": 288
+    },
+    {
+      "path": "caselist/decode/Kimi-K3_decode_tp1_kvlimit_200GB_model_len_128K_kda_op.list",
+      "raw_case_count": 204
+    },
+    {
+      "path": "caselist/decode/Kimi-K3_decode_tp2_kvlimit_200GB_model_len_128K_kda_op.list",
+      "raw_case_count": 234
+    },
+    {
+      "path": "caselist/decode/Kimi-K3_decode_tp4_kvlimit_200GB_model_len_128K_kda_op.list",
+      "raw_case_count": 252
+    },
+    {
+      "path": "caselist/decode/Kimi-K3_decode_tp8_kvlimit_200GB_model_len_128K_kda_op.list",
+      "raw_case_count": 271
+    },
+    {
+      "path": "caselist/decode/Kimi-Linear-48B-A3B_decode_tp1_kvlimit_200GB_model_len_128K_kda_op.list",
+      "raw_case_count": 59
+    },
+    {
+      "path": "caselist/decode/Kimi-Linear-48B-A3B_decode_tp2_kvlimit_200GB_model_len_128K_kda_op.list",
+      "raw_case_count": 62
+    },
+    {
+      "path": "caselist/decode/Qwen3-Next-80B-A3B_decode_tp1_kvlimit_200GB_model_len_128K_gdn_op.list",
+      "raw_case_count": 234
+    },
+    {
+      "path": "caselist/decode/Qwen3-Next-80B-A3B_decode_tp2_kvlimit_200GB_model_len_128K_gdn_op.list",
+      "raw_case_count": 245
+    },
+    {
+      "path": "caselist/decode/Qwen3-Next-80B-A3B_decode_tp4_kvlimit_200GB_model_len_128K_gdn_op.list",
+      "raw_case_count": 247
+    },
+    {
+      "path": "caselist/decode/Qwen3.5-27B_decode_tp1_kvlimit_200GB_model_len_128K_gdn_op.list",
+      "raw_case_count": 217
+    },
+    {
+      "path": "caselist/decode/Qwen3.5-27B_decode_tp2_kvlimit_200GB_model_len_128K_gdn_op.list",
+      "raw_case_count": 232
+    },
+    {
+      "path": "caselist/decode/Qwen3.5-35B-A3B_decode_tp1_kvlimit_200GB_model_len_128K_gdn_op.list",
+      "raw_case_count": 234
+    },
+    {
+      "path": "caselist/decode/Qwen3.5-35B-A3B_decode_tp2_kvlimit_200GB_model_len_128K_gdn_op.list",
+      "raw_case_count": 244
+    },
+    {
+      "path": "caselist/decode/Qwen3.5-397B-A17B_decode_tp1_kvlimit_200GB_model_len_128K_gdn_op.list",
+      "raw_case_count": 213
+    },
+    {
+      "path": "caselist/decode/Qwen3.5-397B-A17B_decode_tp2_kvlimit_200GB_model_len_128K_gdn_op.list",
+      "raw_case_count": 224
+    },
+    {
+      "path": "caselist/decode/Qwen3.5-397B-A17B_decode_tp4_kvlimit_200GB_model_len_128K_gdn_op.list",
+      "raw_case_count": 243
+    },
+    {
+      "path": "caselist/decode/Qwen3.5-397B-A17B_decode_tp8_kvlimit_200GB_model_len_128K_gdn_op.list",
+      "raw_case_count": 243
+    },
+    {
+      "path": "caselist/decode/Qwen3.5-Max_decode_tp1_kvlimit_200GB_model_len_128K_gdn_op.list",
+      "raw_case_count": 221
+    },
+    {
+      "path": "caselist/decode/Qwen3.5-Max_decode_tp2_kvlimit_200GB_model_len_128K_gdn_op.list",
+      "raw_case_count": 232
+    },
+    {
+      "path": "caselist/decode/Qwen3.5-Max_decode_tp4_kvlimit_200GB_model_len_128K_gdn_op.list",
+      "raw_case_count": 243
+    },
+    {
+      "path": "caselist/decode/Qwen3.5-Max_decode_tp8_kvlimit_200GB_model_len_128K_gdn_op.list",
+      "raw_case_count": 243
+    },
+    {
+      "path": "caselist/decode/Qwen3.7-Max_decode_tp1_kvlimit_200GB_model_len_128K_gdn_op.list",
+      "raw_case_count": 200
+    },
+    {
+      "path": "caselist/decode/Qwen3.7-Max_decode_tp2_kvlimit_200GB_model_len_128K_gdn_op.list",
+      "raw_case_count": 213
+    },
+    {
+      "path": "caselist/decode/Qwen3.7-Max_decode_tp4_kvlimit_200GB_model_len_128K_gdn_op.list",
+      "raw_case_count": 224
+    },
+    {
+      "path": "caselist/decode/Qwen3.7-Max_decode_tp8_kvlimit_200GB_model_len_128K_gdn_op.list",
+      "raw_case_count": 243
+    }
+  ],
+  "created_at": "2026-09-15T20:55:24.220977+08:00",
+  "expected_rows_by_kernel": {
+    "k_last": 6931,
+    "k_last_mtp": 6931,
+    "k_last_packed": 6931
+  },
+  "expected_total_rows": 20793,
+  "filters": {
+    "excluded": [
+      "test_*",
+      "*mamba2*",
+      "*lightning*"
+    ],
+    "included": [
+      "*_gdn_op.list",
+      "*_kda_op.list"
+    ],
+    "restored_after_validation": [
+      "Kimi-K3_*"
+    ]
+  },
+  "finished_at": "2026-09-16T01:51:44.137539+08:00",
+  "iters": 50,
+  "max_mem_gb": 80.0,
+  "method": "minimum of 50 synchronized E2E samples (median retained in runner output but not CSV); ordinary gate (caselist lower-bound/ragged metadata is not replayed); k_last T1; k_last_mtp T4 with existing linear-parent harness; k_last_packed T1; PLA measured before FLA-Triton; runner timed region unchanged",
+  "mode": "events",
+  "nonpow2_head_validation": {
+    "architectures": [
+      "ZW-M890P",
+      "PPU-ZW810E"
+    ],
+    "evidence": "reports/nonpow2_20260915/acceptance.json",
+    "requires_rebuilt_decode_extension": true
+  },
+  "provenance": {
+    "arch": "890p",
+    "candidate": {
+      "event": "artifact",
+      "gpu": "ZW-M890P",
+      "path": "/host_ssd/pla_nonpow2_20260915/install_v2/pla/decode/_C.cpython-312-x86_64-linux-gnu.so",
+      "sha256": "2c2f5309576e6f09e402774a0fb03b7ec3925058a4cdaac86e7761b875ba5038",
+      "torch": "2.11.0"
+    },
+    "cards": [
+      0,
+      1,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "health": {
+      "0": "\n==============PPUSMI LOG==============\n\nTimestamp                                   : Tue Sep 15 20:55:10 2026\nDriver Version                              : 2.2.1-rc0f8b072216\nHGGC Version                                : 13.3\nSDK Version                                 : 2.2.0-bcc7ac\n\nAttached PPUs                               : 8\nPPU 00000001:D9:00.0                        \n    Product Name                            : ZW-M890P\n    Product Architecture                    : Beethoven\n    Compute Capability                      : 8.9\n    Persistence Mode                        : N/A\n    Addressing Mode                         : None\n    MIG Mode                                \n        Current                             : Disabled\n        Pending                             : Disabled\n    Serial Number                           : NA\n    PPU UUID                                : GPU-1154b604-4591-0928-0000-000000000000\n    Minor Number                            : 1\n    Rear ID                                 : 0\n    Platform Info                           \n        Chassis Serial Number               : 0x0\n        Slot Number                         : 255\n        Tray Index                          : 0\n        Host ID                             : 0\n        Peer Type                           : Switch Connected\n        Module Id                           : 0\n        PPU Fabric GUID                     : 0x5013228a096ca82\n    PPU Virtualization Mode                 \n        Virtualization Mode                 : None\n        Host VGPU Mode                      : Non SR-IOV\n    PPU Recovery Action                     : None\n    PCI                                     \n        Bus                                 : 0xD9\n        Device                              : 0x00\n        Domain                              : 0x0001\n        Base Classcode                      : 0x3\n        Sub Classcode                       : 0x2\n        Device Id                           : 0x60051DED\n        Bus Id                              : 00000001:D9:00.0\n        Sub System Id                       : 0x61011DED\n        Vendor Id                           : 0x1DED\n        PPU Link Info                       \n            PCIe Generation                 \n                Max                         : 5\n                Current                     : 5\n            Link Width                      \n                Max                         : 16x\n                Current                     : 16x\n        Replays Since Reset                 : N/A\n        Tx Throughput                       : 0 KB/s\n        Rx Throughput                       : 0 KB/s\n    Fan Speed                               : N/A\n    Performance State                       : N/A\n    VBIOS Version                           : 1.2.1-rd8865072218\n    Auto Reset                              : Enabled\n    Overclocking Mode                       : N/A\n    Performance Counter                     : Disabled\n    Tide Mode                               : Disabled\n    MPS Mode                                : Disabled\n    Clocks Throttle Reasons                 \n        Idle                                : Active\n        Applications Clocks Setting         : Not Active\n        SW Power Cap                        : Not Active\n        HW Slowdown                         : Not Active\n            HW Thermal Slowdown             : Not Active\n            HW Power Brake Slowdown         : Not Active\n        Sync Boost                          : Not Active\n        SW Thermal Slowdown                 : Not Active\n    Xid Errors                              \n        PPU Reset Correctable               : N/A\n        OS Reboot Correctable               : N/A\n        Cold Reboot Correctable             : N/A\n    Compute Mode                            : Default\n    HBM Vendor                              : Samsung\n    Memory Usage                            \n        Total                               : 98304 MiB\n        Used                                : 1 MiB\n        Free                                : 98303 MiB\n    Utilization                             \n        Ppu                                 : 0 %\n        Core                                : 0 %\n        Memory                              : 0 %\n        Encoder                             : 0 %\n        Decoder                             : 0 %\n    Ecc Mode                                \n        Current                             : Enabled\n        Pending                             : Enabled\n    ECC Errors                              \n        Volatile                            \n            SRAM Correctable                : N/A\n            SRAM Uncorrectable              : N/A\n            DRAM Correctable                : 0\n            DRAM Uncorrectable              : 0\n        Aggregate                           \n            SRAM Correctable                : N/A\n            SRAM Uncorrectable              : N/A\n            DRAM Correctable                : 0\n            DRAM Uncorrectable              : 0\n    Retired Pages                           \n        Single Bit ECC                      : 0\n        Double Bit ECC                      : 0\n        Pending Page Blacklist              : No\n    Remapped Rows                           \n        Correctable Error                   : 0\n        Uncorrectable Error                 : 0\n        Pending                             : No\n        Remapping Failure Occurred          : No\n        Bank Remap Availability Histogram   \n            Max                             : 4096 bank(s)\n            High                            : 0 bank(s)\n            Partial                         : 0 bank(s)\n            Low                             : 0 bank(s)\n            None                            : 0 bank(s)\n    Temperature                             \n        PPU Current Temp                    : 30 C\n        PPU Shutdown Temp                   : 95 C\n        PPU Slowdown Temp                   : 82 C\n        PPU Max Operating Temp              : 82 C\n        PPU Target Temperature              : N/A\n        Memory Current Temp                 : 34 C\n        Memory Max Operating Temp           : 95 C\n    Power Readings                          \n        Power Management                    : Supported\n        Power Draw                          : 160.53 W\n        Power Limit                         : 850.00 W\n        Default Power Limit                 : 850.00 W\n        Enforced Power Limit                : 850.00 W\n        Min Power Limit                     : 400.00 W\n        Max Power Limit                     : 850.00 W\n    Clocks                                  \n        CU                                  : 200 MHz\n        Memory                              : 1600 MHz\n        Video                               : 600 MHz\n    Applications Clocks                     \n        CU                                  : 1300 MHz\n        Memory                              : 1600 MHz\n    Default Applications Clocks             \n        CU                                  : 1300 MHz\n        Memory                              : 1600 MHz\n    Max Clocks                              \n        CU                                  : 1300 MHz\n        Memory                              : 1600 MHz\n        Video                               : 925 MHz\n    Fabric                                  \n        State                               : Completed\n        Status                              : Success\n        CliqueId                            : 32766\n        ClusterUUID                         : 019EC114-0080-1228-0000-000000000000\n    Capabilities                            \n        EGM                                 : Disabled\n    Processes                               : None\n",
+      "1": "\n==============PPUSMI LOG==============\n\nTimestamp                                   : Tue Sep 15 20:55:10 2026\nDriver Version                              : 2.2.1-rc0f8b072216\nHGGC Version                                : 13.3\nSDK Version                                 : 2.2.0-bcc7ac\n\nAttached PPUs                               : 8\nPPU 00000001:81:00.0                        \n    Product Name                            : ZW-M890P\n    Product Architecture                    : Beethoven\n    Compute Capability                      : 8.9\n    Persistence Mode                        : N/A\n    Addressing Mode                         : None\n    MIG Mode                                \n        Current                             : Disabled\n        Pending                             : Disabled\n    Serial Number                           : NA\n    PPU UUID                                : GPU-1154b604-c530-0604-0000-000000000000\n    Minor Number                            : 2\n    Rear ID                                 : 0\n    Platform Info                           \n        Chassis Serial Number               : 0x0\n        Slot Number                         : 255\n        Tray Index                          : 0\n        Host ID                             : 0\n        Peer Type                           : Switch Connected\n        Module Id                           : 1\n        PPU Fabric GUID                     : 0x80c618a096ca82\n    PPU Virtualization Mode                 \n        Virtualization Mode                 : None\n        Host VGPU Mode                      : Non SR-IOV\n    PPU Recovery Action                     : None\n    PCI                                     \n        Bus                                 : 0x81\n        Device                              : 0x00\n        Domain                              : 0x0001\n        Base Classcode                      : 0x3\n        Sub Classcode                       : 0x2\n        Device Id                           : 0x60051DED\n        Bus Id                              : 00000001:81:00.0\n        Sub System Id                       : 0x61011DED\n        Vendor Id                           : 0x1DED\n        PPU Link Info                       \n            PCIe Generation                 \n                Max                         : 5\n                Current                     : 5\n            Link Width                      \n                Max                         : 16x\n                Current                     : 16x\n        Replays Since Reset                 : N/A\n        Tx Throughput                       : 0 KB/s\n        Rx Throughput                       : 0 KB/s\n    Fan Speed                               : N/A\n    Performance State                       : N/A\n    VBIOS Version                           : 1.2.1-rd8865072218\n    Auto Reset                              : Enabled\n    Overclocking Mode                       : N/A\n    Performance Counter                     : Disabled\n    Tide Mode                               : Disabled\n    MPS Mode                                : Disabled\n    Clocks Throttle Reasons                 \n        Idle                                : Active\n        Applications Clocks Setting         : Not Active\n        SW Power Cap                        : Not Active\n        HW Slowdown                         : Not Active\n            HW Thermal Slowdown             : Not Active\n            HW Power Brake Slowdown         : Not Active\n        Sync Boost                          : Not Active\n        SW Thermal Slowdown                 : Not Active\n    Xid Errors                              \n        PPU Reset Correctable               : N/A\n        OS Reboot Correctable               : N/A\n        Cold Reboot Correctable             : N/A\n    Compute Mode                            : Default\n    HBM Vendor                              : Samsung\n    Memory Usage                            \n        Total                               : 98304 MiB\n        Used                                : 1 MiB\n        Free                                : 98303 MiB\n    Utilization                             \n        Ppu                                 : 0 %\n        Core                                : 0 %\n        Memory                              : 0 %\n        Encoder                             : 0 %\n        Decoder                             : 0 %\n    Ecc Mode                                \n        Current                             : Enabled\n        Pending                             : Enabled\n    ECC Errors                              \n        Volatile                            \n            SRAM Correctable                : N/A\n            SRAM Uncorrectable              : N/A\n            DRAM Correctable                : 0\n            DRAM Uncorrectable              : 0\n        Aggregate                           \n            SRAM Correctable                : N/A\n            SRAM Uncorrectable              : N/A\n            DRAM Correctable                : 0\n            DRAM Uncorrectable              : 0\n    Retired Pages                           \n        Single Bit ECC                      : 0\n        Double Bit ECC                      : 0\n        Pending Page Blacklist              : No\n    Remapped Rows                           \n        Correctable Error                   : 0\n        Uncorrectable Error                 : 0\n        Pending                             : No\n        Remapping Failure Occurred          : No\n        Bank Remap Availability Histogram   \n            Max                             : 4096 bank(s)\n            High                            : 0 bank(s)\n            Partial                         : 0 bank(s)\n            Low                             : 0 bank(s)\n            None                            : 0 bank(s)\n    Temperature                             \n        PPU Current Temp                    : 34 C\n        PPU Shutdown Temp                   : 95 C\n        PPU Slowdown Temp                   : 82 C\n        PPU Max Operating Temp              : 82 C\n        PPU Target Temperature              : N/A\n        Memory Current Temp                 : 38 C\n        Memory Max Operating Temp           : 95 C\n    Power Readings                          \n        Power Management                    : Supported\n        Power Draw                          : 160.81 W\n        Power Limit                         : 850.00 W\n        Default Power Limit                 : 850.00 W\n        Enforced Power Limit                : 850.00 W\n        Min Power Limit                     : 400.00 W\n        Max Power Limit                     : 850.00 W\n    Clocks                                  \n        CU                                  : 200 MHz\n        Memory                              : 1600 MHz\n        Video                               : 600 MHz\n    Applications Clocks                     \n        CU                                  : 1300 MHz\n        Memory                              : 1600 MHz\n    Default Applications Clocks             \n        CU                                  : 1300 MHz\n        Memory                              : 1600 MHz\n    Max Clocks                              \n        CU                                  : 1300 MHz\n        Memory                              : 1600 MHz\n        Video                               : 925 MHz\n    Fabric                                  \n        State                               : Completed\n        Status                              : Success\n        CliqueId                            : 32766\n        ClusterUUID                         : 019EC114-0080-1228-0000-000000000000\n    Capabilities                            \n        EGM                                 : Disabled\n    Processes                               : None\n",
+      "3": "\n==============PPUSMI LOG==============\n\nTimestamp                                   : Tue Sep 15 20:55:10 2026\nDriver Version                              : 2.2.1-rc0f8b072216\nHGGC Version                                : 13.3\nSDK Version                                 : 2.2.0-bcc7ac\n\nAttached PPUs                               : 8\nPPU 00000001:27:00.0                        \n    Product Name                            : ZW-M890P\n    Product Architecture                    : Beethoven\n    Compute Capability                      : 8.9\n    Persistence Mode                        : N/A\n    Addressing Mode                         : None\n    MIG Mode                                \n        Current                             : Disabled\n        Pending                             : Disabled\n    Serial Number                           : NA\n    PPU UUID                                : GPU-1154b604-4511-061c-0000-000000000000\n    Minor Number                            : 4\n    Rear ID                                 : 0\n    Platform Info                           \n        Chassis Serial Number               : 0x0\n        Slot Number                         : 255\n        Tray Index                          : 0\n        Host ID                             : 0\n        Peer Type                           : Switch Connected\n        Module Id                           : 3\n        PPU Fabric GUID                     : 0x380c228a096ca82\n    PPU Virtualization Mode                 \n        Virtualization Mode                 : None\n        Host VGPU Mode                      : Non SR-IOV\n    PPU Recovery Action                     : None\n    PCI                                     \n        Bus                                 : 0x27\n        Device                              : 0x00\n        Domain                              : 0x0001\n        Base Classcode                      : 0x3\n        Sub Classcode                       : 0x2\n        Device Id                           : 0x60051DED\n        Bus Id                              : 00000001:27:00.0\n        Sub System Id                       : 0x61011DED\n        Vendor Id                           : 0x1DED\n        PPU Link Info                       \n            PCIe Generation                 \n                Max                         : 5\n                Current                     : 5\n            Link Width                      \n                Max                         : 16x\n                Current                     : 16x\n        Replays Since Reset                 : N/A\n        Tx Throughput                       : 0 KB/s\n        Rx Throughput                       : 0 KB/s\n    Fan Speed                               : N/A\n    Performance State                       : N/A\n    VBIOS Version                           : 1.2.1-rd8865072218\n    Auto Reset                              : Enabled\n    Overclocking Mode                       : N/A\n    Performance Counter                     : Disabled\n    Tide Mode                               : Disabled\n    MPS Mode                                : Disabled\n    Clocks Throttle Reasons                 \n        Idle                                : Active\n        Applications Clocks Setting         : Not Active\n        SW Power Cap                        : Not Active\n        HW Slowdown                         : Not Active\n            HW Thermal Slowdown             : Not Active\n            HW Power Brake Slowdown         : Not Active\n        Sync Boost                          : Not Active\n        SW Thermal Slowdown                 : Not Active\n    Xid Errors                              \n        PPU Reset Correctable               : N/A\n        OS Reboot Correctable               : N/A\n        Cold Reboot Correctable             : N/A\n    Compute Mode                            : Default\n    HBM Vendor                              : Samsung\n    Memory Usage                            \n        Total                               : 98304 MiB\n        Used                                : 1 MiB\n        Free                                : 98303 MiB\n    Utilization                             \n        Ppu                                 : 0 %\n        Core                                : 0 %\n        Memory                              : 0 %\n        Encoder                             : 0 %\n        Decoder                             : 0 %\n    Ecc Mode                                \n        Current                             : Enabled\n        Pending                             : Enabled\n    ECC Errors                              \n        Volatile                            \n            SRAM Correctable                : N/A\n            SRAM Uncorrectable              : N/A\n            DRAM Correctable                : 0\n            DRAM Uncorrectable              : 0\n        Aggregate                           \n            SRAM Correctable                : N/A\n            SRAM Uncorrectable              : N/A\n            DRAM Correctable                : 0\n            DRAM Uncorrectable              : 0\n    Retired Pages                           \n        Single Bit ECC                      : 0\n        Double Bit ECC                      : 0\n        Pending Page Blacklist              : No\n    Remapped Rows                           \n        Correctable Error                   : 0\n        Uncorrectable Error                 : 0\n        Pending                             : No\n        Remapping Failure Occurred          : No\n        Bank Remap Availability Histogram   \n            Max                             : 4096 bank(s)\n            High                            : 0 bank(s)\n            Partial                         : 0 bank(s)\n            Low                             : 0 bank(s)\n            None                            : 0 bank(s)\n    Temperature                             \n        PPU Current Temp                    : 29 C\n        PPU Shutdown Temp                   : 95 C\n        PPU Slowdown Temp                   : 82 C\n        PPU Max Operating Temp              : 82 C\n        PPU Target Temperature              : N/A\n        Memory Current Temp                 : 32 C\n        Memory Max Operating Temp           : 95 C\n    Power Readings                          \n        Power Management                    : Supported\n        Power Draw                          : 159.63 W\n        Power Limit                         : 850.00 W\n        Default Power Limit                 : 850.00 W\n        Enforced Power Limit                : 850.00 W\n        Min Power Limit                     : 400.00 W\n        Max Power Limit                     : 850.00 W\n    Clocks                                  \n        CU                                  : 200 MHz\n        Memory                              : 1600 MHz\n        Video                               : 600 MHz\n    Applications Clocks                     \n        CU                                  : 1300 MHz\n        Memory                              : 1600 MHz\n    Default Applications Clocks             \n        CU                                  : 1300 MHz\n        Memory                              : 1600 MHz\n    Max Clocks                              \n        CU                                  : 1300 MHz\n        Memory                              : 1600 MHz\n        Video                               : 925 MHz\n    Fabric                                  \n        State                               : Completed\n        Status                              : Success\n        CliqueId                            : 32766\n        ClusterUUID                         : 019EC114-0080-1228-0000-000000000000\n    Capabilities                            \n        EGM                                 : Disabled\n    Processes                               : None\n",
+      "4": "\n==============PPUSMI LOG==============\n\nTimestamp                                   : Tue Sep 15 20:55:11 2026\nDriver Version                              : 2.2.1-rc0f8b072216\nHGGC Version                                : 13.3\nSDK Version                                 : 2.2.0-bcc7ac\n\nAttached PPUs                               : 8\nPPU 00000000:DF:00.0                        \n    Product Name                            : ZW-M890P\n    Product Architecture                    : Beethoven\n    Compute Capability                      : 8.9\n    Persistence Mode                        : N/A\n    Addressing Mode                         : None\n    MIG Mode                                \n        Current                             : Disabled\n        Pending                             : Disabled\n    Serial Number                           : NA\n    PPU UUID                                : GPU-1154b604-c8b0-0424-0000-000000000000\n    Minor Number                            : 5\n    Rear ID                                 : 0\n    Platform Info                           \n        Chassis Serial Number               : 0x0\n        Slot Number                         : 255\n        Tray Index                          : 0\n        Host ID                             : 0\n        Peer Type                           : Switch Connected\n        Module Id                           : 4\n        PPU Fabric GUID                     : 0x48096190096ca82\n    PPU Virtualization Mode                 \n        Virtualization Mode                 : None\n        Host VGPU Mode                      : Non SR-IOV\n    PPU Recovery Action                     : None\n    PCI                                     \n        Bus                                 : 0xDF\n        Device                              : 0x00\n        Domain                              : 0x0000\n        Base Classcode                      : 0x3\n        Sub Classcode                       : 0x2\n        Device Id                           : 0x60051DED\n        Bus Id                              : 00000000:DF:00.0\n        Sub System Id                       : 0x61011DED\n        Vendor Id                           : 0x1DED\n        PPU Link Info                       \n            PCIe Generation                 \n                Max                         : 5\n                Current                     : 5\n            Link Width                      \n                Max                         : 16x\n                Current                     : 16x\n        Replays Since Reset                 : N/A\n        Tx Throughput                       : 0 KB/s\n        Rx Throughput                       : 0 KB/s\n    Fan Speed                               : N/A\n    Performance State                       : N/A\n    VBIOS Version                           : 1.2.1-rd8865072218\n    Auto Reset                              : Enabled\n    Overclocking Mode                       : N/A\n    Performance Counter                     : Disabled\n    Tide Mode                               : Disabled\n    MPS Mode                                : Disabled\n    Clocks Throttle Reasons                 \n        Idle                                : Active\n        Applications Clocks Setting         : Not Active\n        SW Power Cap                        : Not Active\n        HW Slowdown                         : Not Active\n            HW Thermal Slowdown             : Not Active\n            HW Power Brake Slowdown         : Not Active\n        Sync Boost                          : Not Active\n        SW Thermal Slowdown                 : Not Active\n    Xid Errors                              \n        PPU Reset Correctable               : N/A\n        OS Reboot Correctable               : N/A\n        Cold Reboot Correctable             : N/A\n    Compute Mode                            : Default\n    HBM Vendor                              : Samsung\n    Memory Usage                            \n        Total                               : 98304 MiB\n        Used                                : 1 MiB\n        Free                                : 98303 MiB\n    Utilization                             \n        Ppu                                 : 0 %\n        Core                                : 0 %\n        Memory                              : 0 %\n        Encoder                             : 0 %\n        Decoder                             : 0 %\n    Ecc Mode                                \n        Current                             : Enabled\n        Pending                             : Enabled\n    ECC Errors                              \n        Volatile                            \n            SRAM Correctable                : N/A\n            SRAM Uncorrectable              : N/A\n            DRAM Correctable                : 0\n            DRAM Uncorrectable              : 0\n        Aggregate                           \n            SRAM Correctable                : N/A\n            SRAM Uncorrectable              : N/A\n            DRAM Correctable                : 0\n            DRAM Uncorrectable              : 0\n    Retired Pages                           \n        Single Bit ECC                      : 0\n        Double Bit ECC                      : 0\n        Pending Page Blacklist              : No\n    Remapped Rows                           \n        Correctable Error                   : 0\n        Uncorrectable Error                 : 0\n        Pending                             : No\n        Remapping Failure Occurred          : No\n        Bank Remap Availability Histogram   \n            Max                             : 4096 bank(s)\n            High                            : 0 bank(s)\n            Partial                         : 0 bank(s)\n            Low                             : 0 bank(s)\n            None                            : 0 bank(s)\n    Temperature                             \n        PPU Current Temp                    : 30 C\n        PPU Shutdown Temp                   : 95 C\n        PPU Slowdown Temp                   : 82 C\n        PPU Max Operating Temp              : 82 C\n        PPU Target Temperature              : N/A\n        Memory Current Temp                 : 34 C\n        Memory Max Operating Temp           : 95 C\n    Power Readings                          \n        Power Management                    : Supported\n        Power Draw                          : 161.57 W\n        Power Limit                         : 850.00 W\n        Default Power Limit                 : 850.00 W\n        Enforced Power Limit                : 850.00 W\n        Min Power Limit                     : 400.00 W\n        Max Power Limit                     : 850.00 W\n    Clocks                                  \n        CU                                  : 200 MHz\n        Memory                              : 1600 MHz\n        Video                               : 600 MHz\n    Applications Clocks                     \n        CU                                  : 1300 MHz\n        Memory                              : 1600 MHz\n    Default Applications Clocks             \n        CU                                  : 1300 MHz\n        Memory                              : 1600 MHz\n    Max Clocks                              \n        CU                                  : 1300 MHz\n        Memory                              : 1600 MHz\n        Video                               : 925 MHz\n    Fabric                                  \n        State                               : Completed\n        Status                              : Success\n        CliqueId                            : 32766\n        ClusterUUID                         : 019EC114-0080-1228-0000-000000000000\n    Capabilities                            \n        EGM                                 : Disabled\n    Processes                               : None\n",
+      "5": "\n==============PPUSMI LOG==============\n\nTimestamp                                   : Tue Sep 15 20:55:11 2026\nDriver Version                              : 2.2.1-rc0f8b072216\nHGGC Version                                : 13.3\nSDK Version                                 : 2.2.0-bcc7ac\n\nAttached PPUs                               : 8\nPPU 00000000:BE:00.0                        \n    Product Name                            : ZW-M890P\n    Product Architecture                    : Beethoven\n    Compute Capability                      : 8.9\n    Persistence Mode                        : N/A\n    Addressing Mode                         : None\n    MIG Mode                                \n        Current                             : Disabled\n        Pending                             : Disabled\n    Serial Number                           : NA\n    PPU UUID                                : GPU-1154b604-4541-050c-0000-000000000000\n    Minor Number                            : 6\n    Rear ID                                 : 0\n    Platform Info                           \n        Chassis Serial Number               : 0x0\n        Slot Number                         : 255\n        Tray Index                          : 0\n        Host ID                             : 0\n        Peer Type                           : Switch Connected\n        Module Id                           : 5\n        PPU Fabric GUID                     : 0x180a828a096ca82\n    PPU Virtualization Mode                 \n        Virtualization Mode                 : None\n        Host VGPU Mode                      : Non SR-IOV\n    PPU Recovery Action                     : None\n    PCI                                     \n        Bus                                 : 0xBE\n        Device                              : 0x00\n        Domain                              : 0x0000\n        Base Classcode                      : 0x3\n        Sub Classcode                       : 0x2\n        Device Id                           : 0x60051DED\n        Bus Id                              : 00000000:BE:00.0\n        Sub System Id                       : 0x61011DED\n        Vendor Id                           : 0x1DED\n        PPU Link Info                       \n            PCIe Generation                 \n                Max                         : 5\n                Current                     : 5\n            Link Width                      \n                Max                         : 16x\n                Current                     : 16x\n        Replays Since Reset                 : N/A\n        Tx Throughput                       : 0 KB/s\n        Rx Throughput                       : 0 KB/s\n    Fan Speed                               : N/A\n    Performance State                       : N/A\n    VBIOS Version                           : 1.2.1-rd8865072218\n    Auto Reset                              : Enabled\n    Overclocking Mode                       : N/A\n    Performance Counter                     : Disabled\n    Tide Mode                               : Disabled\n    MPS Mode                                : Disabled\n    Clocks Throttle Reasons                 \n        Idle                                : Active\n        Applications Clocks Setting         : Not Active\n        SW Power Cap                        : Not Active\n        HW Slowdown                         : Not Active\n            HW Thermal Slowdown             : Not Active\n            HW Power Brake Slowdown         : Not Active\n        Sync Boost                          : Not Active\n        SW Thermal Slowdown                 : Not Active\n    Xid Errors                              \n        PPU Reset Correctable               : N/A\n        OS Reboot Correctable               : N/A\n        Cold Reboot Correctable             : N/A\n    Compute Mode                            : Default\n    HBM Vendor                              : Samsung\n    Memory Usage                            \n        Total                               : 98304 MiB\n        Used                                : 1 MiB\n        Free                                : 98303 MiB\n    Utilization                             \n        Ppu                                 : 0 %\n        Core                                : 0 %\n        Memory                              : 0 %\n        Encoder                             : 0 %\n        Decoder                             : 0 %\n    Ecc Mode                                \n        Current                             : Enabled\n        Pending                             : Enabled\n    ECC Errors                              \n        Volatile                            \n            SRAM Correctable                : N/A\n            SRAM Uncorrectable              : N/A\n            DRAM Correctable                : 0\n            DRAM Uncorrectable              : 0\n        Aggregate                           \n            SRAM Correctable                : N/A\n            SRAM Uncorrectable              : N/A\n            DRAM Correctable                : 0\n            DRAM Uncorrectable              : 0\n    Retired Pages                           \n        Single Bit ECC                      : 0\n        Double Bit ECC                      : 0\n        Pending Page Blacklist              : No\n    Remapped Rows                           \n        Correctable Error                   : 0\n        Uncorrectable Error                 : 0\n        Pending                             : No\n        Remapping Failure Occurred          : No\n        Bank Remap Availability Histogram   \n            Max                             : 4096 bank(s)\n            High                            : 0 bank(s)\n            Partial                         : 0 bank(s)\n            Low                             : 0 bank(s)\n            None                            : 0 bank(s)\n    Temperature                             \n        PPU Current Temp                    : 33 C\n        PPU Shutdown Temp                   : 95 C\n        PPU Slowdown Temp                   : 82 C\n        PPU Max Operating Temp              : 82 C\n        PPU Target Temperature              : N/A\n        Memory Current Temp                 : 37 C\n        Memory Max Operating Temp           : 95 C\n    Power Readings                          \n        Power Management                    : Supported\n        Power Draw                          : 160.94 W\n        Power Limit                         : 850.00 W\n        Default Power Limit                 : 850.00 W\n        Enforced Power Limit                : 850.00 W\n        Min Power Limit                     : 400.00 W\n        Max Power Limit                     : 850.00 W\n    Clocks                                  \n        CU                                  : 200 MHz\n        Memory                              : 1600 MHz\n        Video                               : 600 MHz\n    Applications Clocks                     \n        CU                                  : 1300 MHz\n        Memory                              : 1600 MHz\n    Default Applications Clocks             \n        CU                                  : 1300 MHz\n        Memory                              : 1600 MHz\n    Max Clocks                              \n        CU                                  : 1300 MHz\n        Memory                              : 1600 MHz\n        Video                               : 925 MHz\n    Fabric                                  \n        State                               : Completed\n        Status                              : Success\n        CliqueId                            : 32766\n        ClusterUUID                         : 019EC114-0080-1228-0000-000000000000\n    Capabilities                            \n        EGM                                 : Disabled\n    Processes                               : None\n",
+      "6": "\n==============PPUSMI LOG==============\n\nTimestamp                                   : Tue Sep 15 20:55:11 2026\nDriver Version                              : 2.2.1-rc0f8b072216\nHGGC Version                                : 13.3\nSDK Version                                 : 2.2.0-bcc7ac\n\nAttached PPUs                               : 8\nPPU 00000000:03:00.0                        \n    Product Name                            : ZW-M890P\n    Product Architecture                    : Beethoven\n    Compute Capability                      : 8.9\n    Persistence Mode                        : N/A\n    Addressing Mode                         : None\n    MIG Mode                                \n        Current                             : Disabled\n        Pending                             : Disabled\n    Serial Number                           : NA\n    PPU UUID                                : GPU-1154b604-c870-071c-0000-000000000000\n    Minor Number                            : 7\n    Rear ID                                 : 0\n    Platform Info                           \n        Chassis Serial Number               : 0x0\n        Slot Number                         : 255\n        Tray Index                          : 0\n        Host ID                             : 0\n        Peer Type                           : Switch Connected\n        Module Id                           : 6\n        PPU Fabric GUID                     : 0x380ee190096ca82\n    PPU Virtualization Mode                 \n        Virtualization Mode                 : None\n        Host VGPU Mode                      : Non SR-IOV\n    PPU Recovery Action                     : None\n    PCI                                     \n        Bus                                 : 0x03\n        Device                              : 0x00\n        Domain                              : 0x0000\n        Base Classcode                      : 0x3\n        Sub Classcode                       : 0x2\n        Device Id                           : 0x60051DED\n        Bus Id                              : 00000000:03:00.0\n        Sub System Id                       : 0x61011DED\n        Vendor Id                           : 0x1DED\n        PPU Link Info                       \n            PCIe Generation                 \n                Max                         : 5\n                Current                     : 5\n            Link Width                      \n                Max                         : 16x\n                Current                     : 16x\n        Replays Since Reset                 : N/A\n        Tx Throughput                       : 0 KB/s\n        Rx Throughput                       : 0 KB/s\n    Fan Speed                               : N/A\n    Performance State                       : N/A\n    VBIOS Version                           : 1.2.1-rd8865072218\n    Auto Reset                              : Enabled\n    Overclocking Mode                       : N/A\n    Performance Counter                     : Disabled\n    Tide Mode                               : Disabled\n    MPS Mode                                : Disabled\n    Clocks Throttle Reasons                 \n        Idle                                : Active\n        Applications Clocks Setting         : Not Active\n        SW Power Cap                        : Not Active\n        HW Slowdown                         : Not Active\n            HW Thermal Slowdown             : Not Active\n            HW Power Brake Slowdown         : Not Active\n        Sync Boost                          : Not Active\n        SW Thermal Slowdown                 : Not Active\n    Xid Errors                              \n        PPU Reset Correctable               : N/A\n        OS Reboot Correctable               : N/A\n        Cold Reboot Correctable             : N/A\n    Compute Mode                            : Default\n    HBM Vendor                              : Samsung\n    Memory Usage                            \n        Total                               : 98304 MiB\n        Used                                : 1 MiB\n        Free                                : 98303 MiB\n    Utilization                             \n        Ppu                                 : 0 %\n        Core                                : 0 %\n        Memory                              : 0 %\n        Encoder                             : 0 %\n        Decoder                             : 0 %\n    Ecc Mode                                \n        Current                             : Enabled\n        Pending                             : Enabled\n    ECC Errors                              \n        Volatile                            \n            SRAM Correctable                : N/A\n            SRAM Uncorrectable              : N/A\n            DRAM Correctable                : 0\n            DRAM Uncorrectable              : 0\n        Aggregate                           \n            SRAM Correctable                : N/A\n            SRAM Uncorrectable              : N/A\n            DRAM Correctable                : 0\n            DRAM Uncorrectable              : 0\n    Retired Pages                           \n        Single Bit ECC                      : 0\n        Double Bit ECC                      : 0\n        Pending Page Blacklist              : No\n    Remapped Rows                           \n        Correctable Error                   : 0\n        Uncorrectable Error                 : 0\n        Pending                             : No\n        Remapping Failure Occurred          : No\n        Bank Remap Availability Histogram   \n            Max                             : 4096 bank(s)\n            High                            : 0 bank(s)\n            Partial                         : 0 bank(s)\n            Low                             : 0 bank(s)\n            None                            : 0 bank(s)\n    Temperature                             \n        PPU Current Temp                    : 35 C\n        PPU Shutdown Temp                   : 95 C\n        PPU Slowdown Temp                   : 82 C\n        PPU Max Operating Temp              : 82 C\n        PPU Target Temperature              : N/A\n        Memory Current Temp                 : 39 C\n        Memory Max Operating Temp           : 95 C\n    Power Readings                          \n        Power Management                    : Supported\n        Power Draw                          : 161.19 W\n        Power Limit                         : 850.00 W\n        Default Power Limit                 : 850.00 W\n        Enforced Power Limit                : 850.00 W\n        Min Power Limit                     : 400.00 W\n        Max Power Limit                     : 850.00 W\n    Clocks                                  \n        CU                                  : 200 MHz\n        Memory                              : 1600 MHz\n        Video                               : 600 MHz\n    Applications Clocks                     \n        CU                                  : 1300 MHz\n        Memory                              : 1600 MHz\n    Default Applications Clocks             \n        CU                                  : 1300 MHz\n        Memory                              : 1600 MHz\n    Max Clocks                              \n        CU                                  : 1300 MHz\n        Memory                              : 1600 MHz\n        Video                               : 925 MHz\n    Fabric                                  \n        State                               : Completed\n        Status                              : Success\n        CliqueId                            : 32766\n        ClusterUUID                         : 019EC114-0080-1228-0000-000000000000\n    Capabilities                            \n        EGM                                 : Disabled\n    Processes                               : None\n",
+      "7": "\n==============PPUSMI LOG==============\n\nTimestamp                                   : Tue Sep 15 20:55:11 2026\nDriver Version                              : 2.2.1-rc0f8b072216\nHGGC Version                                : 13.3\nSDK Version                                 : 2.2.0-bcc7ac\n\nAttached PPUs                               : 8\nPPU 00000000:61:00.0                        \n    Product Name                            : ZW-M890P\n    Product Architecture                    : Beethoven\n    Compute Capability                      : 8.9\n    Persistence Mode                        : N/A\n    Addressing Mode                         : None\n    MIG Mode                                \n        Current                             : Disabled\n        Pending                             : Disabled\n    Serial Number                           : NA\n    PPU UUID                                : GPU-1154b604-4551-0710-0000-000000000000\n    Minor Number                            : 8\n    Rear ID                                 : 0\n    Platform Info                           \n        Chassis Serial Number               : 0x0\n        Slot Number                         : 255\n        Tray Index                          : 0\n        Host ID                             : 0\n        Peer Type                           : Switch Connected\n        Module Id                           : 7\n        PPU Fabric GUID                     : 0x200ea28a096ca82\n    PPU Virtualization Mode                 \n        Virtualization Mode                 : None\n        Host VGPU Mode                      : Non SR-IOV\n    PPU Recovery Action                     : None\n    PCI                                     \n        Bus                                 : 0x61\n        Device                              : 0x00\n        Domain                              : 0x0000\n        Base Classcode                      : 0x3\n        Sub Classcode                       : 0x2\n        Device Id                           : 0x60051DED\n        Bus Id                              : 00000000:61:00.0\n        Sub System Id                       : 0x61011DED\n        Vendor Id                           : 0x1DED\n        PPU Link Info                       \n            PCIe Generation                 \n                Max                         : 5\n                Current                     : 5\n            Link Width                      \n                Max                         : 16x\n                Current                     : 16x\n        Replays Since Reset                 : N/A\n        Tx Throughput                       : 0 KB/s\n        Rx Throughput                       : 0 KB/s\n    Fan Speed                               : N/A\n    Performance State                       : N/A\n    VBIOS Version                           : 1.2.1-rd8865072218\n    Auto Reset                              : Enabled\n    Overclocking Mode                       : N/A\n    Performance Counter                     : Disabled\n    Tide Mode                               : Disabled\n    MPS Mode                                : Disabled\n    Clocks Throttle Reasons                 \n        Idle                                : Active\n        Applications Clocks Setting         : Not Active\n        SW Power Cap                        : Not Active\n        HW Slowdown                         : Not Active\n            HW Thermal Slowdown             : Not Active\n            HW Power Brake Slowdown         : Not Active\n        Sync Boost                          : Not Active\n        SW Thermal Slowdown                 : Not Active\n    Xid Errors                              \n        PPU Reset Correctable               : N/A\n        OS Reboot Correctable               : N/A\n        Cold Reboot Correctable             : N/A\n    Compute Mode                            : Default\n    HBM Vendor                              : Samsung\n    Memory Usage                            \n        Total                               : 98304 MiB\n        Used                                : 1 MiB\n        Free                                : 98303 MiB\n    Utilization                             \n        Ppu                                 : 0 %\n        Core                                : 0 %\n        Memory                              : 0 %\n        Encoder                             : 0 %\n        Decoder                             : 0 %\n    Ecc Mode                                \n        Current                             : Enabled\n        Pending                             : Enabled\n    ECC Errors                              \n        Volatile                            \n            SRAM Correctable                : N/A\n            SRAM Uncorrectable              : N/A\n            DRAM Correctable                : 0\n            DRAM Uncorrectable              : 0\n        Aggregate                           \n            SRAM Correctable                : N/A\n            SRAM Uncorrectable              : N/A\n            DRAM Correctable                : 0\n            DRAM Uncorrectable              : 0\n    Retired Pages                           \n        Single Bit ECC                      : 0\n        Double Bit ECC                      : 0\n        Pending Page Blacklist              : No\n    Remapped Rows                           \n        Correctable Error                   : 0\n        Uncorrectable Error                 : 0\n        Pending                             : No\n        Remapping Failure Occurred          : No\n        Bank Remap Availability Histogram   \n            Max                             : 4096 bank(s)\n            High                            : 0 bank(s)\n            Partial                         : 0 bank(s)\n            Low                             : 0 bank(s)\n            None                            : 0 bank(s)\n    Temperature                             \n        PPU Current Temp                    : 32 C\n        PPU Shutdown Temp                   : 95 C\n        PPU Slowdown Temp                   : 82 C\n        PPU Max Operating Temp              : 82 C\n        PPU Target Temperature              : N/A\n        Memory Current Temp                 : 35 C\n        Memory Max Operating Temp           : 95 C\n    Power Readings                          \n        Power Management                    : Supported\n        Power Draw                          : 159.18 W\n        Power Limit                         : 850.00 W\n        Default Power Limit                 : 850.00 W\n        Enforced Power Limit                : 850.00 W\n        Min Power Limit                     : 400.00 W\n        Max Power Limit                     : 850.00 W\n    Clocks                                  \n        CU                                  : 200 MHz\n        Memory                              : 1600 MHz\n        Video                               : 600 MHz\n    Applications Clocks                     \n        CU                                  : 1300 MHz\n        Memory                              : 1600 MHz\n    Default Applications Clocks             \n        CU                                  : 1300 MHz\n        Memory                              : 1600 MHz\n    Max Clocks                              \n        CU                                  : 1300 MHz\n        Memory                              : 1600 MHz\n        Video                               : 925 MHz\n    Fabric                                  \n        State                               : Completed\n        Status                              : Success\n        CliqueId                            : 32766\n        ClusterUUID                         : 019EC114-0080-1228-0000-000000000000\n    Capabilities                            \n        EGM                                 : Disabled\n    Processes                               : None\n"
+    },
+    "inventory": {
+      "expected_per_arch": 20793,
+      "files": [
+        {
+          "file": "GLM-5.3-Flash_decode_tp16_kvlimit_200GB_model_len_128K_kda_op.list",
+          "rows": 259,
+          "sha256": "89386ca19ee9c9866e2da827a82b544907d816e0551c445e50b499cd08570cdb"
+        },
+        {
+          "file": "GLM-5.3-Flash_decode_tp1_kvlimit_200GB_model_len_128K_kda_op.list",
+          "rows": 203,
+          "sha256": "6764742ef8755f8dac0b45b594345a90b2f12fa68dc47b19bebd591dba39d355"
+        },
+        {
+          "file": "GLM-5.3-Flash_decode_tp2_kvlimit_200GB_model_len_128K_kda_op.list",
+          "rows": 221,
+          "sha256": "df1db6b67a7f22335ee157b8e97a6b1fb2fde08d5ca9ebed3622f89602245433"
+        },
+        {
+          "file": "GLM-5.3-Flash_decode_tp4_kvlimit_200GB_model_len_128K_kda_op.list",
+          "rows": 234,
+          "sha256": "b0afa8482fa257260102d6c57d84359316fa9b8b5ba17e4f160de448fe85b2df"
+        },
+        {
+          "file": "GLM-5.3-Flash_decode_tp8_kvlimit_200GB_model_len_128K_kda_op.list",
+          "rows": 249,
+          "sha256": "2c2fe77a0e6b019f4d52e4e2d89b242123cfa73672ab3de134fcc7c26889093c"
+        },
+        {
+          "file": "Kimi-K3_decode_tp16_kvlimit_200GB_model_len_128K_kda_op.list",
+          "rows": 288,
+          "sha256": "14bf41f05bf67201b70054b72623fe3cd2d41248659d0b52e10ef252857d7700"
+        },
+        {
+          "file": "Kimi-K3_decode_tp1_kvlimit_200GB_model_len_128K_kda_op.list",
+          "rows": 204,
+          "sha256": "6960f8496a56c80359e635a30c386ed9693b022021b862558fea4c6658ffe82d"
+        },
+        {
+          "file": "Kimi-K3_decode_tp2_kvlimit_200GB_model_len_128K_kda_op.list",
+          "rows": 234,
+          "sha256": "ee922e349ab80aab7066cdc6f418d110ae27a674002defff58668602bd6267d4"
+        },
+        {
+          "file": "Kimi-K3_decode_tp4_kvlimit_200GB_model_len_128K_kda_op.list",
+          "rows": 252,
+          "sha256": "4bf07f5b04ac95f61f0bf12964fbe3116527d25cca2fa028be1a867c0d99e528"
+        },
+        {
+          "file": "Kimi-K3_decode_tp8_kvlimit_200GB_model_len_128K_kda_op.list",
+          "rows": 271,
+          "sha256": "b4a658cac03cbeba154408a6928a6c7b906b68377a33b261be785bd53f7c8d1a"
+        },
+        {
+          "file": "Kimi-Linear-48B-A3B_decode_tp1_kvlimit_200GB_model_len_128K_kda_op.list",
+          "rows": 59,
+          "sha256": "f48152edabe237c66b66c8f7e1481e773b5bf7d75644048f4e30092b8d6b177a"
+        },
+        {
+          "file": "Kimi-Linear-48B-A3B_decode_tp2_kvlimit_200GB_model_len_128K_kda_op.list",
+          "rows": 62,
+          "sha256": "9812c887a621d7d7cbe1f2521a823c680a3c8baa504f048fea7b3c38e54cd5fd"
+        },
+        {
+          "file": "Qwen3-Next-80B-A3B_decode_tp1_kvlimit_200GB_model_len_128K_gdn_op.list",
+          "rows": 234,
+          "sha256": "4b53beebcef26d739f7cd6202556aff65264b2fd71fcc7acdcff248b3187201a"
+        },
+        {
+          "file": "Qwen3-Next-80B-A3B_decode_tp2_kvlimit_200GB_model_len_128K_gdn_op.list",
+          "rows": 245,
+          "sha256": "4a25fca857183534a580a6847a1c590253c44263e7e97f7c5c24297753bf3da3"
+        },
+        {
+          "file": "Qwen3-Next-80B-A3B_decode_tp4_kvlimit_200GB_model_len_128K_gdn_op.list",
+          "rows": 247,
+          "sha256": "ed8f05280761940ec6eec992a2584bca9fde8b679deef68741391af3d3628670"
+        },
+        {
+          "file": "Qwen3.5-27B_decode_tp1_kvlimit_200GB_model_len_128K_gdn_op.list",
+          "rows": 217,
+          "sha256": "453d7eede430eedf56fd8bab69c48e39def800cf4c737d601f51ec6226122d61"
+        },
+        {
+          "file": "Qwen3.5-27B_decode_tp2_kvlimit_200GB_model_len_128K_gdn_op.list",
+          "rows": 232,
+          "sha256": "8687e7e2017bfbe02f1ad705db338c8efdc7fa7ac72b53440aa3d34d27ca441f"
+        },
+        {
+          "file": "Qwen3.5-35B-A3B_decode_tp1_kvlimit_200GB_model_len_128K_gdn_op.list",
+          "rows": 234,
+          "sha256": "52d16a34c85eb64e1660262b9fce3f53511accf31b1b0ea6eef34251565b05cf"
+        },
+        {
+          "file": "Qwen3.5-35B-A3B_decode_tp2_kvlimit_200GB_model_len_128K_gdn_op.list",
+          "rows": 244,
+          "sha256": "d647179f80f25cfe5ac5a440c67d2b8fd9966d6be07cf827dd4b7ea1598021a9"
+        },
+        {
+          "file": "Qwen3.5-397B-A17B_decode_tp1_kvlimit_200GB_model_len_128K_gdn_op.list",
+          "rows": 213,
+          "sha256": "dc0156dd2958bca992990787136ead5bc9eaadcd6db735a982db57fa46762dc2"
+        },
+        {
+          "file": "Qwen3.5-397B-A17B_decode_tp2_kvlimit_200GB_model_len_128K_gdn_op.list",
+          "rows": 224,
+          "sha256": "5a9e780bd23da7c3d14c68e6faf83d329207c5ab8cfbcfd1b659537b89a662d1"
+        },
+        {
+          "file": "Qwen3.5-397B-A17B_decode_tp4_kvlimit_200GB_model_len_128K_gdn_op.list",
+          "rows": 243,
+          "sha256": "3aac6f644f9f70d550e832956656fe36852459d0d76ffcaaf3d2ce77bdc2f0fd"
+        },
+        {
+          "file": "Qwen3.5-397B-A17B_decode_tp8_kvlimit_200GB_model_len_128K_gdn_op.list",
+          "rows": 243,
+          "sha256": "8afbb3ccee52760f303d35202f4e1edf835d31cd0c0f2b34a69a8df1dbd4912b"
+        },
+        {
+          "file": "Qwen3.5-Max_decode_tp1_kvlimit_200GB_model_len_128K_gdn_op.list",
+          "rows": 221,
+          "sha256": "4f70bb9e7c14d2feded0f64c8c549b30f4bbe1709ac84115ea79bc135aabb4df"
+        },
+        {
+          "file": "Qwen3.5-Max_decode_tp2_kvlimit_200GB_model_len_128K_gdn_op.list",
+          "rows": 232,
+          "sha256": "19873c69c3637d61a98538a1ab9fbe8ac7388e442bdece90942d6892d015d4d7"
+        },
+        {
+          "file": "Qwen3.5-Max_decode_tp4_kvlimit_200GB_model_len_128K_gdn_op.list",
+          "rows": 243,
+          "sha256": "3aac6f644f9f70d550e832956656fe36852459d0d76ffcaaf3d2ce77bdc2f0fd"
+        },
+        {
+          "file": "Qwen3.5-Max_decode_tp8_kvlimit_200GB_model_len_128K_gdn_op.list",
+          "rows": 243,
+          "sha256": "8afbb3ccee52760f303d35202f4e1edf835d31cd0c0f2b34a69a8df1dbd4912b"
+        },
+        {
+          "file": "Qwen3.7-Max_decode_tp1_kvlimit_200GB_model_len_128K_gdn_op.list",
+          "rows": 200,
+          "sha256": "f5a86e7d92e7ddf8d50bfd27a857d1e9fbb3da10039f0880f56000678e68cfad"
+        },
+        {
+          "file": "Qwen3.7-Max_decode_tp2_kvlimit_200GB_model_len_128K_gdn_op.list",
+          "rows": 213,
+          "sha256": "44c843053b642767a5d8d76a05334ccf7561ac6ba49c093c75fb32af90a79691"
+        },
+        {
+          "file": "Qwen3.7-Max_decode_tp4_kvlimit_200GB_model_len_128K_gdn_op.list",
+          "rows": 224,
+          "sha256": "ed1e4d56442a89157aca28d3e7c0bc7e8e294c165bfe4c3802972dfddb0a9771"
+        },
+        {
+          "file": "Qwen3.7-Max_decode_tp8_kvlimit_200GB_model_len_128K_gdn_op.list",
+          "rows": 243,
+          "sha256": "3dc3fd915578c55f04f004fd465a9a80b3f54102cad1eca16d8e96d76511bf13"
+        }
+      ],
+      "gate": "ordinary",
+      "iters": 50,
+      "maximum_estimated_gb": {
+        "k_last": 8.497082112,
+        "k_last_mtp": 25.541000192,
+        "k_last_packed": 8.63129984
+      },
+      "mode": "events",
+      "mtp_tokens": 4,
+      "original_ragged_lower_bound_replayed": false,
+      "raw_rows": 6931,
+      "raw_rows_independently_measured": true,
+      "seed": 2026,
+      "state_dtype": "fp32",
+      "warmup": 10
+    },
+    "probes": {
+      "0": {
+        "gpu": "ZW-M890P",
+        "path": "/host_ssd/pla_nonpow2_20260915/install_v2/pla/decode/_C.cpython-312-x86_64-linux-gnu.so",
+        "sha256": "2c2f5309576e6f09e402774a0fb03b7ec3925058a4cdaac86e7761b875ba5038",
+        "torch": "2.11.0"
+      },
+      "1": {
+        "gpu": "ZW-M890P",
+        "path": "/host_ssd/pla_nonpow2_20260915/install_v2/pla/decode/_C.cpython-312-x86_64-linux-gnu.so",
+        "sha256": "2c2f5309576e6f09e402774a0fb03b7ec3925058a4cdaac86e7761b875ba5038",
+        "torch": "2.11.0"
+      },
+      "3": {
+        "gpu": "ZW-M890P",
+        "path": "/host_ssd/pla_nonpow2_20260915/install_v2/pla/decode/_C.cpython-312-x86_64-linux-gnu.so",
+        "sha256": "2c2f5309576e6f09e402774a0fb03b7ec3925058a4cdaac86e7761b875ba5038",
+        "torch": "2.11.0"
+      },
+      "4": {
+        "gpu": "ZW-M890P",
+        "path": "/host_ssd/pla_nonpow2_20260915/install_v2/pla/decode/_C.cpython-312-x86_64-linux-gnu.so",
+        "sha256": "2c2f5309576e6f09e402774a0fb03b7ec3925058a4cdaac86e7761b875ba5038",
+        "torch": "2.11.0"
+      },
+      "5": {
+        "gpu": "ZW-M890P",
+        "path": "/host_ssd/pla_nonpow2_20260915/install_v2/pla/decode/_C.cpython-312-x86_64-linux-gnu.so",
+        "sha256": "2c2f5309576e6f09e402774a0fb03b7ec3925058a4cdaac86e7761b875ba5038",
+        "torch": "2.11.0"
+      },
+      "6": {
+        "gpu": "ZW-M890P",
+        "path": "/host_ssd/pla_nonpow2_20260915/install_v2/pla/decode/_C.cpython-312-x86_64-linux-gnu.so",
+        "sha256": "2c2f5309576e6f09e402774a0fb03b7ec3925058a4cdaac86e7761b875ba5038",
+        "torch": "2.11.0"
+      },
+      "7": {
+        "gpu": "ZW-M890P",
+        "path": "/host_ssd/pla_nonpow2_20260915/install_v2/pla/decode/_C.cpython-312-x86_64-linux-gnu.so",
+        "sha256": "2c2f5309576e6f09e402774a0fb03b7ec3925058a4cdaac86e7761b875ba5038",
+        "torch": "2.11.0"
+      }
+    },
+    "time": "2026-09-15T20:55:24.055225+08:00"
+  },
+  "raw_case_count": 6931,
+  "result_rows_by_kernel": {
+    "k_last": 6931,
+    "k_last_mtp": 6931,
+    "k_last_packed": 6931
+  },
+  "result_total_rows": 20793,
+  "schema_version": 1,
+  "skipped_rows_by_kernel": {
+    "k_last": 0,
+    "k_last_mtp": 0,
+    "k_last_packed": 0
+  },
+  "skipped_total_rows": 0,
+  "status": "completed",
+  "warmup": 10
+}
