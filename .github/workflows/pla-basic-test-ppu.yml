@@ -1,0 +1,96 @@
+name: PLA Basic Tests PPU
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SAIL_IMAGE: download.t-head.cn/docker_release/pytorch:sdk2.2.0-2.10.0-ubuntu24.04-hggcrt3-py312-20261005
+
+jobs:
+  build-and-test:
+    name: Build on CPU and test on 890P
+    runs-on: k8s-runner-group-cpu-thead
+    container:
+      image: download.t-head.cn/docker_release/pytorch:sdk2.2.0-2.10.0-ubuntu24.04-hggcrt3-py312-20261005
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout PLA
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout ACTLIZE v1.0.0
+        uses: actions/checkout@v4
+        with:
+          repository: t-head/actlize
+          ref: 2c7c9f9612e5d237c1d92ea652a83e99720739ff
+          path: .ci/actlize
+          persist-credentials: false
+
+      - name: Build PLA wheel on CPU runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset PIP_INDEX_URL
+          source /usr/local/PPU_SDK/envsetup.sh
+          python -m pip install --upgrade \
+            setuptools==69.5.1 setuptools-scm==9.2.2 wheel pybind11
+          export PPU_ACTLIZE_DIR="$GITHUB_WORKSPACE/.ci/actlize"
+          export PLA_BUILD_NAMESPACE="pla.decode,pla.decode.gdn.v_last,pla.prefill.flashqla"
+          export MAX_JOBS=20
+          python setup.py bdist_wheel
+          test -n "$(find dist -maxdepth 1 -name 'pla-*.whl' -print -quit)"
+
+      - name: Prepare repository caselist smoke subset
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_list="caselist/decode/Qwen3.7-Max_decode_tp1_kvlimit_200GB_model_len_128K_gdn_op.list"
+          smoke_dir=".ci/cases"
+          smoke_list="$smoke_dir/Qwen3.7-Max_decode_tp1_gdn_smoke.list"
+          mkdir -p "$smoke_dir"
+          awk '!/^#/ && NF { print; if (++count == 3) exit }' "$source_list" > "$smoke_list"
+          test "$(wc -l < "$smoke_list")" -eq 3
+
+      - name: Run v_last, k_last and prefill cases on PPU
+        id: ppu-test
+        uses: t-head/ppu-scheduler-action@main
+        with:
+          image: ${{ env.SAIL_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 1
+          node_selector: board-type=ZW-M890P
+          namespace: ppu-sched
+          timeout_minutes: 300
+          cleanup_policy: always
+          dmesg_policy: on_failure
+          command: |
+            set -euo pipefail
+            cd /workspace/source
+            unset PIP_INDEX_URL
+            source /usr/local/PPU_SDK/envsetup.sh
+            python -m pip install numpy==1.26.4 pandas==2.2.3
+            python -m pip install --force-reinstall --no-deps dist/pla-*.whl
+            export SAIL_PLA_CUDA=1
+
+            echo "===== v_last basic cases ====="
+            python tests/test_op_forge.py \
+              --kernel cuda \
+              --caselist .ci/cases/Qwen3.7-Max_decode_tp1_gdn_smoke.list
+
+            echo "===== k_last basic cases ====="
+            python tests/test_op_forge.py \
+              --kernel k_last \
+              --caselist .ci/cases/Qwen3.7-Max_decode_tp1_gdn_smoke.list
+
+            echo "===== prefill basic cases ====="
+            python tests/test_op_forge_prefill.py \
+              --caselist caselist/prefill/Qwen3.7-Max_prefill_tp1_kvlimit_200GB_model_len_128K_gdn_op.list \
+              --max-cases 3 \
+              --state-dtype fp32

@@ -1,0 +1,50 @@
+name: CI Pipeline
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  precheck:
+    name: Pre-check
+    uses: t-head/.github/.github/workflows/user-precheck.yml@main
+
+  smoke-test:
+    name: Smoke Test
+    needs: precheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Validate Python sources and CI assets
+        run: |
+          python -m compileall -q pla scripts tests
+          test -s caselist/decode/Qwen3.7-Max_decode_tp1_kvlimit_200GB_model_len_128K_gdn_op.list
+          test -s caselist/prefill/Qwen3.7-Max_prefill_tp1_kvlimit_200GB_model_len_128K_gdn_op.list
+
+  ai-code-review:
+    name: AI Code Review (Copilot Gate)
+    needs: precheck
+    uses: t-head/.github/.github/workflows/ai-code-review.yml@main
+    secrets: inherit
+
+  human-review:
+    name: Human Review Gate
+    needs: [smoke-test, ai-code-review]
+    uses: t-head/.github/.github/workflows/human-review.yml@main
+    secrets: inherit
+
+  ci:
+    name: Full CI (PPU)
+    needs: human-review
+    uses: ./.github/workflows/pla-basic-test-ppu.yml
+    secrets: inherit
