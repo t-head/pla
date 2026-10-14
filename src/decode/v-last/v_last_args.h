@@ -55,6 +55,12 @@
 
 #include <hggc_runtime.h>
 
+// Device SDKs expose this attribute inconsistently. Use the documented value
+// through the regular function-attribute API.
+#ifndef PLA_FUNC_ATTR_BLOCK_AGE_EN
+#define PLA_FUNC_ATTR_BLOCK_AGE_EN static_cast<hggcFuncAttribute>(129)
+#endif
+
 namespace pla {
 namespace v_last {
 
