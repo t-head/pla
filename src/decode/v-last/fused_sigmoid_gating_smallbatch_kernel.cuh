@@ -720,7 +720,7 @@ static void dispatch_V_Head_Num(
 #define DISPATCH_HV_WITH_ATTR(HV_VAL) \
     if (HV == HV_VAL) { \
         hggcFuncSetAttribute(fused_sigmoid_gating_delta_rule_cuda_kernel<alog_t, scalar_t, K, V, H, HV_VAL, BV, WARP_NUM>, \
-                             hggcFuncAttributeBlockAgeEn, 1); \
+                             PLA_FUNC_ATTR_BLOCK_AGE_EN, 1); \
         fused_sigmoid_gating_delta_rule_cuda_kernel<alog_t, scalar_t, K, V, H, HV_VAL, BV, WARP_NUM><<<grid, block, shared_mem_size, stream>>>( \
             A_log, a, dt_bias, softplus_beta, softplus_threshold, q, k, v, b, o, \
             h0_source, h0_indices, cu_seqlens, scale, T, B, \

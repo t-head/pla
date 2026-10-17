@@ -236,7 +236,7 @@ performs causal convolution, gating, recurrence, and optional output RMSNorm,
 writes `conv_state`, `state`, and `out` in place, and returns `None`.
 
 - `x`: `[B,3*H*128]` fp16/bf16, channel-contiguous;
-  `H in {6,12,24,48,96}`.
+  `H in {4,6,8,12,16,24,48,64,96}`.
 - `weight`: contiguous fp32 `[3,4,H*128]`; optional `bias`: contiguous fp32
   `[3*H*128]`.
 - `conv_state`: activation dtype `[slots,3*H*128,3]` in the SD cache layout.

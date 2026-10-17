@@ -54,10 +54,9 @@ from OpForge's decode caselist:
     representative values by quantile (always including min and max), ensuring at least one in each of the <200 and >=200 tiers: these two tiers are
     exactly the perf threshold boundary, and functional coverage follows them so a perf regression never lands on a shape that was never tested.
   * head -- **not** taken from the caselist ``num_heads_qk``. The mega kernel entry supports
-    H in {6,12,24,48,96} (the TORCH_CHECK in src/decode/k-last/fused_kda_decode_mega.cu),
-    while the Kimi-Linear-48B caselist is tp1=32 / tp2=16; feeding those in would only hit the TORCH_CHECK
-    "H must be 6, 12, 24, 48, or 96", which is a caselist/kernel support-set mismatch, not a regression.
-    So the heads are the support set itself (which matches the per-card head counts of Kimi-K3 tp1/2/4/8/16).
+    H in {4,6,8,12,16,24,48,64,96}. Caselist head values describe individual model/TP
+    configurations rather than the full kernel support contract, so this test uses the explicit
+    support set to keep every accepted head count covered.
   * gate mode -- both (lower_bound=-5.0, fuse_output_norm=True) and (None, False)
     are run: the former uses the lower-bound sigmoid gate + fused RMSNorm, the latter the softplus gate
     without fused norm; they are two different branches in the kernel.
@@ -105,8 +104,8 @@ import compare_kda_decode_fusion as ref  # noqa: E402
 
 DEFAULT_CASELIST = ("caselist/decode/"
                     "Kimi-Linear-48B-A3B_decode_tp1_kvlimit_200GB_model_len_128K_kda_op.list")
-# Support set of the mega kernel, equal to the per-card head counts of Kimi-K3 tp1/tp2/tp4/tp8/tp16
-SUPPORTED_HEADS = (6, 12, 24, 48, 96)
+# Full runtime head-count contract shared by the PPU and reference paths
+SUPPORTED_HEADS = (4, 6, 8, 12, 16, 24, 48, 64, 96)
 # Tier boundary of the perf threshold: batch<200 tolerates 5%, >=200 tolerates 2%
 BATCH_SPLIT = 200
 # (lower_bound, fuse_output_norm)

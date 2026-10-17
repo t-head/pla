@@ -40,7 +40,7 @@ Both paths are CUDA kernels already compiled in this repo and share the same pyb
 Criteria: no correctness check (fully covered by compare_kda_decode_fusion.py); only end-to-end
        latency is measured. Timed with ``torch.cuda.Event``, taking the median (us).
 
-Sweeps the HxB grid by default: H in {12,24,48,96} x B in {1,2,4,8,16,32,64}. Override with ``--heads`` and
+Sweeps the HxB grid by default: H in {4,6,8,12,16,24,48,64,96} x B in {1,2,4,8,16,32,64}. Override with ``--heads`` and
 ``--batches``. lower_bound / fuse_output_norm are fixed to vllm test_kda's
 main-case settings (lower_bound=-5.0, fuse_output_norm=True).
 
@@ -138,7 +138,7 @@ def _parse_int_list(s, default):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--heads", default=None,
-                    help="comma-sep H values (default 12,24,48,96)")
+                    help="comma-sep H values (default 4,6,8,12,16,24,48,64,96)")
     ap.add_argument("--batches", default=None,
                     help="comma-sep B values (default 1,2,4,8,16,32,64)")
     ap.add_argument("--iters", type=int, default=100)
@@ -149,7 +149,7 @@ def main():
     ap.add_argument("--json", default=None)
     args = ap.parse_args()
 
-    heads = _parse_int_list(args.heads, [12, 24, 48, 96])
+    heads = _parse_int_list(args.heads, [4, 6, 8, 12, 16, 24, 48, 64, 96])
     batches = _parse_int_list(args.batches, [1, 2, 4, 8, 16, 32, 64])
     fon = not args.no_fon
     lb = args.lower_bound

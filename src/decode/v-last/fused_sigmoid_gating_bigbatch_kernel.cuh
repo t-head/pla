@@ -936,7 +936,7 @@ static void dispatch_hv_per_cta(
             hggcFuncSetAttribute( \
                 fused_sigmoid_gating_delta_rule_cuda_kernel< \
                     alog_t, scalar_t, STAGE_NUM, K, V, H, HV, WARP_NUM, hv_per_cta_v>, \
-                hggcFuncAttributeBlockAgeEn, \
+                PLA_FUNC_ATTR_BLOCK_AGE_EN, \
                 1); \
             fused_sigmoid_gating_delta_rule_cuda_kernel<alog_t, scalar_t, STAGE_NUM, K, V, H, HV, WARP_NUM, hv_per_cta_v><<<grid, block, shared_mem_size, stream>>>( \
                 A_log,  \

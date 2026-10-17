@@ -814,14 +814,29 @@ void launch_kda_decode_many_heads_selected(
   } while (false)
 
   switch (H) {
+    case 4:
+      LAUNCH_KDA_DECODE(4);
+      break;
+    case 6:
+      LAUNCH_KDA_DECODE(6);
+      break;
+    case 8:
+      LAUNCH_KDA_DECODE(8);
+      break;
     case 12:
       LAUNCH_KDA_DECODE(12);
+      break;
+    case 16:
+      LAUNCH_KDA_DECODE(16);
       break;
     case 24:
       LAUNCH_KDA_DECODE(24);
       break;
     case 48:
       LAUNCH_KDA_DECODE(48);
+      break;
+    case 64:
+      LAUNCH_KDA_DECODE(64);
       break;
     case 96:
       LAUNCH_KDA_DECODE(96);

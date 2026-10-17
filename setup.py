@@ -191,8 +191,8 @@ if "pla.decode" in NAMESPACES:
                     # PPU runtime does not JIT, so a vm_* (or missing) -arch
                     # makes every launch fail with 801 operation-not-supported
                     # while hggcDeviceSynchronize() still returns success.
-                    # Emit native images for both supported PPU generations.
-                    '-arch=ppu_10,ppu_15'
+                    # Emit one native image flag per supported PPU generation.
+                    '-arch=ppu_10', '-arch=ppu_15'
                 ]
             },
             # MUST be absolute: ninja does not run from the project root, so
@@ -241,8 +241,8 @@ if "pla.decode.gdn.v_last" in NAMESPACES:
                     # PPU runtime does not JIT, so a vm_* (or missing) -arch
                     # makes every launch fail with 801 operation-not-supported
                     # while hggcDeviceSynchronize() still returns success.
-                    # Emit native images for both supported PPU generations.
-                    '-arch=ppu_10,ppu_15'
+                    # Emit one native image flag per supported PPU generation.
+                    '-arch=ppu_10', '-arch=ppu_15'
                 ]
             },
             # Absolute, for the same reason as pla.decode above.
@@ -290,8 +290,8 @@ if "pla.decode.kda_mtp_sglang" in NAMESPACES:
                     # PPU runtime does not JIT, so a vm_* (or missing) -arch
                     # makes every launch fail with 801 operation-not-supported
                     # while hggcDeviceSynchronize() still returns success.
-                    # Emit native images for both supported PPU generations.
-                    '-arch=ppu_10,ppu_15'
+                    # Emit one native image flag per supported PPU generation.
+                    '-arch=ppu_10', '-arch=ppu_15'
                 ]
             },
             # Absolute path: ninja does not run from the project root. Only
@@ -486,7 +486,7 @@ PREFILL_HGCC_FLAGS = [
     "-DCUTLASS_VERSIONS_GENERATED", "-DCUTLASS_TEST_LEVEL=0",
     "-DCUTLASS_TEST_ENABLE_CACHED_RESULTS=1", "-DCUTLASS_DEBUG_TRACE_LEVEL=0",
     # Real device targets (see the decode extensions for why vm_* is wrong)
-    "-arch=ppu_10,ppu_15",
+    "-arch=ppu_10", "-arch=ppu_15",
     "--threads", HGCC_THREADS,
 ]
 

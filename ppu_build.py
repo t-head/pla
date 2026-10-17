@@ -72,11 +72,6 @@ class PPUBuildExtension(build_ext):
 
         torch_root = Path(torch.__path__[0]).resolve()
         compat_wrapper = torch_root / ".ppu_compat" / "compatible_wrapper.h"
-        if not compat_wrapper.is_file():
-            raise RuntimeError(
-                f"Cannot find the PPU PyTorch compatibility header at {compat_wrapper}. "
-                "Install a PPU-enabled PyTorch build."
-            )
         include_dirs = [
             torch_root / "include",
             torch_root / "include" / "torch" / "csrc" / "api" / "include",
@@ -90,7 +85,9 @@ class PPUBuildExtension(build_ext):
         # PPU PyTorch headers still expose the upstream CUDA-named C++ ABI. The
         # wheel-provided wrapper maps that host ABI to native PPU SDK types. It
         # must not be injected into .cu files, which use native hggc headers.
-        self._host_compat_flags = ["-include", str(compat_wrapper)]
+        self._host_compat_flags = (
+            ["-include", str(compat_wrapper)] if compat_wrapper.is_file() else []
+        )
 
         library_dirs = [torch_root / "lib", sdk / "lib", sdk / "lib64"]
         self._link_flags = [f"-L{path}" for path in library_dirs if path.is_dir()]

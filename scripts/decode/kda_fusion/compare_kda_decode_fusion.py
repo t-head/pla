@@ -109,15 +109,19 @@ FP16_RTOL = 1e-2
 
 SCALE = 1.0 / math.sqrt(D)
 
-# (num_heads, num_seqs, lower_bound, fuse_output_norm) —— vllm test_kda + Kimi-K3 TP16
+# (num_heads, num_seqs, lower_bound, fuse_output_norm) -- supported-head smoke matrix
 K3_CASES = [
+    (4, 1, -5.0, True),
     (6, 1, -5.0, True),
     (6, 4, None, False),
     (6, 16, -5.0, True),
+    (8, 1, -5.0, True),
     (12, 1, -5.0, True),
     (12, 4, None, False),
+    (16, 1, -5.0, True),
     (24, 4, None, False),
     (48, 1, -5.0, True),
+    (64, 1, -5.0, True),
     (96, 1, -5.0, True),
 ]
 

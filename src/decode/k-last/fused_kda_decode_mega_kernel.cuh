@@ -58,8 +58,8 @@
  *
  * Only the parts that DIFFER from the original PLA-style interface are adjusted
  * to the vllm reference contract (functional micro-adjustments):
- *   (a) non-power-of-2 head count: grid = dim3(1, H, B), i_n=blockIdx.z,
- *       i_h=i_hv=blockIdx.y  (Kimi K3 has H==HV, H in {6,12,24,48,96});
+ *   (a) runtime head count: grid = dim3(1, H, B), i_n=blockIdx.z,
+ *       i_h=i_hv=blockIdx.y (H==HV, H in {4,6,8,12,16,24,48,64,96});
  *   (b) lower_bound decay variant  exp(lb*sigmoid(exp_a*g)) vs the softplus one;
  *   (c) packed tap-major conv weight [3,W,dim] and conv_state [slot,3*dim,3]
  *       (bit-exact 3-tap shift writeback), instead of channel-major [D,W];
