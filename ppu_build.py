@@ -49,7 +49,6 @@ class PPUBuildExtension(build_ext):
         self._ppu_sdk = None
         self._hgcc = None
         self._framework_includes = None
-        self._host_compat_flags = None
         self._link_flags = None
 
     def build_extensions(self):
@@ -71,12 +70,6 @@ class PPUBuildExtension(build_ext):
             )
 
         torch_root = Path(torch.__path__[0]).resolve()
-        compat_wrapper = torch_root / ".ppu_compat" / "compatible_wrapper.h"
-        if not compat_wrapper.is_file():
-            raise RuntimeError(
-                f"Cannot find the PPU PyTorch compatibility header at {compat_wrapper}. "
-                "Install a PPU-enabled PyTorch build."
-            )
         include_dirs = [
             torch_root / "include",
             torch_root / "include" / "torch" / "csrc" / "api" / "include",
@@ -87,10 +80,6 @@ class PPUBuildExtension(build_ext):
         self._framework_includes = list(dict.fromkeys(
             str(path.resolve()) for path in include_dirs if path.is_dir()
         ))
-        # PPU PyTorch headers still expose the upstream CUDA-named C++ ABI. The
-        # wheel-provided wrapper maps that host ABI to native PPU SDK types. It
-        # must not be injected into .cu files, which use native hggc headers.
-        self._host_compat_flags = ["-include", str(compat_wrapper)]
 
         library_dirs = [torch_root / "lib", sdk / "lib", sdk / "lib64"]
         self._link_flags = [f"-L{path}" for path in library_dirs if path.is_dir()]
@@ -169,8 +158,7 @@ class PPUBuildExtension(build_ext):
             stream.write(
                 "  command = " + self._quote(
                     [os.environ.get("CXX", "c++")] + cxx_flags + ["-fPIC"]
-                    + self._host_compat_flags + base_flags + include_flags
-                    + ["-c", "$in", "-o", "$out"]
+                    + base_flags + include_flags + ["-c", "$in", "-o", "$out"]
                 ).replace("'$in'", "$in").replace("'$out'", "$out") + "\n"
             )
             stream.write("  description = CXX $in\n\n")

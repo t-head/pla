@@ -94,7 +94,6 @@ class PPUBuildExtensionTests(unittest.TestCase):
         self.command = self.backend.PPUBuildExtension()
         self.command._hgcc = "/native/ppu/bin/hgcc"
         self.command._framework_includes = []
-        self.command._host_compat_flags = ["-include", "/torch/.ppu_compat/compatible_wrapper.h"]
         self.command._link_flags = ["-ltorch", "-ltorch_cuda", "-lc10_cuda", "-lhggc_wrapper"]
 
     def tearDown(self):
@@ -137,9 +136,10 @@ class PPUBuildExtensionTests(unittest.TestCase):
         hgcc_command = ninja.split("rule hgcc_compile\n", 1)[1].splitlines()[0]
         cxx_command = ninja.split("rule cxx_compile\n", 1)[1].splitlines()[0]
         self.assertIn("-Xcompiler=-fPIC", hgcc_command)
-        self.assertNotIn("compatible_wrapper.h", hgcc_command)
-        self.assertIn(" -fPIC ", cxx_command)
-        self.assertIn("compatible_wrapper.h", cxx_command)
+        self.assertIn(
+            "c++ -O1 -std=c++17 -fPIC -DTORCH_EXTENSION_NAME", cxx_command
+        )
+        self.assertNotIn("-include", cxx_command)
         self.assertNotIn("nvcc", ninja)
         self.assertNotIn("CUDA_HOME", ninja)
 
@@ -150,19 +150,12 @@ class PPUBuildExtensionTests(unittest.TestCase):
         (sdk / "include").mkdir()
         (sdk / "targets/x86_64-linux/include").mkdir(parents=True)
         (sdk / "lib").mkdir()
-        (self.torch_root / ".ppu_compat").mkdir()
-        (self.torch_root / ".ppu_compat/compatible_wrapper.h").touch()
-
         with patch.dict("os.environ", {"PPU_SDK_DIR": str(sdk)}, clear=False):
             self.command._configure_toolchain()
 
         sdk = sdk.resolve()
         self.assertEqual(self.command._hgcc, str(sdk / "bin/hgcc"))
         self.assertIn(f"-L{sdk / 'lib'}", self.command._link_flags)
-        self.assertEqual(
-            self.command._host_compat_flags,
-            ["-include", str(self.torch_root.resolve() / ".ppu_compat/compatible_wrapper.h")],
-        )
         self.assertNotIn("-lcuda", self.command._link_flags)
         self.assertNotIn("-lcudart", self.command._link_flags)
 
