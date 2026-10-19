@@ -33,6 +33,7 @@
 import hashlib
 import os
 import shlex
+import shutil
 import subprocess
 import sysconfig
 from pathlib import Path
@@ -56,18 +57,33 @@ class PPUBuildExtension(build_ext):
         for extension in self.extensions:
             self.build_extension(extension)
 
+    @staticmethod
+    def _find_toolchain():
+        candidates = []
+        for key in ("PPU_SDK_DIR", "PPU_SDK"):
+            value = os.environ.get(key)
+            if value:
+                candidates.append(Path(value).expanduser().resolve())
+
+        compiler = shutil.which("hgcc")
+        if compiler:
+            candidates.append(Path(compiler).absolute().parent.parent.resolve())
+        candidates.append(Path("/usr/local/PPU_SDK"))
+
+        searched = []
+        for sdk in dict.fromkeys(candidates):
+            hgcc = sdk / "bin" / "hgcc"
+            searched.append(str(hgcc))
+            if hgcc.is_file() and os.access(hgcc, os.X_OK):
+                return sdk, hgcc
+        raise RuntimeError(
+            "PPU compiler not found. Checked: " + ", ".join(searched)
+            + ". Set PPU_SDK_DIR or add the toolchain bin to PATH."
+        )
+
     def _configure_toolchain(self):
-        sdk = Path(
-            os.environ.get("PPU_SDK_DIR")
-            or os.environ.get("PPU_SDK")
-            or "/usr/local/PPU_SDK"
-        ).resolve()
-        hgcc = sdk / "bin" / "hgcc"
-        if not hgcc.is_file():
-            raise RuntimeError(
-                f"Cannot find the PPU compiler at {hgcc}. "
-                "Set PPU_SDK_DIR to the native PPU SDK root."
-            )
+        sdk, hgcc = self._find_toolchain()
+        print(f"[pla] SDK: {sdk}; compiler: {hgcc}")
 
         torch_root = Path(torch.__path__[0]).resolve()
         include_dirs = [
@@ -81,7 +97,10 @@ class PPUBuildExtension(build_ext):
             str(path.resolve()) for path in include_dirs if path.is_dir()
         ))
 
-        library_dirs = [torch_root / "lib", sdk / "lib", sdk / "lib64"]
+        library_dirs = [
+            torch_root / "lib", sdk / "lib", sdk / "lib64",
+            sdk / "lib" / "stubs", sdk / "lib64" / "stubs",
+        ]
         self._link_flags = [f"-L{path}" for path in library_dirs if path.is_dir()]
         self._link_flags += [
             "-ltorch",
