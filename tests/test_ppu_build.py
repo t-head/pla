@@ -62,7 +62,7 @@ class FakeExtension:
         self.extra_objects = []
 
 
-def load_backend(torch_root):
+def load_backend(torch_root, source_text=None):
     fake_torch = types.ModuleType("torch")
     fake_torch.__path__ = [str(torch_root)]
     fake_torch._C = types.SimpleNamespace(_GLIBCXX_USE_CXX11_ABI=True)
@@ -79,7 +79,10 @@ def load_backend(torch_root):
     spec = importlib.util.spec_from_file_location("ppu_build_test_module", ROOT / "ppu_build.py")
     module = importlib.util.module_from_spec(spec)
     with patch.dict(sys.modules, modules):
-        spec.loader.exec_module(module)
+        if source_text is None:
+            spec.loader.exec_module(module)
+        else:
+            exec(compile(source_text, spec.origin, "exec"), module.__dict__)
     return module
 
 
@@ -94,7 +97,6 @@ class PPUBuildExtensionTests(unittest.TestCase):
         self.command = self.backend.PPUBuildExtension()
         self.command._hgcc = "/native/ppu/bin/hgcc"
         self.command._framework_includes = []
-        self.command._host_compat_flags = ["-include", "/torch/.ppu_compat/compatible_wrapper.h"]
         self.command._link_flags = ["-ltorch", "-ltorch_cuda", "-lc10_cuda", "-lhggc_wrapper"]
 
     def tearDown(self):
@@ -137,9 +139,10 @@ class PPUBuildExtensionTests(unittest.TestCase):
         hgcc_command = ninja.split("rule hgcc_compile\n", 1)[1].splitlines()[0]
         cxx_command = ninja.split("rule cxx_compile\n", 1)[1].splitlines()[0]
         self.assertIn("-Xcompiler=-fPIC", hgcc_command)
-        self.assertNotIn("compatible_wrapper.h", hgcc_command)
-        self.assertIn(" -fPIC ", cxx_command)
-        self.assertIn("compatible_wrapper.h", cxx_command)
+        self.assertIn(
+            "c++ -O1 -std=c++17 -fPIC -DTORCH_EXTENSION_NAME", cxx_command
+        )
+        self.assertNotIn("-include", cxx_command)
         self.assertNotIn("nvcc", ninja)
         self.assertNotIn("CUDA_HOME", ninja)
 
@@ -147,24 +150,101 @@ class PPUBuildExtensionTests(unittest.TestCase):
         sdk = self.root / "ppu-sdk"
         (sdk / "bin").mkdir(parents=True)
         (sdk / "bin/hgcc").touch()
+        (sdk / "bin/hgcc").chmod(0o755)
         (sdk / "include").mkdir()
         (sdk / "targets/x86_64-linux/include").mkdir(parents=True)
         (sdk / "lib").mkdir()
-        (self.torch_root / ".ppu_compat").mkdir()
-        (self.torch_root / ".ppu_compat/compatible_wrapper.h").touch()
-
         with patch.dict("os.environ", {"PPU_SDK_DIR": str(sdk)}, clear=False):
             self.command._configure_toolchain()
 
         sdk = sdk.resolve()
         self.assertEqual(self.command._hgcc, str(sdk / "bin/hgcc"))
         self.assertIn(f"-L{sdk / 'lib'}", self.command._link_flags)
-        self.assertEqual(
-            self.command._host_compat_flags,
-            ["-include", str(self.torch_root.resolve() / ".ppu_compat/compatible_wrapper.h")],
-        )
         self.assertNotIn("-lcuda", self.command._link_flags)
         self.assertNotIn("-lcudart", self.command._link_flags)
+
+    def make_toolchain(self, name, compiler="hgcc"):
+        sdk = (self.root / name).resolve()
+        (sdk / "bin").mkdir(parents=True)
+        driver = sdk / "bin" / compiler
+        driver.touch()
+        driver.chmod(0o755)
+        (sdk / "include").mkdir()
+        (sdk / "lib64/stubs").mkdir(parents=True)
+        return sdk, driver
+
+    def test_explicit_sdk_precedes_environment_and_path(self):
+        sdk, driver = self.make_toolchain("explicit")
+        other, _ = self.make_toolchain("environment")
+        path_sdk, _ = self.make_toolchain("on-path")
+        env = {"PPU_SDK_DIR": str(sdk), "PPU_SDK": str(other),
+               "PATH": str(path_sdk / "bin")}
+        with patch.dict("os.environ", env, clear=True):
+            self.assertEqual(self.command._find_toolchain(), (sdk, driver))
+
+    def test_sdk_environment_is_used_without_explicit_override(self):
+        sdk, driver = self.make_toolchain("environment")
+        with patch.dict("os.environ", {"PPU_SDK": str(sdk), "PATH": ""}, clear=True):
+            self.assertEqual(self.command._find_toolchain(), (sdk, driver))
+
+    def test_path_fallback_keeps_headers_and_libraries_together(self):
+        sdk, driver = self.make_toolchain("relocated")
+        env = {"PPU_SDK_DIR": str(self.root / "missing"),
+               "PPU_SDK": str(self.root / "old-sdk"), "PATH": str(sdk / "bin")}
+        with patch.dict("os.environ", env, clear=True):
+            self.command._configure_toolchain()
+        self.assertEqual(self.command._hgcc, str(driver))
+        self.assertEqual(self.command._ppu_sdk, sdk)
+        self.assertIn(str(sdk / "include"), self.command._framework_includes)
+        self.assertIn(f"-L{sdk / 'lib64'}", self.command._link_flags)
+        self.assertIn(f"-L{sdk / 'lib64/stubs'}", self.command._link_flags)
+
+    def test_non_executable_driver_falls_back_to_path(self):
+        bad_sdk, bad_driver = self.make_toolchain("not-executable")
+        bad_driver.chmod(0o644)
+        sdk, driver = self.make_toolchain("working")
+        env = {"PPU_SDK_DIR": str(bad_sdk), "PATH": str(sdk / "bin")}
+        with patch.dict("os.environ", env, clear=True):
+            self.assertEqual(self.command._find_toolchain(), (sdk, driver))
+
+    def test_driver_symlink_preserves_sdk_entry_directory(self):
+        sdk = (self.root / "entry").resolve()
+        (sdk / "bin").mkdir(parents=True)
+        _, internal = self.make_toolchain("internal", "driver")
+        driver = sdk / "bin/hgcc"
+        driver.symlink_to(internal)
+        with patch.dict("os.environ", {"PATH": str(sdk / "bin")}, clear=True):
+            self.assertEqual(self.command._find_toolchain(), (sdk, driver))
+
+    def test_default_root_is_checked_after_path(self):
+        with patch.dict("os.environ", {"PATH": ""}, clear=True), \
+                patch.object(Path, "is_file", return_value=True), \
+                patch.object(self.backend.os, "access", return_value=True):
+            self.assertEqual(
+                self.command._find_toolchain(),
+                (Path("/usr/local/PPU_SDK"), Path("/usr/local/PPU_SDK/bin/hgcc")),
+            )
+
+    def test_missing_compiler_reports_searched_paths(self):
+        with patch.dict("os.environ", {"PATH": ""}, clear=True), \
+                patch.object(Path, "is_file", return_value=False):
+            with self.assertRaisesRegex(RuntimeError, "/usr/local/PPU_SDK/bin/hgcc.*PATH"):
+                self.command._find_toolchain()
+
+    def test_compiler_rename_does_not_require_sdk_layout_rewrite(self):
+        source = (ROOT / "ppu_build.py").read_text().replace("hgcc", "devicecc")
+        backend = load_backend(self.torch_root, source)
+        original, _ = self.make_toolchain("original")
+        sdk, driver = self.make_toolchain("selected", "devicecc")
+        env = {"PPU_SDK": str(original), "PATH": str(sdk / "bin")}
+        with patch.dict("os.environ", env, clear=True):
+            command = backend.PPUBuildExtension()
+            command._configure_toolchain()
+        self.assertEqual(command._devicecc, str(driver))
+        self.assertEqual(command._ppu_sdk, sdk)
+        self.assertIn(str(sdk / "include"), command._framework_includes)
+        self.assertNotIn(str(original / "include"), command._framework_includes)
+        self.assertIn(f"-L{sdk / 'lib64/stubs'}", command._link_flags)
 
     def test_link_invokes_hgcc_without_cuda_driver_libraries(self):
         extension = FakeExtension(

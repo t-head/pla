@@ -145,8 +145,10 @@ void fused_kda_decode_mega_forward(
               "x must have shape [B, 3 * H * 128]");
   int const num_heads = static_cast<int>(qkv_width / (3 * kHeadDim));
   TORCH_CHECK(
-      num_heads == 6 || num_heads == 12 || num_heads == 24 || num_heads == 48 || num_heads == 96,
-      "H must be 6, 12, 24, 48, or 96, got ", num_heads);
+      num_heads == 4 || num_heads == 6 || num_heads == 8 || num_heads == 12 ||
+          num_heads == 16 || num_heads == 24 || num_heads == 48 ||
+          num_heads == 64 || num_heads == 96,
+      "H must be 4, 6, 8, 12, 16, 24, 48, 64, or 96, got ", num_heads);
   TORCH_CHECK(batch_size > 0, "KDA decode fusion requires at least one row");
   int const dim = num_heads * kHeadDim;
 

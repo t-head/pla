@@ -33,6 +33,7 @@
 import hashlib
 import os
 import shlex
+import shutil
 import subprocess
 import sysconfig
 from pathlib import Path
@@ -49,7 +50,6 @@ class PPUBuildExtension(build_ext):
         self._ppu_sdk = None
         self._hgcc = None
         self._framework_includes = None
-        self._host_compat_flags = None
         self._link_flags = None
 
     def build_extensions(self):
@@ -57,26 +57,35 @@ class PPUBuildExtension(build_ext):
         for extension in self.extensions:
             self.build_extension(extension)
 
+    @staticmethod
+    def _find_toolchain():
+        candidates = []
+        for key in ("PPU_SDK_DIR", "PPU_SDK"):
+            value = os.environ.get(key)
+            if value:
+                candidates.append(Path(value).expanduser().resolve())
+
+        compiler = shutil.which("hgcc")
+        if compiler:
+            candidates.append(Path(compiler).absolute().parent.parent.resolve())
+        candidates.append(Path("/usr/local/PPU_SDK"))
+
+        searched = []
+        for sdk in dict.fromkeys(candidates):
+            hgcc = sdk / "bin" / "hgcc"
+            searched.append(str(hgcc))
+            if hgcc.is_file() and os.access(hgcc, os.X_OK):
+                return sdk, hgcc
+        raise RuntimeError(
+            "PPU compiler not found. Checked: " + ", ".join(searched)
+            + ". Set PPU_SDK_DIR or add the toolchain bin to PATH."
+        )
+
     def _configure_toolchain(self):
-        sdk = Path(
-            os.environ.get("PPU_SDK_DIR")
-            or os.environ.get("PPU_SDK")
-            or "/usr/local/PPU_SDK"
-        ).resolve()
-        hgcc = sdk / "bin" / "hgcc"
-        if not hgcc.is_file():
-            raise RuntimeError(
-                f"Cannot find the PPU compiler at {hgcc}. "
-                "Set PPU_SDK_DIR to the native PPU SDK root."
-            )
+        sdk, hgcc = self._find_toolchain()
+        print(f"[pla] SDK: {sdk}; compiler: {hgcc}")
 
         torch_root = Path(torch.__path__[0]).resolve()
-        compat_wrapper = torch_root / ".ppu_compat" / "compatible_wrapper.h"
-        if not compat_wrapper.is_file():
-            raise RuntimeError(
-                f"Cannot find the PPU PyTorch compatibility header at {compat_wrapper}. "
-                "Install a PPU-enabled PyTorch build."
-            )
         include_dirs = [
             torch_root / "include",
             torch_root / "include" / "torch" / "csrc" / "api" / "include",
@@ -87,12 +96,11 @@ class PPUBuildExtension(build_ext):
         self._framework_includes = list(dict.fromkeys(
             str(path.resolve()) for path in include_dirs if path.is_dir()
         ))
-        # PPU PyTorch headers still expose the upstream CUDA-named C++ ABI. The
-        # wheel-provided wrapper maps that host ABI to native PPU SDK types. It
-        # must not be injected into .cu files, which use native hggc headers.
-        self._host_compat_flags = ["-include", str(compat_wrapper)]
 
-        library_dirs = [torch_root / "lib", sdk / "lib", sdk / "lib64"]
+        library_dirs = [
+            torch_root / "lib", sdk / "lib", sdk / "lib64",
+            sdk / "lib" / "stubs", sdk / "lib64" / "stubs",
+        ]
         self._link_flags = [f"-L{path}" for path in library_dirs if path.is_dir()]
         self._link_flags += [
             "-ltorch",
@@ -169,8 +177,7 @@ class PPUBuildExtension(build_ext):
             stream.write(
                 "  command = " + self._quote(
                     [os.environ.get("CXX", "c++")] + cxx_flags + ["-fPIC"]
-                    + self._host_compat_flags + base_flags + include_flags
-                    + ["-c", "$in", "-o", "$out"]
+                    + base_flags + include_flags + ["-c", "$in", "-o", "$out"]
                 ).replace("'$in'", "$in").replace("'$out'", "$out") + "\n"
             )
             stream.write("  description = CXX $in\n\n")
