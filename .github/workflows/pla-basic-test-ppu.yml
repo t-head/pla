@@ -1,0 +1,112 @@
+name: PLA Functional Tests PPU
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SAIL_IMAGE: download.t-head.cn/docker_release/pytorch:sdk2.2.0-2.10.0-ubuntu24.04-hggcrt3-py312-20261005
+
+jobs:
+  build-test:
+    name: Build & Test (${{ matrix.board }})
+    runs-on: k8s-runner-group-cpu-thead
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 900
+    strategy:
+      fail-fast: false
+      matrix:
+        board: [OAM-810E, ZW-M890P]
+    env:
+      REPORT_ROOT: /wl_nas/devops/${{ github.repository_id }}-${{ github.run_id }}-${{ github.run_attempt }}/pla/${{ matrix.board }}
+      WORKER_REPORT_ROOT: /mnt/wl_nas/devops/${{ github.repository_id }}-${{ github.run_id }}-${{ github.run_attempt }}/pla/${{ matrix.board }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Checkout ACTLIZE
+        uses: actions/checkout@v4
+        with:
+          repository: t-head/actlize
+          ref: 7c08602a4f4a3ba1ebee7ce16e58eb496e183115
+          path: 3rdparty/actlize
+          submodules: recursive
+          persist-credentials: false
+      - name: Validate CI assets
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python3 .github/workflows/scripts/test_ci_functional.py
+      - name: Build and Test on PPU
+        id: ppu-test
+        uses: t-head/ppu-scheduler-action@main
+        with:
+          image: ${{ env.SAIL_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 1
+          node_selector: board-type=${{ matrix.board }}
+          namespace: ppu-sched
+          timeout_minutes: 840
+          cleanup_policy: always
+          dmesg_policy: on_failure
+          extra_env: PLA_REPORT_ROOT=${{ env.WORKER_REPORT_ROOT }},PLA_TEST_REVISION=${{ github.sha }},PLA_CI_BOARD=${{ matrix.board }}
+          command: |
+            set -eo pipefail
+            mkdir -p "$PLA_REPORT_ROOT"
+            exec > >(tee "$PLA_REPORT_ROOT/worker.log") 2>&1
+            cd /workspace/source
+            unset PIP_INDEX_URL PYTHONPATH PLA_BUILD_NAMESPACE PPU_ACTLIZE_DIR
+            export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
+            source /usr/local/PPU_SDK/envsetup.sh
+            set -u
+            export PPU_SDK_DIR=/usr/local/PPU_SDK
+            export PPU_ACTLIZE_DIR=/workspace/source/3rdparty/actlize
+            "$PPU_SDK_DIR/bin/hgcc" --version
+            python -m pip install setuptools==69.5.1 setuptools-scm==9.2.2 \
+              packaging==24.2 wheel==0.45.1 pybind11==2.13.6 ninja==1.11.1.4 \
+              numpy==1.26.4 pandas==2.2.3 pytest==8.3.5 einops==0.8.1
+            python -c 'import torch, triton; print(torch.__version__, triton.__version__)'
+            python .github/workflows/scripts/run_functional.py --list
+            export MAX_JOBS=20 HGCC_THREADS=2
+            BUILD_ROOT=$(mktemp -d /tmp/pla-build.XXXXXX)
+            timeout --signal=TERM --kill-after=30s 180m \
+              python setup.py bdist_wheel \
+                --bdist-dir "$BUILD_ROOT/wheel" --dist-dir "$BUILD_ROOT/dist" \
+              2>&1 | tee "$PLA_REPORT_ROOT/build.log"
+            wheels=("$BUILD_ROOT"/dist/pla-*.whl)
+            test "${#wheels[@]}" -eq 1 && test -f "${wheels[0]}"
+            python -m pip install --force-reinstall --no-deps "${wheels[0]}"
+            python .github/workflows/scripts/run_functional.py --stage-wheel "${wheels[0]}"
+            result=0
+            for phase in decode prefill; do
+              python .github/workflows/scripts/run_functional.py \
+                --board "$PLA_CI_BOARD" --phase "$phase" \
+                --output "$PLA_REPORT_ROOT/$phase" --budget-seconds 18000 || result=1
+            done
+            exit "$result"
+      - name: Collect reports from shared NAS
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          destination=".ci-results/${{ matrix.board }}"
+          mkdir -p "$destination"
+          if [ -d "$REPORT_ROOT" ]; then
+            cp -a "$REPORT_ROOT/." "$destination/"
+          fi
+      - name: Board results (${{ matrix.board }})
+        if: always()
+        env:
+          PLA_TEST_RESULT: ${{ steps.ppu-test.outcome }}
+        run: python3 .github/workflows/scripts/run_functional.py --summary-root .ci-results --board "${{ matrix.board }}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pla-results-${{ matrix.board }}
+          path: .ci-results/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
