@@ -1804,6 +1804,7 @@ void launch_fused_fwd_cp_cute(
   FF_DISPATCH_AUX_P(ElementType, 12, 4) \
   FF_DISPATCH_AUX_P(ElementType,  8, 4) \
   FF_DISPATCH_AUX_P(ElementType,  8, 2) \
+  FF_DISPATCH_AUX_P(ElementType,  8, 1) \
   FF_DISPATCH_AUX_P(ElementType,  6, 2) \
   FF_DISPATCH_AUX_P(ElementType,  4, 2)
 
@@ -1863,6 +1864,7 @@ void launch_fused_fwd_cp_cute(
   FF_DISPATCH_E(ElementType,  12,  4) \
   FF_DISPATCH_E(ElementType,   8,  4) \
   FF_DISPATCH_E(ElementType,   8,  2) \
+  FF_DISPATCH_E(ElementType,   8,  1) \
   FF_DISPATCH_E(ElementType,   6,  2) \
   FF_DISPATCH_E(ElementType,   4,  2)
 
