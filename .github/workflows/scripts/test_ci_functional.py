@@ -237,13 +237,18 @@ class FunctionalCITests(unittest.TestCase):
         self.assertIn("workflow_dispatch:", workflow)
         self.assertIn("github.event.pull_request.number || github.ref", workflow)
         dependencies = {"ai-code-review": "precheck", "human-review": "ai-code-review",
-                        "ci": "human-review"}
+                        "static-compliance": "precheck", "ci": "[human-review, static-compliance]"}
         for name, dependency in dependencies.items():
             job = workflow.split(f"  {name}:\n", 1)[1].split("\n\n", 1)[0]
             self.assertEqual([line.strip() for line in job.splitlines() if "needs:" in line],
                              [f"needs: {dependency}"])
             self.assertNotIn("if:", job)
             self.assertNotIn("continue-on-error:", job)
+        static = workflow.split("  static-compliance:\n", 1)[1].split("\n\n", 1)[0]
+        self.assertIn("uses: ./.github/workflows/static-compliance-scan.yml", static)
+        self.assertIn("github.event.pull_request.base.sha || inputs.scan-base", static)
+        self.assertIn("github.event.pull_request.head.sha || github.sha", static)
+        self.assertNotIn("secrets:", static)
         self.assertNotIn("pull_request_review:", workflow)
         self.assertNotIn("scripts/ci/", workflow)
         self.assertNotIn("tests/test_ci_functional.py", workflow)

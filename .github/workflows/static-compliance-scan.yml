@@ -1,0 +1,90 @@
+name: Static Compliance Scan
+
+on:
+  workflow_call:
+    inputs:
+      base:
+        description: Base commit SHA or an explicit ref for manual runs
+        required: true
+        type: string
+      head:
+        description: Exact commit SHA to scan
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      base:
+        description: Base ref or SHA for the incremental scan (must differ from head)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: static-compliance-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    name: Static Compliance Scan (strong)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      SCAN_BASE: ${{ inputs.base }}
+      SCAN_HEAD: ${{ inputs.head || github.sha }}
+    steps:
+      - name: Validate scan refs
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SCAN_HEAD" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$SCAN_BASE" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]]
+      - name: Checkout workflow tools
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: ci-tools
+          sparse-checkout: .github/workflows
+          persist-credentials: false
+      - name: Checkout source as scan data
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ env.SCAN_HEAD }}
+          path: source
+          fetch-depth: 0
+          submodules: false
+          persist-credentials: false
+      - name: Validate scanner regressions
+        run: python3 -I -B ci-tools/.github/workflows/scripts/test_static_compliance.py
+      - name: Scan incremental changes
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/static-compliance"
+          mkdir -p "$report"
+          git fetch --no-tags origin "$SCAN_BASE" > "$report/fetch.log" 2>&1
+          base_sha=$(git rev-parse --verify 'FETCH_HEAD^{commit}')
+          python3 -I -B ../ci-tools/.github/workflows/scripts/run_static_compliance.py \
+            --base "$base_sha" --head "$SCAN_HEAD" --output "$report"
+      - name: Summarize incomplete scan
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          if [[ ! -f "$RUNNER_TEMP/static-compliance/results.json" ]]; then
+            mkdir -p "$RUNNER_TEMP/static-compliance"
+            printf '%s\n' 'Static compliance scan did not complete. See job logs.' \
+              > "$RUNNER_TEMP/static-compliance/error.txt"
+            printf '%s\n' '## Static Compliance Scan (strong)' '' 'Status: ERROR (scan did not complete).' \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload static scan report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: static-compliance-results
+          path: ${{ runner.temp }}/static-compliance
+          if-no-files-found: error
+          retention-days: 14

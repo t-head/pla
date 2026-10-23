@@ -2,6 +2,11 @@ name: CI Pipeline
 
 on:
   workflow_dispatch:
+    inputs:
+      scan-base:
+        description: Explicit base ref or SHA for the static compliance scan
+        required: true
+        type: string
   pull_request:
     branches: [master]
     types: [opened, synchronize, reopened, ready_for_review]
@@ -19,6 +24,14 @@ jobs:
     name: Pre-check
     uses: t-head/.github/.github/workflows/user-precheck.yml@main
 
+  static-compliance:
+    name: Static Compliance
+    needs: precheck
+    uses: ./.github/workflows/static-compliance-scan.yml
+    with:
+      base: ${{ github.event.pull_request.base.sha || inputs.scan-base }}
+      head: ${{ github.event.pull_request.head.sha || github.sha }}
+
   ai-code-review:
     name: AI Code Review (Copilot Gate)
     needs: precheck
@@ -33,6 +46,6 @@ jobs:
 
   ci:
     name: Full CI (PPU)
-    needs: human-review
+    needs: [human-review, static-compliance]
     uses: ./.github/workflows/pla-basic-test-ppu.yml
     secrets: inherit
