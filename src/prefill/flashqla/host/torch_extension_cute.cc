@@ -224,7 +224,7 @@ bool is_supported_head_config(int64_t H, int64_t Hg) {
            (H == 24 && Hg == 8) ||
            (H == 16 && (Hg == 8 || Hg == 4 || Hg == 2)) ||
            (H == 12 && Hg == 4) ||
-           (H == 8 && (Hg == 4 || Hg == 2)) ||
+           (H == 8 && (Hg == 4 || Hg == 2 || Hg == 1)) ||
            (H == 6 && Hg == 2) ||
            (H == 4 && Hg == 2);
 }

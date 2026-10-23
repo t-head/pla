@@ -72,6 +72,7 @@ SUPPORTED_HEAD_CONFIGS = frozenset({
     (12, 4),
     (8, 4),
     (8, 2),
+    (8, 1),
     (6, 2),
     (4, 2),
 })
