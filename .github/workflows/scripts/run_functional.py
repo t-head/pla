@@ -15,7 +15,7 @@ import time
 import xml.etree.ElementTree as ET
 from zipfile import ZipFile
 
-from functional_cases import BASELINE, cases
+from functional_cases import BASELINE, STATE_DTYPE_CASES, StateDtypeSubset, cases, v_last_lists
 
 ROOT = Path(__file__).resolve().parents[3]
 BOARDS = ("OAM-810E", "ZW-M890P")
@@ -141,6 +141,8 @@ def validate_inventory(selected):
                 line.strip() and not line.startswith("#") for line in path.read_text().splitlines()
             ):
                 raise ValueError(f"Missing or empty caselist: {path}")
+            if "--kernel=cuda" in case.argv:
+                v_last_lists(path.read_text())
 
 
 def prepare(case, directory):
@@ -151,6 +153,22 @@ def prepare(case, directory):
         cwd = ROOT / "tests"
         command = [sys.executable, "-m", "pytest", *case.argv, "-v",
                    "-o", "console_output_style=classic", f"--junitxml={directory / 'pytest.xml'}"]
+        if case.name == "k-last-state-dtype":
+            command = [sys.executable, "-u", str(Path(__file__).resolve()),
+                       "--state-dtype-junit", str(directory / "pytest.xml")]
+    elif case.report == "markers" and "--kernel=cuda" in case.argv:
+        arg = next(arg for arg in case.argv if arg.startswith("--caselist="))
+        source = ROOT / arg.split("=", 1)[1]
+        selected = v_last_lists(source.read_text())
+        lists = directory / "lists"
+        lists.mkdir()
+        for tp, lines in selected.items():
+            name = source.name.replace("_tp1_", f"_tp{tp}_")
+            if f"_tp{tp}_" not in name:
+                raise ValueError("v-last input must be a TP1 caselist")
+            (lists / name).write_text("\n".join(lines) + "\n")
+        expected = sum(map(len, selected.values()))
+        command[command.index(arg)] = f"--caselist={lists}"
     elif case.report == "jsonl":
         lists = directory / "lists"
         lists.mkdir()
@@ -181,6 +199,8 @@ def run_case(case, output, timeout):
     try:
         if case.report == "markers":
             children = parse_markers(text)
+            if expected is not None and len(children) != expected:
+                children.append(item("inventory", "FAIL", f"Expected {expected}, received {len(children)}"))
         elif case.report == "pytest":
             children = parse_pytest(directory / "pytest.xml")
         elif case.report == "jsonl":
@@ -293,7 +313,12 @@ def main():
     parser.add_argument("--list", action="store_true")
     parser.add_argument("--summary-root", type=Path)
     parser.add_argument("--stage-wheel", type=Path)
+    parser.add_argument("--state-dtype-junit", type=Path)
     args = parser.parse_args()
+    if args.state_dtype_junit is not None:
+        import pytest
+        return pytest.main(["test_k_last_state_dtype.py", "-v", "-o", "console_output_style=classic",
+                            f"--junitxml={args.state_dtype_junit}"], plugins=[StateDtypeSubset()])
     if args.stage_wheel is not None:
         stage_wheel(args.stage_wheel)
         return 0
@@ -304,6 +329,16 @@ def main():
     if args.list:
         for case in selected:
             print(case.phase, case.name, shlex.join(case.argv), case.lists)
+            if "--kernel=cuda" in case.argv:
+                source = ROOT / next(arg.split("=", 1)[1] for arg in case.argv if arg.startswith("--caselist="))
+                text = source.read_text()
+                subset = v_last_lists(text)
+                batches = [int(re.search(r"batch_size:(\d+)", line)[1]) for line in subset[1]]
+                original = sum(bool(line.strip()) and not line.strip().startswith("#") for line in text.splitlines())
+                print(f"  v-last: TP={tuple(subset)}; batch={batches}; cases={sum(map(len, subset.values()))}"
+                      f" (from {original} TP1 records)")
+            elif case.name == "k-last-state-dtype":
+                print(f"  state-dtype: {STATE_DTYPE_CASES} precision cases selected by CI")
         print(f"Total groups: {len(selected)}")
         return 0
     if not args.output or not args.board or not args.phase or args.budget_seconds <= 0:

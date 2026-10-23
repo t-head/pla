@@ -1,20 +1,24 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
+import ast
 from collections import Counter
 from contextlib import redirect_stdout
+import importlib.util
 import io
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 import xml.etree.ElementTree as ET
 from zipfile import ZipFile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from functional_cases import Case, cases
+from functional_cases import Case, STATE_DTYPE_CASES, StateDtypeSubset, cases, v_last_lists
 import run_functional as runner
 
 
@@ -33,6 +37,169 @@ class FunctionalCITests(unittest.TestCase):
         runner.validate_inventory(selected)
         self.assertEqual(sum("--kernel=cuda" in case.argv for case in selected), 4)
         self.assertFalse(any("--max-cases" in arg for case in selected for arg in case.argv))
+
+    @staticmethod
+    def v_last_line(batch, seqlen=1, heads=16):
+        return (f"[GDN]:[D][{batch}]gdn_attn:seqlen_q:{seqlen},head_dim_qk:128,head_dim_v:128,"
+                f"num_heads_qk:{heads},num_heads_v:32,batch_size:{batch},dtype:bf16.")
+
+    @staticmethod
+    def line_params(line):
+        return dict(re.findall(r"(\w+):([^,]+)", line.split("gdn_attn:", 1)[1].rstrip(".")))
+
+    def test_v_last_selects_two_tp_endpoints_and_five_batches_per_model(self):
+        for case in (case for case in cases() if "--kernel=cuda" in case.argv):
+            with self.subTest(model=case.name):
+                output = self.root / case.name
+                output.mkdir()
+                source = runner.ROOT / next(arg.split("=", 1)[1] for arg in case.argv
+                                            if arg.startswith("--caselist="))
+                original = source.read_bytes()
+                command, cwd, expected = runner.prepare(case, output)
+                self.assertEqual(expected, 10)
+                self.assertEqual(cwd, runner.ROOT)
+                self.assertIn(f"--caselist={output / 'lists'}", command)
+                generated = sorted((output / "lists").iterdir())
+                self.assertEqual({int(re.search(r"_tp(\d+)_", path.name)[1]) for path in generated}, {1, 16})
+                baseline = self.line_params(source.read_text().splitlines()[1])
+                batches = []
+                for path in generated:
+                    tp = int(re.search(r"tp(\d+)", str(path))[1])
+                    params = [self.line_params(line) for line in path.read_text().splitlines()]
+                    batch = [int(row["batch_size"]) for row in params]
+                    self.assertEqual(len(set(batch)), 5)
+                    self.assertTrue(all(0 < value < 256 for value in batch))
+                    self.assertEqual(batch[0], 1)
+                    batches.append(batch)
+                    for row in params:
+                        self.assertEqual(int(row["seqlen_q"]), 1)
+                        for key in ("num_heads_qk", "num_heads_v"):
+                            self.assertEqual(int(row[key]) * tp, int(baseline[key]))
+                        for key in ("head_dim_qk", "head_dim_v", "dtype"):
+                            self.assertEqual(row[key], baseline[key])
+                self.assertEqual(batches[0], batches[1])
+                self.assertEqual(source.read_bytes(), original)
+
+    def test_v_last_deduplicates_batches_and_ignores_unused_seqlens(self):
+        text = "\n".join(self.v_last_line(batch, seqlen) for batch, seqlen in
+                         ((1, 1), (1, 1), (4, 1), (16, 3), (64, 4), (255, 5), (256, 1)))
+        selected = v_last_lists(text)
+        self.assertEqual(set(selected), {1, 16})
+        for lines in selected.values():
+            self.assertEqual([int(self.line_params(line)["batch_size"]) for line in lines], [1, 4])
+
+    def test_v_last_rejects_empty_or_invalid_inventory(self):
+        for text in ("", "# empty", self.v_last_line(256), self.v_last_line(1, 3),
+                     self.v_last_line(1, heads=24), self.v_last_line(1, heads=0)):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                v_last_lists(text)
+
+    def test_v_last_incomplete_tp_inventory_cannot_pass(self):
+        case = next(case for case in cases() if "--kernel=cuda" in case.argv)
+
+        def execute(command, cwd, env, log, timeout):
+            log.write_text("*--- start test case 1/1 ---*\n--- case pass!!! ---\nTotal cases: 1\n")
+            return 0
+
+        with patch.object(runner, "execute", execute), redirect_stdout(io.StringIO()):
+            result = runner.run_case(case, self.root, 5)
+        self.assertEqual(result["status"], "FAIL")
+        self.assertEqual(result["children"][-1]["name"], "inventory")
+
+    def test_v_last_complete_two_file_summary_passes(self):
+        case = next(case for case in cases() if "--kernel=cuda" in case.argv)
+
+        def execute(command, cwd, env, log, timeout):
+            lines = [f"*--- start test case {i}/5 ---*\n--- case pass!!! ---"
+                     for tp in (1, 16) for i in range(1, 6)]
+            log.write_text("\n".join(lines) + "\nTotal cases: 10\n")
+            return 0
+
+        with patch.object(runner, "execute", execute), redirect_stdout(io.StringIO()):
+            result = runner.run_case(case, self.root, 5)
+        self.assertEqual(result["status"], "PASS")
+        self.assertEqual(len(result["children"]), 10)
+
+    def test_list_reports_actual_reduced_scope(self):
+        with patch.object(sys, "argv", ["runner", "--list"]), redirect_stdout(io.StringIO()) as stream:
+            self.assertEqual(runner.main(), 0)
+        text = stream.getvalue()
+        self.assertEqual(text.count("v-last: TP=(1, 16)"), 4)
+        self.assertEqual(text.count("cases=10"), 4)
+        self.assertIn("state-dtype: 38 precision cases", text)
+        self.assertIn("Total groups: 50", text)
+
+    def test_other_kernel_and_prefill_commands_are_unchanged(self):
+        for case in cases():
+            if "--kernel=cuda" in case.argv or case.report in ("pytest", "jsonl"):
+                continue
+            command, cwd, expected = runner.prepare(case, self.root)
+            self.assertEqual(command[2:], list(case.argv))
+            self.assertEqual(cwd, runner.ROOT)
+            self.assertIsNone(expected)
+
+    def test_state_dtype_uses_ci_selection_from_tests_directory(self):
+        case = next(case for case in cases() if case.name == "k-last-state-dtype")
+        command, cwd, expected = runner.prepare(case, self.root)
+        self.assertEqual(cwd, runner.ROOT / "tests")
+        self.assertEqual(command[2], str(Path(runner.__file__).resolve()))
+        self.assertEqual(command[3:], ["--state-dtype-junit", str(self.root / "pytest.xml")])
+        self.assertIsNone(expected)
+
+    def test_state_dtype_ci_entry_runs_original_pytest_with_selection(self):
+        calls = []
+        fake_pytest = SimpleNamespace(main=lambda argv, plugins: calls.append((argv, plugins)) or 0)
+        with patch.dict(sys.modules, {"pytest": fake_pytest}):
+            with patch.object(sys, "argv", ["runner", "--state-dtype-junit", "result.xml"]):
+                self.assertEqual(runner.main(), 0)
+        argv, plugins = calls[0]
+        self.assertEqual(argv, ["test_k_last_state_dtype.py", "-v", "-o",
+                                "console_output_style=classic", "--junitxml=result.xml"])
+        self.assertIsInstance(plugins[0], StateDtypeSubset)
+
+    def test_state_dtype_empty_collection_is_an_error(self):
+        with self.assertRaisesRegex(ValueError, "Expected 38 state-dtype cases"):
+            StateDtypeSubset().pytest_collection_modifyitems(None, [])
+
+    @unittest.skipUnless(importlib.util.find_spec("pytest"), "requires pytest for collection")
+    def test_state_dtype_subset_with_actual_product_parametrization(self):
+        import pytest
+
+        source = ast.parse((runner.ROOT / "tests/test_k_last_state_dtype.py").read_text())
+        module = ast.parse("import pytest\nfrom types import SimpleNamespace\n"
+                           "torch = SimpleNamespace(float32='torch.float32', "
+                           "float16='torch.float16', bfloat16='torch.bfloat16')\n")
+        for node in source.body:
+            if isinstance(node, ast.FunctionDef) and node.name.startswith("test_"):
+                node.body = [ast.Pass()]
+                module.body.append(node)
+        path = self.root / "test_state_dtype_collection.py"
+        path.write_text(ast.unparse(ast.fix_missing_locations(module)))
+
+        class Capture(StateDtypeSubset):
+            def pytest_collection_modifyitems(self, config, items):
+                self.total = len(items)
+                super().pytest_collection_modifyitems(config, items)
+                self.selected = [(item.originalname, item.callspec.params) for item in items]
+
+        selection = Capture()
+        with redirect_stdout(io.StringIO()):
+            rc = pytest.main([str(path), "--collect-only", "-q", "--noconftest"], plugins=[selection])
+        self.assertEqual(rc, 0)
+        self.assertEqual(selection.total, 745)
+        self.assertEqual(len(selection.selected), STATE_DTYPE_CASES)
+        self.assertEqual(Counter(name for name, _ in selection.selected),
+                         {"test_k_last_state_dtype": 26, "test_nonpow2_entry_modes": 8,
+                          "test_k_last_kda_lower_bound": 2, "test_k_last_vllm_slot_table": 2})
+        core = [params for name, params in selection.selected
+                if name == "test_k_last_state_dtype" and params["mode"] in ("decode", "verify")]
+        self.assertEqual(len(core), 16)
+        self.assertEqual({(p["state_dtype"], p["activation_dtype"], p["is_kda"], p["mode"]) for p in core},
+                         {(state, activation, kda, mode) for state in ("torch.float32", "torch.bfloat16")
+                          for activation in ("torch.float16", "torch.bfloat16")
+                          for kda in (False, True) for mode in ("decode", "verify")})
+        self.assertEqual({p["mode"] for name, p in selection.selected if name == "test_k_last_state_dtype"},
+                         {"decode", "verify", "writeback", "tree", "ragged", "graph", "tunable"})
 
     def make_wheel(self, directories=None, source=b"# source\n", manifest=True):
         package = self.root / "pla"
