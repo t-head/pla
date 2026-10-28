@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the shared strong rules against an explicitly identified PR change set."""
+"""Run the shared normal rules against an explicitly identified PR change set."""
 
 import argparse
 from contextlib import redirect_stderr, redirect_stdout
@@ -18,6 +18,7 @@ scanner = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = scanner
 spec.loader.exec_module(scanner)
 
+SCAN_MODE = scanner.NORMAL_MODE
 IGNORED_PATHS = (
     ".aoneci",
     ".github/workflows/scripts/static_compliance_scan.py",
@@ -39,14 +40,14 @@ def scan(base, head):
     scanner.repo_root.cache_clear()
     scanner.head_exists.cache_clear()
     findings, files, lines, commits = scanner.scan_diff(
-        merge_base, None, scanner.STRONG_MODE, IGNORED_PATHS,
+        merge_base, None, SCAN_MODE, IGNORED_PATHS,
     )
     if not files and not lines and not commits:
         raise RuntimeError("Empty scan inventory")
     print(f"Base SHA: {base}")
     print(f"Head SHA: {head}")
     print(f"Merge base: {merge_base}")
-    print("Rule mode: strong")
+    print(f"Rule mode: {SCAN_MODE.name}")
     print(f"Ignored paths: {' '.join(IGNORED_PATHS)}")
     print("Only rule definitions, rule fixtures and legacy pipeline files are excluded.")
     print(f"Scanned changed files: {files}")
@@ -77,14 +78,14 @@ def main(argv=None):
             result = {"status": "ERROR", "error": str(exc)}
             print(f"Static compliance scan ERROR: {exc}")
             code = 2
-    result["mode"] = "strong"
+    result["mode"] = SCAN_MODE.name
     result["ignored_paths"] = list(IGNORED_PATHS)
     result["scanner_sha256"] = hashlib.sha256(SCANNER_PATH.read_bytes()).hexdigest()
     (args.output / "scan.log").write_text(log.getvalue(), encoding="utf-8")
     (args.output / "results.json").write_text(
         json.dumps(result, indent=2, ensure_ascii=True) + "\n", encoding="utf-8",
     )
-    summary = f"## Static Compliance Scan (strong)\n\nStatus: {result['status']}\n\n"
+    summary = f"## Static Compliance Scan ({SCAN_MODE.name})\n\nStatus: {result['status']}\n\n"
     if result["status"] != "ERROR":
         summary += (f"Changed files: {result['files']}; added lines: {result['added_lines']}; "
                     f"commit messages: {result['commits']}; findings: {len(result['findings'])}.\n\n")
@@ -94,7 +95,7 @@ def main(argv=None):
     if os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as handle:
             handle.write(summary)
-    print(f"Static Compliance Scan (strong): {result['status']}")
+    print(f"Static Compliance Scan ({SCAN_MODE.name}): {result['status']}")
     return code
 
 

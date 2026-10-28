@@ -73,14 +73,39 @@ class StaticComplianceTests(unittest.TestCase):
         self.assertEqual((result["files"], result["added_lines"], result["commits"]), (1, 1, 1))
 
     def test_existing_violations_do_not_enter_increment(self):
-        self.write("source.py", "cu" + "daMalloc();\nvalue = 1\n")
+        self.write("source.py", "# \u4e2d\u6587\nvalue = 1\n")
         base = self.commit("test: historical fixture")
-        self.write("source.py", "cu" + "daMalloc();\nvalue = 2\n")
+        self.write("source.py", "# \u4e2d\u6587\nvalue = 2\n")
         self.assertEqual(self.scan(self.commit("test: clean addition"), base)["status"], "PASS")
 
-    def test_added_vendor_name_fails_strong(self):
-        self.write("source.py", "cu" + "daMalloc();\n")
-        self.assertIn("nv-style-name", self.rules(self.scan(self.commit("test: vendor fixture"))))
+    def test_added_vendor_names_pass_normal(self):
+        self.write("source.py", "cu" + "daMalloc();\na" + "compute_task();\n")
+        result = self.scan(self.commit("test: vendor fixture"))
+        self.assertEqual(result["status"], "PASS")
+        self.assertEqual(result["findings"], [])
+
+    def test_vendor_names_in_commit_messages_pass_normal(self):
+        self.write("source.py", "value = 2\n")
+        result = self.scan(self.commit("test: cu" + "da fixture\n\na" + "compute task"))
+        self.assertEqual(result["status"], "PASS")
+        self.assertEqual(result["commits"], 1)
+        self.assertEqual(result["findings"], [])
+
+    def test_normal_retains_all_core_line_rules(self):
+        fixtures = {
+            "next-gen-chip-term": "ppu" + "0017",
+            "restricted-eula-component": "cute" + "DSL",
+            "tensor-core-term": "tensor" + " core",
+            "internal-host-name": "git" + "lab",
+            "chinese-text": "\u4e2d\u6587",
+            "illegal-char": "\u00a0",
+        }
+        for rule, text in fixtures.items():
+            with self.subTest(rule=rule):
+                self.write("source.py", f"# {text}\n")
+                result = self.scan(self.commit("test: core rule fixture"))
+                self.assertEqual(result["status"], "FAIL")
+                self.assertIn(rule, self.rules(result))
 
     def test_chinese_and_internal_terms_are_core_findings(self):
         self.write("source.py", "# \u4e2d\u6587\n# git" + "lab\n")
@@ -98,7 +123,7 @@ class StaticComplianceTests(unittest.TestCase):
         self.write("source.py", "value = 2\n")
         head = self.commit("test: branch fixture")
         self.git("checkout", "-q", "target")
-        self.write("target.py", "cu" + "daMalloc();\n")
+        self.write("target.py", "# \u4e2d\u6587\n")
         base = self.commit("test: target fixture")
         self.git("checkout", "-q", "--detach", head)
         result = self.scan(head, base)
@@ -144,20 +169,21 @@ class StaticComplianceTests(unittest.TestCase):
 
     def test_exclusions_are_narrow_and_visible(self):
         for path in runner.IGNORED_PATHS[1:]:
-            self.write(path, "cu" + "daMalloc();\n")
-        self.write(".aoneci/legacy.yml", "cu" + "daMalloc();\n")
-        self.write(".github/other.py", "cu" + "daMalloc();\n")
+            self.write(path, "# \u4e2d\u6587\n")
+        self.write(".aoneci/legacy.yml", "# \u4e2d\u6587\n")
+        self.write(".github/other.py", "# \u4e2d\u6587\n")
         result = self.scan(self.commit("test: exclusion fixture"))
         paths = {item["path"] for item in result["findings"]}
         self.assertEqual(paths, {".github/other.py"})
         self.assertFalse(scanner.is_ignored(".aoneci-extra/other.py", runner.IGNORED_PATHS))
         self.assertEqual(result["files"], 1)
 
-    def test_changed_vendor_path_is_checked(self):
+    def test_changed_vendor_path_passes_normal(self):
         self.write("n" + "v_helper.py", "value = 1\n")
         result = self.scan(self.commit("test: path fixture"))
-        self.assertIn("nv-style-name", self.rules(result))
-        self.assertTrue(any(item["line"] is None for item in result["findings"]))
+        self.assertEqual(result["status"], "PASS")
+        self.assertEqual(result["findings"], [])
+        self.assertEqual(result["files"], 1)
 
     def test_inline_asm_uses_whole_file_context(self):
         self.write("source.cpp", 'asm volatile(\n    "ppu.test;"\n);\n')
@@ -201,15 +227,20 @@ class StaticComplianceTests(unittest.TestCase):
             self.assertEqual(code, expected)
             result = json.loads((output / "results.json").read_text())
             self.assertEqual(result["status"], "FAIL" if expected else "PASS")
-            self.assertEqual(result["mode"], "strong")
+            self.assertEqual(result["mode"], "normal")
             self.assertEqual(len(result["scanner_sha256"]), 64)
-            self.assertTrue((output / "scan.log").exists())
-            self.assertIn("Explicit exclusions", (output / "summary.md").read_text())
+            self.assertIn("Rule mode: normal", (output / "scan.log").read_text())
+            summary = (output / "summary.md").read_text()
+            self.assertIn("Static Compliance Scan (normal)", summary)
+            self.assertIn("Explicit exclusions", summary)
         output = self.root / "report-error"
         with redirect_stdout(io.StringIO()):
             code = runner.main(["--base", "0" * 40, "--head", head, "--output", str(output)])
         self.assertEqual(code, 2)
-        self.assertEqual(json.loads((output / "results.json").read_text())["status"], "ERROR")
+        result = json.loads((output / "results.json").read_text())
+        self.assertEqual(result["status"], "ERROR")
+        self.assertEqual(result["mode"], "normal")
+        self.assertIn("Static Compliance Scan (normal)", (output / "summary.md").read_text())
 
     def test_source_text_cannot_inject_step_summary_or_console_commands(self):
         self.write("source.py", "# \u4e2d\u6587\n::error::fixture\n```\n")
@@ -220,6 +251,7 @@ class StaticComplianceTests(unittest.TestCase):
             with redirect_stdout(io.StringIO()) as console:
                 self.assertEqual(runner.main(["--base", self.base, "--head", head,
                                               "--output", str(output)]), 1)
+        self.assertIn("Static Compliance Scan (normal): FAIL", console.getvalue())
         self.assertNotIn("::error::", console.getvalue())
         self.assertNotIn("\u4e2d\u6587", summary.read_text())
         self.assertNotIn("```", summary.read_text())
@@ -248,6 +280,9 @@ class StaticComplianceTests(unittest.TestCase):
 
     def test_workflow_is_isolated_read_only_and_has_explicit_inventory(self):
         workflow = WORKFLOW.read_text()
+        self.assertIs(runner.SCAN_MODE, scanner.NORMAL_MODE)
+        self.assertEqual(workflow.count("Static Compliance Scan (normal)"), 2)
+        self.assertNotIn("(strong)", workflow)
         self.assertIn("runs-on: ubuntu-latest", workflow)
         self.assertIn("contents: read", workflow)
         self.assertNotIn("secrets:", workflow)
@@ -282,7 +317,7 @@ class StaticComplianceTests(unittest.TestCase):
                 subprocess.run(["bash", "-n"], input=step["run"], text=True, check=True)
 
     @unittest.skipUnless(os.environ.get("COMPLIANCE_WORKTREE"), "optional working-tree scan")
-    def test_current_worktree_changes_pass_strong_without_staging(self):
+    def test_current_worktree_changes_pass_normal_without_staging(self):
         os.chdir(os.environ["COMPLIANCE_WORKTREE"])
         scanner.repo_root.cache_clear()
         scanner.head_exists.cache_clear()
@@ -300,9 +335,9 @@ class StaticComplianceTests(unittest.TestCase):
                                       capture_output=True, text=True)
                 self.assertIn(proc.returncode, (0, 1))
                 diff += proc.stdout
-        findings, files, lines, _ = scanner.scan_diff(None, diff, scanner.STRONG_MODE, runner.IGNORED_PATHS)
+        findings, files, lines, _ = scanner.scan_diff(None, diff, scanner.NORMAL_MODE, runner.IGNORED_PATHS)
         paths = [path for path in paths if not scanner.is_ignored(path, runner.IGNORED_PATHS)]
-        findings.extend(scanner.scan_paths(paths, scanner.STRONG_MODE))
+        findings.extend(scanner.scan_paths(paths, scanner.NORMAL_MODE))
         self.assertGreater(files, 0)
         self.assertGreater(lines, 0)
         self.assertEqual(findings, [])
