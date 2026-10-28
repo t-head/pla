@@ -66,8 +66,28 @@
   const int seq_idx = head_contiguous ? task_idx / H : int(blockIdx.x);
   const int head_idx = head_contiguous ? task_idx % H : int(blockIdx.y);
 #else
-  const int seq_idx  = blockIdx.x;
-  const int head_idx = blockIdx.y;
+  int seq_idx = blockIdx.x;
+  int head_idx = blockIdx.y;
+  if constexpr (H == 16 && Hg == 2 && NGRP == 2) {
+    if (cp_seq_map == nullptr && (batch_size == 2 || batch_size == 3) &&
+        cu_seqlens[batch_size] >= 16384 && cu_seqlens[batch_size] <= 32768) {
+      const int task = int(blockIdx.y) * int(gridDim.x) + int(blockIdx.x);
+      const int ordinal = task / H;
+      head_idx = task % H;
+      int lengths[3];
+      lengths[0] = cu_seqlens[1] - cu_seqlens[0];
+      lengths[1] = cu_seqlens[2] - cu_seqlens[1];
+      lengths[2] = batch_size == 3 ? cu_seqlens[3] - cu_seqlens[2] : -1;
+      CUTE_UNROLL
+      for (int i = 0; i < 3; ++i) {
+        int rank = 0;
+        CUTE_UNROLL
+        for (int j = 0; j < 3; ++j)
+          rank += lengths[j] > lengths[i] || (lengths[j] == lengths[i] && j < i);
+        if (rank == ordinal) seq_idx = i;
+      }
+    }
+  }
 #endif
   const int kv_head_idx = head_idx / (H / Hg);
   // 2D block: threadIdx.x = warp-group-local tid (0..FF_WG-1 = 0..127),
@@ -88,13 +108,36 @@
   const int tx  = gid * FF_WG + l;                 // flat CTA tid for cooperative loops
 #endif
 
-  const int seq_start = cu_seqlens[seq_idx];
-  const int seq_end   = cu_seqlens[seq_idx + 1];
-  const int seq_len   = seq_end - seq_start;
+  const int output_start = cu_seqlens[seq_idx];
+  const int seq_end = cu_seqlens[seq_idx + 1];
+  const int raw_batch_idx = cp_seq_map != nullptr ? cp_seq_map[seq_idx] : seq_idx;
+  int seq_start = output_start;
+  if (cp_seq_map != nullptr && num_warmup_chunks != nullptr &&
+      fallback_mask != nullptr && raw_batch_idx >= 0 &&
+      raw_batch_idx < raw_batch_size &&
+      output_start > raw_cu_seqlens[raw_batch_idx]) {
+    int predecessor = seq_idx - 1;
+    while (predecessor >= 0 && cp_seq_map[predecessor] == raw_batch_idx) {
+      const int metadata_offset = predecessor * H + head_idx;
+      if (!static_cast<bool>(fallback_mask[metadata_offset])) {
+        const int predecessor_start = cu_seqlens[predecessor];
+        const int predecessor_end = cu_seqlens[predecessor + 1];
+        const int predecessor_chunks =
+            (predecessor_end - predecessor_start + FF_CS - 1) / FF_CS;
+        int warmup_chunks = num_warmup_chunks[metadata_offset];
+        warmup_chunks = max(0, min(warmup_chunks, predecessor_chunks));
+        seq_start = max(predecessor_start,
+                        predecessor_end - warmup_chunks * FF_CS);
+        break;
+      }
+      seq_start = cu_seqlens[predecessor];
+      --predecessor;
+    }
+  }
+  const int seq_len = seq_end - seq_start;
   if (seq_len == 0) return;
   const int num_chunks = (seq_len + FF_CS - 1) / FF_CS;
   const int full_chunks = seq_len / FF_CS;  // chunks with actual==FF_CS (no partial)
-  const int raw_batch_idx = cp_seq_map != nullptr ? cp_seq_map[seq_idx] : seq_idx;
 #if defined(FF_BODY_INDEXED_TC01)
   // The mapped raw-batch slot is CTA-uniform. Reject a malformed private-call
   // map before reading raw_state_indices and before the first CTA barrier.
@@ -104,10 +147,17 @@
   const int raw_state_idx =
       (raw_state_indices != nullptr && raw_batch_idx >= 0)
       ? raw_state_indices[raw_batch_idx] : raw_batch_idx;
+  const auto* state_input =
+      raw_state_input != nullptr ? raw_state_input : raw_state;
+  const int state_input_idx =
+      raw_state_input != nullptr ? raw_batch_idx : raw_state_idx;
 #endif
   bool need_store_ht = false;
+  bool load_raw_state = cp_seq_map == nullptr;
   if (raw_batch_idx >= 0 && raw_batch_idx < raw_batch_size) {
     need_store_ht = (seq_end >= raw_cu_seqlens[raw_batch_idx + 1]);
+    load_raw_state = load_raw_state ||
+        (seq_start <= raw_cu_seqlens[raw_batch_idx]);
   }
 
   extern __shared__ char smem[];
@@ -223,11 +273,12 @@
 #else
             if (h0 != nullptr) {
               raw[vv] = h0[hbase + dk * FF_DV + (dv_base + dv)];
-            } else if (raw_state != nullptr && raw_state_idx >= 0) {
+            } else if (load_raw_state && state_input != nullptr &&
+                       state_input_idx >= 0) {
               const int64_t raw_off =
-                  ((int64_t)raw_state_idx * H + head_idx) * FF_DV * FF_DK +
+                  ((int64_t)state_input_idx * H + head_idx) * FF_DV * FF_DK +
                   (int64_t)(dv_base + dv) * FF_DK + dk;
-              raw[vv] = raw_state[raw_off];
+              raw[vv] = state_input[raw_off];
             } else {
               fq::state_from_f32(raw[vv], 0.0f);
             }
@@ -264,11 +315,12 @@
             if (h0 != nullptr) {
               rHreg(vv, m, n) =
                   fq::state_to_f32(h0[hbase + dk * FF_DV + (dv_base + dv)]);
-            } else if (raw_state != nullptr && raw_state_idx >= 0) {
+            } else if (load_raw_state && state_input != nullptr &&
+                       state_input_idx >= 0) {
               const int64_t raw_off =
-                  ((int64_t)raw_state_idx * H + head_idx) * FF_DV * FF_DK +
+                  ((int64_t)state_input_idx * H + head_idx) * FF_DV * FF_DK +
                   (int64_t)(dv_base + dv) * FF_DK + dk;
-              rHreg(vv, m, n) = fq::state_to_f32(raw_state[raw_off]);
+              rHreg(vv, m, n) = fq::state_to_f32(state_input[raw_off]);
             } else {
               rHreg(vv, m, n) = 0.0f;
             }
@@ -638,7 +690,9 @@
     // Vd^T feeds Vd^T @ Pg^T unchanged and Vd^T*diag(g_rev) @ K after
     // column scaling. Both are direct tc02 A fragments; no shuffle is needed.
     uint32_t vd_a_regs[FF_CS / 16][1][4];
+#if !defined(FLASHQLA_ARCH_100) || !defined(FF_VD_INPLACE)
     uint32_t gvd_a_regs[FF_CS / 16][1][4];
+#endif
     {
       auto rVd = cute::recast<float>(vd_acc);
       CUTE_UNROLL
@@ -655,6 +709,7 @@
           vd_c_regs[i] = fq::pack_b16x2_u32(lo, hi);
         }
         fq::cfrag_to_afrag_mma_u32<Element>(vd_c_regs, vd_a_regs[kt][0], l & 31);
+#if !defined(FLASHQLA_ARCH_100) || !defined(FF_VD_INPLACE)
         // gVd has the same A-fragment ownership as Vd.  Scale the already
         // converted Vd fragment at its destination CS coordinates instead of
         // building a second C fragment and paying another eight cross-lane
@@ -687,8 +742,36 @@
               fq::float_to_element<Element>(g_rev[cs1] * vd1));
           gvd_a_regs[kt][0][i] = fq::pack_b16x2_u32(lo, hi);
         }
+#endif
       }
     }
+
+#if defined(FLASHQLA_ARCH_100) && defined(FF_VD_INPLACE)
+    // Consume the unscaled Vd fragment before reusing the same registers for
+    // gVd. This shortens the tc01 live range by one A-fragment array.
+    ff_gemm_regA_swzlB_m4<FF_CS, FF_CS, Element>(
+        vd_a_regs, Pg_g, l, o_acc, /*clear_acc=*/false);
+    CUTE_UNROLL
+    for (int kt = 0; kt < FF_CS / 16; ++kt) {
+      CUTE_UNROLL
+      for (int i = 0; i < 4; ++i) {
+        const int cs0 = kt * 16 + 2 * (l & 3) + 8 * (i & 1);
+        const int cs1 = cs0 + 1;
+        const uint32_t vd_pack = vd_a_regs[kt][0][i];
+        const float vd0 = fq::element_to_float<Element>(
+            fq::element_from_bits16<Element>(
+                fq::get_b16_from_pack(vd_pack, 0)));
+        const float vd1 = fq::element_to_float<Element>(
+            fq::element_from_bits16<Element>(
+                fq::get_b16_from_pack(vd_pack, 1)));
+        const uint32_t lo = fq::element_bits16<Element>(
+            fq::float_to_element<Element>(g_rev[cs0] * vd0));
+        const uint32_t hi = fq::element_bits16<Element>(
+            fq::float_to_element<Element>(g_rev[cs1] * vd1));
+        vd_a_regs[kt][0][i] = fq::pack_b16x2_u32(lo, hi);
+      }
+    }
+#endif
 
     // ---- decay h^T; GEMM6^T h^T += gVd^T@K; GEMM5^T O^T += Vd^T@Pg^T ----
     CUTE_UNROLL
@@ -700,19 +783,26 @@
           rHreg(vv, m, n) *= decay;
       }
     }
+#if defined(FLASHQLA_ARCH_100) && defined(FF_VD_INPLACE)
+    ff_gemm_regA_ktB_m4_acc<Element>(
+        vd_a_regs, K_buf, l, h_reg);
+#else
     ff_gemm_regA_ktB_m4_acc<Element>(
         gvd_a_regs, K_buf, l, h_reg);
     ff_gemm_regA_swzlB_m4<FF_CS, FF_CS, Element>(
         vd_a_regs, Pg_g, l, o_acc, /*clear_acc=*/false);
+#endif
 
     // The DV-major fragment owns a [DV16,CS32] O^T tile per warp.  Transpose it
     // once in registers and publish two aligned int4 vectors per lane.  This
     // removes the Wswz_g scatter, group barrier and TSM reload from the final
     // output path without reintroducing scalar/uncoalesced global stores.
-    Element* O_ptr = o + (int64_t)chunk_start * H * FF_DV
-                     + head_idx * FF_DV;
-    ff_store_ot_register_direct<Element>(
-        o_acc, O_ptr, (int64_t)H * FF_DV, dv_base, l, actual);
+    if (chunk_start >= output_start) {
+      Element* O_ptr = o + (int64_t)chunk_start * H * FF_DV
+                       + head_idx * FF_DV;
+      ff_store_ot_register_direct<Element>(
+          o_acc, O_ptr, (int64_t)H * FF_DV, dv_base, l, actual);
+    }
 #else
     // ============ PHASE D (FF_GEMM_REORDER): GEMM4->3->1->2->6->5 =============
     auto sH  = fq::make_smem_tensor_h_ld<FF_DVH, FF_DK, FF_HLD>(hstmT_g);
@@ -941,7 +1031,7 @@
     fq::flashqla_gemm_ss_acc<decltype(sPg), decltype(sVdT), decltype(o_acc), MmaO, Element>(
         sPg, sVdT, l, o_acc);                                    // accumulate on scaled O_int
 #endif
-    {
+    if (chunk_start >= output_start) {
       Element* O_ptr = o + (int64_t)chunk_start * H * FF_DV + head_idx * FF_DV;
       cute::Tensor rO2 = cute::recast<float>(o_acc);
       CUTE_UNROLL
@@ -1085,7 +1175,7 @@
     auto sVdT = fq::make_smem_tensor_h_ld<FF_DVH, FF_CS, FF_WLD>(Vdswz_g);
     fq::flashqla_gemm_ss_acc<decltype(sPg), decltype(sVdT), decltype(o_acc), MmaO, Element>(
         sPg, sVdT, l, o_acc);                                    // accumulate on scaled O_int
-    {
+    if (chunk_start >= output_start) {
       Element* O_ptr = o + (int64_t)chunk_start * H * FF_DV + head_idx * FF_DV;
       cute::Tensor rO2 = cute::recast<float>(o_acc);
       CUTE_UNROLL

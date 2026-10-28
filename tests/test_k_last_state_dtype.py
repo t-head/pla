@@ -260,6 +260,61 @@ def tunable_config():
     return dict(bv=16 if tc01 else 64, wn=4 if tc01 else 8, sn=4, hv_per_cta=1)
 
 
+@pytest.mark.parametrize("is_kda", [False, True])
+@pytest.mark.parametrize("mode", ["decode", "verify", "tree", "graph"])
+@pytest.mark.parametrize("tunable", [False, True])
+def test_k_last_writes_caller_out(is_kda, mode, tunable):
+    case_mode = "verify" if mode == "graph" else mode
+    args, _, lengths, state_ids, cache_ids = make_case(
+        torch.float32, torch.bfloat16, is_kda, case_mode)
+    expected_out, _, _ = reference(args, lengths, state_ids, cache_ids)
+    call = fused_sigmoid_gating_delta_rule_forward_k_last_tunable if tunable else forward
+    kwargs = dict(args, **tunable_config()) if tunable else args
+    # Sentinel-filled storage catches any output row the kernel fails to write.
+    out = torch.full_like(args["v"], 3.0)
+    out_ptr = out.data_ptr()
+    if mode == "graph":
+        call(**kwargs, out=out)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            result = call(**kwargs, out=out)
+        out.fill_(3.0)
+        args["intermediate_states_buffer"].fill_(-7.0)
+        graph.replay()
+    else:
+        result = call(**kwargs, out=out)
+    torch.cuda.synchronize()
+    assert result.data_ptr() == out_ptr
+    torch.testing.assert_close(out, expected_out, atol=1e-3, rtol=1e-2)
+
+
+@pytest.mark.parametrize("defect,message", [
+    ("dtype", "out dtype must match v"),
+    ("shape", "out shape must match v"),
+    ("strided", "out must be contiguous"),
+    ("cpu", "out must be on the same device as v"),
+])
+@pytest.mark.parametrize("tunable", [False, True])
+def test_k_last_rejects_invalid_out(defect, message, tunable):
+    args, _, _, _, _ = make_case(torch.float32, torch.bfloat16, False, "verify")
+    v = args["v"]
+    if defect == "dtype":
+        out = torch.empty_like(v, dtype=torch.float16)
+    elif defect == "shape":
+        out = torch.empty_like(v[:, :-1])
+    elif defect == "strided":
+        out = torch.empty(*v.shape[:-1], 2 * v.shape[-1], dtype=v.dtype, device=v.device)[..., ::2]
+    else:
+        out = torch.empty_like(v, device="cpu")
+    with pytest.raises(RuntimeError, match=message):
+        if tunable:
+            fused_sigmoid_gating_delta_rule_forward_k_last_tunable(
+                **args, **tunable_config(), out=out)
+        else:
+            forward(**args, out=out)
+
+
 def packed_args(args):
     nt = args["q"].shape[1]
     return dict(

@@ -64,7 +64,8 @@ __global__ void get_warmup_chunks_cute_kernel(
     int* __restrict__ num_warmup_chunks,       // [batch * H] output
     int batch_size,
     int num_tokens,
-    int H
+    int H,
+    float threshold
 ) {
     using namespace cute;
 
@@ -103,7 +104,7 @@ __global__ void get_warmup_chunks_cute_kernel(
                 g_val = gG(pos - 1, head);
             }
             g_cumsum += g_val;
-            if (g_cumsum < -10.0f && n_fragment == num_iters) {
+            if (g_cumsum < threshold && n_fragment == num_iters) {
                 n_fragment = i_s + 1;
                 f_fragment = 0;  // can skip earlier chunks
             }
@@ -128,6 +129,7 @@ void launch_get_warmup_chunks_cute(
     int batch_size,
     int num_tokens,
     int H,
+    float threshold,
     hggcStream_t stream
 ) {
     dim3 grid(batch_size);
@@ -135,5 +137,5 @@ void launch_get_warmup_chunks_cute(
     dim3 block(128);
     flashqla_cute::get_warmup_chunks_cute_kernel<<<grid, block, 0, stream>>>(
         cu_seqlens, fallback_mask, g, ht_mask, num_warmup_chunks,
-        batch_size, num_tokens, H);
+        batch_size, num_tokens, H, threshold);
 }

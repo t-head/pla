@@ -1391,6 +1391,8 @@ fused_fwd_cp_cute_kernel(
     const int* __restrict__ cu_seqlens,
     const int* __restrict__ cp_seq_map,
     const int* __restrict__ raw_cu_seqlens,
+    const int* __restrict__ num_warmup_chunks,
+    const signed char* __restrict__ fallback_mask,
     int batch_size, int num_tokens, int raw_batch_size,
     float scale, int64_t v_token_stride)
 {
@@ -1414,15 +1416,50 @@ fused_fwd_cp_cute_indexed_kernel(
     const fq::StatePool<STATE_BF16>* __restrict__ h0,
     fq::StatePool<STATE_BF16>* __restrict__ ht_out,
     fq::StatePool<STATE_BF16>* __restrict__ raw_state,
+    const fq::StatePool<STATE_BF16>* __restrict__ raw_state_input,
     const int* __restrict__ raw_state_indices,
     const int* __restrict__ cu_seqlens,
     const int* __restrict__ cp_seq_map,
     const int* __restrict__ raw_cu_seqlens,
+    const int* __restrict__ num_warmup_chunks,
+    const signed char* __restrict__ fallback_mask,
     int batch_size, int num_tokens, int raw_batch_size,
     float scale, int64_t v_token_stride)
 {
 #define FF_BODY_INDEXED_TC01 1
 #include "fused_fwd_cute_body.inc"
+#undef FF_BODY_INDEXED_TC01
+}
+
+template <typename Element, int H_TPL, int Hg_TPL, int NGRP,
+          int DVH_TPL = FF_DVH, bool AUX_P_TPL = false,
+          bool STATE_BF16 = false>
+__global__ void __launch_bounds__(FF_WG * (AUX_P_TPL ? 2 : NGRP), FF_MIN_BLOCKS)
+fused_fwd_cp_cute_indexed_vd_inplace_kernel(
+    Element* __restrict__ o,
+    const Element* __restrict__ q,
+    const Element* __restrict__ k,
+    const Element* __restrict__ v,
+    const Element* __restrict__ a,
+    const float* __restrict__ beta,
+    const float* __restrict__ g,
+    const fq::StatePool<STATE_BF16>* __restrict__ h0,
+    fq::StatePool<STATE_BF16>* __restrict__ ht_out,
+    fq::StatePool<STATE_BF16>* __restrict__ raw_state,
+    const fq::StatePool<STATE_BF16>* __restrict__ raw_state_input,
+    const int* __restrict__ raw_state_indices,
+    const int* __restrict__ cu_seqlens,
+    const int* __restrict__ cp_seq_map,
+    const int* __restrict__ raw_cu_seqlens,
+    const int* __restrict__ num_warmup_chunks,
+    const signed char* __restrict__ fallback_mask,
+    int batch_size, int num_tokens, int raw_batch_size,
+    float scale, int64_t v_token_stride)
+{
+#define FF_BODY_INDEXED_TC01 1
+#define FF_VD_INPLACE 1
+#include "fused_fwd_cute_body.inc"
+#undef FF_VD_INPLACE
 #undef FF_BODY_INDEXED_TC01
 }
 
@@ -1441,10 +1478,13 @@ fused_fwd_cp_cute_runtime_kernel(
     const fq::StatePool<STATE_BF16>* __restrict__ h0,
     fq::StatePool<STATE_BF16>* __restrict__ ht_out,
     fq::StatePool<STATE_BF16>* __restrict__ raw_state,
+    const fq::StatePool<STATE_BF16>* __restrict__ raw_state_input,
     const int* __restrict__ raw_state_indices,
     const int* __restrict__ cu_seqlens,
     const int* __restrict__ cp_seq_map,
     const int* __restrict__ raw_cu_seqlens,
+    const int* __restrict__ num_warmup_chunks,
+    const signed char* __restrict__ fallback_mask,
     int batch_size, int num_tokens, int raw_batch_size,
     float scale, int64_t v_token_stride)
 {
@@ -1466,10 +1506,13 @@ fused_fwd_cp_cute_runtime_head_major_kernel(
     const fq::StatePool<STATE_BF16>* __restrict__ h0,
     fq::StatePool<STATE_BF16>* __restrict__ ht_out,
     fq::StatePool<STATE_BF16>* __restrict__ raw_state,
+    const fq::StatePool<STATE_BF16>* __restrict__ raw_state_input,
     const int* __restrict__ raw_state_indices,
     const int* __restrict__ cu_seqlens,
     const int* __restrict__ cp_seq_map,
     const int* __restrict__ raw_cu_seqlens,
+    const int* __restrict__ num_warmup_chunks,
+    const signed char* __restrict__ fallback_mask,
     int batch_size, int num_tokens, int raw_batch_size,
     float scale, int64_t v_token_stride)
 {
@@ -1489,7 +1532,7 @@ constexpr int kFusedMaxCachedDevices = 64;
 
 template <flashqla_cute::FfStateMode StateMode,
           typename Element, int H, int Hg, int NGRP, int DVH, bool AUX_P,
-          bool SBF16>
+          bool SBF16, bool VD_INPLACE = false>
 void configure_fused_kernel_smem_once(int device_index, int smem_cap) {
   auto configure = [smem_cap]() {
     if constexpr (StateMode == flashqla_cute::FfStateMode::Legacy) {
@@ -1498,10 +1541,17 @@ void configure_fused_kernel_smem_once(int device_index, int smem_cap) {
               Element, H, Hg, NGRP, DVH, AUX_P, SBF16>,
           hggcFuncAttributeMaxDynamicSharedMemorySize, smem_cap);
     } else if constexpr (StateMode == flashqla_cute::FfStateMode::Indexed) {
-      hggcFuncSetAttribute(
-          flashqla_cute::fused_fwd_cp_cute_indexed_kernel<
-              Element, H, Hg, NGRP, DVH, AUX_P, SBF16>,
-          hggcFuncAttributeMaxDynamicSharedMemorySize, smem_cap);
+      if constexpr (VD_INPLACE) {
+        hggcFuncSetAttribute(
+            flashqla_cute::fused_fwd_cp_cute_indexed_vd_inplace_kernel<
+                Element, H, Hg, NGRP, DVH, AUX_P, SBF16>,
+            hggcFuncAttributeMaxDynamicSharedMemorySize, smem_cap);
+      } else {
+        hggcFuncSetAttribute(
+            flashqla_cute::fused_fwd_cp_cute_indexed_kernel<
+                Element, H, Hg, NGRP, DVH, AUX_P, SBF16>,
+            hggcFuncAttributeMaxDynamicSharedMemorySize, smem_cap);
+      }
     } else {
       hggcFuncSetAttribute(
           flashqla_cute::fused_fwd_cp_cute_runtime_kernel<
@@ -1546,9 +1596,10 @@ void launch_fused_fwd_cp_cute(
     void* o, const void* q, const void* k, const void* v,
     const void* a, const float* beta, const float* g,
     const void* h0, void* ht_out, void* raw_state,
-    bool state_bf16,
+    const void* raw_state_input, bool state_bf16,
     const int* raw_state_indices,
     const int* cu_seqlens, const int* cp_seq_map, const int* raw_cu_seqlens,
+    const int* num_warmup_chunks, const signed char* fallback_mask,
     int batch_size, int num_tokens, int raw_batch_size,
     int H, int Hg, float scale, int dtype_tag,
     int64_t v_token_stride,
@@ -1595,6 +1646,8 @@ void launch_fused_fwd_cp_cute(
   }
   const bool use_tc01_aux_p = use_tc01_d32 && raw_batch_size == 1 &&
       batch_size == 1 && H <= 12;
+  const bool use_tc01_vd_inplace = is_tc01 && raw_state != nullptr &&
+      !(H == 32 && Hg == 4 && raw_batch_size == 2 && num_tokens == 16384);
   const int ngrp = is_tc01 ? (use_tc01_ngrp2 ? 2 : 1)
                            : (use_one_group ? 1 : 2);
   const int dvh = use_tc01_d32 ? 32 : flashqla_cute::FF_DVH;
@@ -1671,6 +1724,7 @@ void launch_fused_fwd_cp_cute(
               reinterpret_cast<const SPool*>(h0),                                \
               reinterpret_cast<SPool*>(ht_out),                                  \
               cu_seqlens, cp_seq_map, raw_cu_seqlens,                            \
+              num_warmup_chunks, fallback_mask,                                  \
               batch_size, num_tokens, raw_batch_size, scale, v_token_stride);    \
     } while (0)
 
@@ -1681,6 +1735,30 @@ void launch_fused_fwd_cp_cute(
       } else {                                                                   \
         FF_LAUNCH_LEGACY_S(ElementType, HV, HGV, NG, DVH, AUX, BLOCK, false);    \
       }                                                                          \
+    } while (0)
+
+#define FF_LAUNCH_INDEXED_VD_INPLACE_S(ElementType, HV, HGV, NG, DVH, AUX, BLOCK, SBF16) \
+    do {                                                                         \
+      using SPool = flashqla::StatePool<(SBF16)>;                                \
+      configure_fused_kernel_smem_once<                                          \
+          flashqla_cute::FfStateMode::Indexed,                                   \
+          ElementType, (HV), (HGV), (NG), (DVH), (AUX), (SBF16), true>(          \
+              device_index, pad_cap);                                            \
+      flashqla_cute::fused_fwd_cp_cute_indexed_vd_inplace_kernel<                \
+          ElementType, (HV), (HGV), (NG), (DVH), (AUX), (SBF16)>                 \
+          <<<grid, (BLOCK), smem_bytes, stream>>>(                               \
+              reinterpret_cast<ElementType*>(o),                                 \
+              reinterpret_cast<const ElementType*>(q),                           \
+              reinterpret_cast<const ElementType*>(k),                           \
+              reinterpret_cast<const ElementType*>(v),                           \
+              reinterpret_cast<const ElementType*>(a), beta, g,                  \
+              reinterpret_cast<const SPool*>(h0),                                \
+              reinterpret_cast<SPool*>(ht_out),                                  \
+              reinterpret_cast<SPool*>(raw_state),                               \
+              reinterpret_cast<const SPool*>(raw_state_input), raw_state_indices,\
+              cu_seqlens, cp_seq_map, raw_cu_seqlens,                            \
+              num_warmup_chunks, fallback_mask,                                  \
+              batch_size, num_tokens, raw_batch_size, scale, v_token_stride);    \
     } while (0)
 
 #define FF_LAUNCH_INDEXED_S(ElementType, HV, HGV, NG, DVH, AUX, BLOCK, SBF16)    \
@@ -1700,17 +1778,31 @@ void launch_fused_fwd_cp_cute(
               reinterpret_cast<const ElementType*>(a), beta, g,                  \
               reinterpret_cast<const SPool*>(h0),                                \
               reinterpret_cast<SPool*>(ht_out),                                  \
-              reinterpret_cast<SPool*>(raw_state), raw_state_indices,            \
+              reinterpret_cast<SPool*>(raw_state),                               \
+              reinterpret_cast<const SPool*>(raw_state_input), raw_state_indices,\
               cu_seqlens, cp_seq_map, raw_cu_seqlens,                            \
+              num_warmup_chunks, fallback_mask,                                  \
               batch_size, num_tokens, raw_batch_size, scale, v_token_stride);    \
     } while (0)
 
 #define FF_LAUNCH_INDEXED(ElementType, HV, HGV, NG, DVH, AUX, BLOCK)             \
     do {                                                                         \
+      if constexpr ((HV) == 32 && (HGV) == 4) {                                  \
+        if (use_tc01_vd_inplace) {                                               \
+          if (state_bf16) {                                                      \
+            FF_LAUNCH_INDEXED_VD_INPLACE_S(                                      \
+                ElementType, HV, HGV, NG, DVH, AUX, BLOCK, true);                 \
+          } else {                                                               \
+            FF_LAUNCH_INDEXED_VD_INPLACE_S(                                      \
+                ElementType, HV, HGV, NG, DVH, AUX, BLOCK, false);                \
+          }                                                                      \
+          break;                                                                 \
+        }                                                                        \
+      }                                                                          \
       if (state_bf16) {                                                          \
-        FF_LAUNCH_INDEXED_S(ElementType, HV, HGV, NG, DVH, AUX, BLOCK, true);    \
+        FF_LAUNCH_INDEXED_S(ElementType, HV, HGV, NG, DVH, AUX, BLOCK, true);     \
       } else {                                                                   \
-        FF_LAUNCH_INDEXED_S(ElementType, HV, HGV, NG, DVH, AUX, BLOCK, false);   \
+        FF_LAUNCH_INDEXED_S(ElementType, HV, HGV, NG, DVH, AUX, BLOCK, false);    \
       }                                                                          \
     } while (0)
 
@@ -1731,8 +1823,10 @@ void launch_fused_fwd_cp_cute(
               reinterpret_cast<const ElementType*>(a), beta, g,                  \
               reinterpret_cast<const SPool*>(h0),                                \
               reinterpret_cast<SPool*>(ht_out),                                  \
-              reinterpret_cast<SPool*>(raw_state), raw_state_indices,            \
+              reinterpret_cast<SPool*>(raw_state),                               \
+              reinterpret_cast<const SPool*>(raw_state_input), raw_state_indices,\
               cu_seqlens, cp_seq_map, raw_cu_seqlens,                            \
+              num_warmup_chunks, fallback_mask,                                  \
               batch_size, num_tokens, raw_batch_size, scale, v_token_stride);    \
     } while (0)
 
@@ -1764,8 +1858,10 @@ void launch_fused_fwd_cp_cute(
               reinterpret_cast<const ElementType*>(a), beta, g,                  \
               reinterpret_cast<const SPool*>(h0),                                \
               reinterpret_cast<SPool*>(ht_out),                                  \
-              reinterpret_cast<SPool*>(raw_state), raw_state_indices,            \
+              reinterpret_cast<SPool*>(raw_state),                               \
+              reinterpret_cast<const SPool*>(raw_state_input), raw_state_indices,\
               cu_seqlens, cp_seq_map, raw_cu_seqlens,                            \
+              num_warmup_chunks, fallback_mask,                                  \
               batch_size, num_tokens, raw_batch_size, scale, v_token_stride);    \
     } while (0)
 
@@ -1804,6 +1900,7 @@ void launch_fused_fwd_cp_cute(
   FF_DISPATCH_AUX_P(ElementType, 12, 4) \
   FF_DISPATCH_AUX_P(ElementType,  8, 4) \
   FF_DISPATCH_AUX_P(ElementType,  8, 2) \
+  FF_DISPATCH_AUX_P(ElementType,  8, 1) \
   FF_DISPATCH_AUX_P(ElementType,  6, 2) \
   FF_DISPATCH_AUX_P(ElementType,  4, 2)
 
@@ -1863,6 +1960,7 @@ void launch_fused_fwd_cp_cute(
   FF_DISPATCH_E(ElementType,  12,  4) \
   FF_DISPATCH_E(ElementType,   8,  4) \
   FF_DISPATCH_E(ElementType,   8,  2) \
+  FF_DISPATCH_E(ElementType,   8,  1) \
   FF_DISPATCH_E(ElementType,   6,  2) \
   FF_DISPATCH_E(ElementType,   4,  2)
 
@@ -1879,6 +1977,7 @@ void launch_fused_fwd_cp_cute(
 #undef FF_LAUNCH_RUNTIME_S
 #undef FF_LAUNCH_INDEXED
 #undef FF_LAUNCH_INDEXED_S
+#undef FF_LAUNCH_INDEXED_VD_INPLACE_S
 #undef FF_LAUNCH_LEGACY
 #undef FF_LAUNCH_LEGACY_S
 

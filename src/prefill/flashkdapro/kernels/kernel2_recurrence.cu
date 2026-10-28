@@ -82,6 +82,9 @@ struct K2StateInAccessor<true> {
     __device__ __forceinline__ BF16 load(int64_t offset) const {
         return ptr[offset];
     }
+    __device__ __forceinline__ float load_fp32(int64_t offset) const {
+        return fk::bf16_to_f32(ptr[offset]);
+    }
 };
 
 template <>
@@ -98,6 +101,11 @@ struct K2StateInAccessor<false> {
             return BF16(reinterpret_cast<const float*>(ptr)[offset]);
         return reinterpret_cast<const BF16*>(ptr)[offset];
     }
+    __device__ __forceinline__ float load_fp32(int64_t offset) const {
+        if (is_fp32)
+            return reinterpret_cast<const float*>(ptr)[offset];
+        return fk::bf16_to_f32(reinterpret_cast<const BF16*>(ptr)[offset]);
+    }
 };
 
 template <bool CompactBf16>
@@ -112,6 +120,9 @@ struct K2StateOutAccessor<true> {
     }
     __device__ __forceinline__ void store(int64_t offset, BF16 value) const {
         ptr[offset] = value;
+    }
+    __device__ __forceinline__ void store_fp32(int64_t offset, float value) const {
+        ptr[offset] = BF16(value);
     }
 };
 
@@ -129,6 +140,12 @@ struct K2StateOutAccessor<false> {
             reinterpret_cast<float*>(ptr)[offset] = fk::bf16_to_f32(value);
         else
             reinterpret_cast<BF16*>(ptr)[offset] = value;
+    }
+    __device__ __forceinline__ void store_fp32(int64_t offset, float value) const {
+        if (is_fp32)
+            reinterpret_cast<float*>(ptr)[offset] = value;
+        else
+            reinterpret_cast<BF16*>(ptr)[offset] = BF16(value);
     }
 };
 
@@ -302,6 +319,11 @@ __global__ void __launch_bounds__(NTHREADS) flashkda_recurrence_kernel(
 
     const int seq = blockIdx.x, head = blockIdx.y, dv_blk = blockIdx.z, tid = threadIdx.x;
     const int dv0 = dv_blk * DVT;
+#if defined(FLASHKDA_ARCH_150)
+    static_assert((DK * DVT) % NTHREADS == 0, "State ownership must be uniform");
+    constexpr int MASTER_VALUES = DK * DVT / NTHREADS;
+    float rmaster[MASTER_VALUES];
+#endif
 
     int64_t bos, eos; int tile_base;
     if constexpr (IsVarlen) {
@@ -325,13 +347,35 @@ __global__ void __launch_bounds__(NTHREADS) flashkda_recurrence_kernel(
     if constexpr (HasStateIn) {
         const int state_slot = init_state.slot(seq);
         const int64_t state_off = (int64_t(state_slot) * H + head) * DV * DK;
+#if defined(FLASHKDA_ARCH_150)
+        CUTE_UNROLL
+        for (int ordinal = 0; ordinal < MASTER_VALUES; ++ordinal) {
+            const int idx = tid + ordinal * NTHREADS;
+            int i = idx / DVT, c = idx % DVT;
+            const float value = init_state.load_fp32(
+                state_off + int64_t(dv0 + c) * DK + i);
+            rmaster[ordinal] = value;
+            sSt[idx] = BF16(value);
+        }
+#else
         for (int idx = tid; idx < DK * DVT; idx += NTHREADS) {
             int i = idx / DVT, c = idx % DVT;
             sSt[idx] = init_state.load(
                 state_off + int64_t(dv0 + c) * DK + i);
         }
+#endif
     } else {
-        for (int idx = tid; idx < DK * DVT; idx += NTHREADS) sSt[idx] = BF16(0);
+#if defined(FLASHKDA_ARCH_150)
+        CUTE_UNROLL
+        for (int ordinal = 0; ordinal < MASTER_VALUES; ++ordinal) {
+            sSt[tid + ordinal * NTHREADS] = BF16(0);
+            rmaster[ordinal] = 0.f;
+        }
+#else
+        for (int idx = tid; idx < DK * DVT; idx += NTHREADS) {
+            sSt[idx] = BF16(0);
+        }
+#endif
     }
     __syncthreads();
 
@@ -394,6 +438,16 @@ __global__ void __launch_bounds__(NTHREADS) flashkda_recurrence_kernel(
 
         // St[dk,dv_local] = St * ex2(g_total)[dk] + delta_s
         // (ws_gt already holds ex2(g_total) from Kernel1 -> use directly)
+#if defined(FLASHKDA_ARCH_150)
+        CUTE_UNROLL
+        for (int ordinal = 0; ordinal < MASTER_VALUES; ++ordinal) {
+            const int idx = tid + ordinal * NTHREADS;
+            float g = sGt[idx / DVT];
+            const float updated = rmaster[ordinal] * g + sDelta[idx];
+            rmaster[ordinal] = updated;
+            sSt[idx] = BF16(updated);
+        }
+#else
         constexpr int ROWS_PER_STEP = NTHREADS / DVT;
         int row = tid / DVT;
         int col = tid - row * DVT;
@@ -402,6 +456,7 @@ __global__ void __launch_bounds__(NTHREADS) flashkda_recurrence_kernel(
             float g = sGt[i];
             sSt[idx] = BF16(fk::bf16_to_f32(sSt[idx]) * g + sDelta[idx]);
         }
+#endif
         // Chunk fence: all reads of chunk t's double-buffered stage buffers are
         // now complete (last reader is sGt[stage] in the St-update loop above).
         // Required before recycling this slot for chunk t+2 (NBUF=2 => (t+2)&1 == t&1).
@@ -425,11 +480,21 @@ __global__ void __launch_bounds__(NTHREADS) flashkda_recurrence_kernel(
     if constexpr (HasStateOut) {
         const int state_slot = final_state.slot(seq);
         const int64_t state_off = (int64_t(state_slot) * H + head) * DV * DK;
+#if defined(FLASHKDA_ARCH_150)
+        CUTE_UNROLL
+        for (int ordinal = 0; ordinal < MASTER_VALUES; ++ordinal) {
+            const int idx = tid + ordinal * NTHREADS;
+            int i = idx / DVT, c = idx % DVT;
+            final_state.store_fp32(
+                state_off + int64_t(dv0 + c) * DK + i, rmaster[ordinal]);
+        }
+#else
         for (int idx = tid; idx < DK * DVT; idx += NTHREADS) {
             int i = idx / DVT, c = idx % DVT;
             final_state.store(
                 state_off + int64_t(dv0 + c) * DK + i, sSt[idx]);
         }
+#endif
     }
 }
 
@@ -481,7 +546,12 @@ void launch_flashkda_recurrence(
                       || (int64_t(N) * int64_t(H) >= 40)         // (b)
                       || (is_varlen && H <= 24)                  // (c)
                       || (!is_varlen && N == 1 && T_total < 256  // (d)
-                          && (H == 12 || H == 24));
+                          && (H == 12 || H == 24))
+                      || (!is_tc01 && is_varlen && N == 1 && H == 32
+                          && T_total < 256);
+        // The tc02 H32 short-varlen path uses the matching BV32 nows gate.
+        // Its FP32 shared-state CTA crosses the 4-to-3 residency threshold;
+        // value splitting keeps FP32 master state in the existing nows kernel.
         if (is_tc01) {
             // The broad low-head varlen promotion was calibrated on tc02.  On
             // tc01, OperatorsForge's explicit [0,T] ABI made H12/B1/T<256 enter

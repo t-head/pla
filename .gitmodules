@@ -1,0 +1,4 @@
+[submodule "3rdparty/actlize"]
+	path = 3rdparty/actlize
+	url = https://github.com/t-head/actlize.git
+	branch = v1.0.0

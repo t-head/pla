@@ -140,6 +140,24 @@ static at::ScalarType check_state_dtype(
     return dtype;
 }
 
+// Returns the caller's out buffer when one is given, otherwise allocates a fresh one.
+// The kernel writes o as a dense [B, T, HV, V] block (decode and MTP verify alike),
+// so a caller buffer must be contiguous and match v's shape, dtype and device.
+static torch::Tensor resolve_k_last_out(
+    const std::optional<torch::Tensor>& out, const torch::Tensor& v
+) {
+    if (!out.has_value()) return torch::empty(v.sizes(), v.options());
+    const torch::Tensor& o = out.value();
+    TORCH_CHECK(o.device() == v.device(),
+                "out must be on the same device as v, got ", o.device(), " vs ", v.device());
+    TORCH_CHECK(o.scalar_type() == v.scalar_type(),
+                "out dtype must match v (", v.scalar_type(), "), got ", o.scalar_type());
+    TORCH_CHECK(o.sizes() == v.sizes(),
+                "out shape must match v ", v.sizes(), ", got ", o.sizes());
+    TORCH_CHECK(o.is_contiguous(), "out must be contiguous");
+    return o;
+}
+
 static void launch_k_last_impl(
     k_last_launcher_t launcher, int shared_mem_size, dim3 grid, hggcStream_t stream,
     torch::Tensor& A_log, torch::Tensor& a, torch::Tensor& dt_bias,
@@ -234,7 +252,8 @@ torch::Tensor fused_sigmoid_gating_delta_rule_forward_k_last(
     std::optional<CacheStepsOrNumAccept> cache_steps_or_num_accept,
     std::optional<torch::Tensor> retrieve_parent_token,
     std::optional<float> lower_bound,
-    std::optional<bool> is_sglang
+    std::optional<bool> is_sglang,
+    std::optional<torch::Tensor> out
 ) {
     if (pla::bypass::enabled()) {
         const auto* accepted = cache_steps_or_num_accept
@@ -256,7 +275,8 @@ torch::Tensor fused_sigmoid_gating_delta_rule_forward_k_last(
             {"cu", cu_seqlens ? &*cu_seqlens : nullptr}, {"accepted", accepted},
             {"cache", intermediate_states_buffer ? &*intermediate_states_buffer : nullptr},
             {"cache_indices", intermediate_state_indices ? &*intermediate_state_indices : nullptr},
-            {"parent", retrieve_parent_token ? &*retrieve_parent_token : nullptr}}, flags.str());
+            {"parent", retrieve_parent_token ? &*retrieve_parent_token : nullptr},
+            {"out", out ? &*out : nullptr}}, flags.str());
         if (k.dim() == 4 && v.dim() == 4) {
             const int B = cu_seqlens && cu_seqlens->dim() == 1 ? cu_seqlens->numel() - 1 : k.size(0);
             const int T = cu_seqlens && initial_state_indices && initial_state_indices->dim() == 2
@@ -264,7 +284,7 @@ torch::Tensor fused_sigmoid_gating_delta_rule_forward_k_last(
             if (pla::instrument::show_params()) pla::instrument::dump_case(B, T, k.size(3), v.size(3), k.size(2), v.size(2),
                 get_dtype_string(q), is_kda, cu_seqlens ? &*cu_seqlens : nullptr, lower_bound.value_or(-5.0f));
         }
-        return pla::bypass::output(v.sizes(), v.options());
+        return out.has_value() ? *out : pla::bypass::output(v.sizes(), v.options());
     }
     sanity_k_last_inputs(A_log, a, dt_bias, softplus_beta, softplus_threshold,
         q, k, v, b, initial_state_source, initial_state_indices, scale, cu_seqlens,
@@ -322,7 +342,7 @@ torch::Tensor fused_sigmoid_gating_delta_rule_forward_k_last(
     }
 
     float scale_val = scale.has_value() ? static_cast<float>(scale.value()) : (1.0f / sqrtf((float)K));
-    auto o = torch::empty({v.size(0), v.size(1), v.size(2), v.size(3)}, v.options());
+    auto o = resolve_k_last_out(out, v);
 
     // KDA accepts both [tokens, HV, K] and the flattened [tokens, HV*K].
     int stride_a = a.dim() == 4 ? a.stride(1)
@@ -431,7 +451,8 @@ torch::Tensor fused_sigmoid_gating_delta_rule_forward_k_last_tunable(
     std::optional<torch::Tensor> retrieve_parent_token,
     int bv, int wn, int sn, int hv_per_cta,
     std::optional<bool> is_sglang,
-    std::optional<float> lower_bound
+    std::optional<float> lower_bound,
+    std::optional<torch::Tensor> out
 ) {
     if (pla::bypass::enabled()) {
         const auto* accepted = cache_steps_or_num_accept
@@ -453,7 +474,8 @@ torch::Tensor fused_sigmoid_gating_delta_rule_forward_k_last_tunable(
             {"cu", cu_seqlens ? &*cu_seqlens : nullptr}, {"accepted", accepted},
             {"cache", intermediate_states_buffer ? &*intermediate_states_buffer : nullptr},
             {"cache_indices", intermediate_state_indices ? &*intermediate_state_indices : nullptr},
-            {"parent", retrieve_parent_token ? &*retrieve_parent_token : nullptr}}, flags.str());
+            {"parent", retrieve_parent_token ? &*retrieve_parent_token : nullptr},
+            {"out", out ? &*out : nullptr}}, flags.str());
         if (k.dim() == 4 && v.dim() == 4) {
             const int B = cu_seqlens && cu_seqlens->dim() == 1 ? cu_seqlens->numel() - 1 : k.size(0);
             const int T = cu_seqlens && initial_state_indices && initial_state_indices->dim() == 2
@@ -461,7 +483,7 @@ torch::Tensor fused_sigmoid_gating_delta_rule_forward_k_last_tunable(
             if (pla::instrument::show_params()) pla::instrument::dump_case(B, T, k.size(3), v.size(3), k.size(2), v.size(2),
                 get_dtype_string(q), is_kda, cu_seqlens ? &*cu_seqlens : nullptr, -5.0f);
         }
-        return pla::bypass::output(v.sizes(), v.options());
+        return out.has_value() ? *out : pla::bypass::output(v.sizes(), v.options());
     }
     sanity_k_last_inputs(A_log, a, dt_bias, softplus_beta, softplus_threshold,
         q, k, v, b, initial_state_source, initial_state_indices, scale, cu_seqlens,
@@ -505,7 +527,7 @@ torch::Tensor fused_sigmoid_gating_delta_rule_forward_k_last_tunable(
                 "head_dim K == V == 128, got K=", K, ", V=", V);
 
     float scale_val = scale.has_value() ? static_cast<float>(scale.value()) : (1.0f / sqrtf((float)K));
-    auto o = torch::empty({v.size(0), v.size(1), v.size(2), v.size(3)}, v.options());
+    auto o = resolve_k_last_out(out, v);
 
     // KDA accepts both [tokens, HV, K] and the flattened [tokens, HV*K].
     int stride_a = a.dim() == 4 ? a.stride(1)

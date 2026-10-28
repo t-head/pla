@@ -41,13 +41,17 @@ is used only when a long sequence is split across CUs; for standard inference
 the fused_fwd kernel is fed an identity CP mapping so every cp segment is its
 own raw batch.
 """
+import math
 from typing import Optional, Set, Tuple
 
 import torch
 
 from . import _C as flashqla_cute
 from .. import _sanity
-from .private.cp_preprocess import calc_cp_seqs
+from .private.cp_preprocess import (
+    calc_cp_seqs,
+    tc01_overlap_warmup_threshold,
+)
 
 CHUNK_SIZE = 32          # Unified chunk size (cumsum, get_warmup, CP splitting, fused_fwd, etc.)
 FF_CHUNK_SIZE = 32       # Same as CHUNK_SIZE (kept for backward compat references)
@@ -57,6 +61,7 @@ DV = 128
 # itself is fp32 either way.
 _STATE_DTYPES = (torch.float32, torch.bfloat16)
 _chunk_indices_cache = []
+_input_validation_signature = None
 SUPPORTED_HEAD_CONFIGS = frozenset({
     (128, 16),
     (64, 16),
@@ -72,6 +77,7 @@ SUPPORTED_HEAD_CONFIGS = frozenset({
     (12, 4),
     (8, 4),
     (8, 2),
+    (8, 1),
     (6, 2),
     (4, 2),
 })
@@ -227,6 +233,8 @@ def chunk_gated_delta_rule_fwd(
     cu_seqlens: Optional[torch.Tensor] = None,      # [batch+1] int32
     output_final_state: bool = True,
     auto_cp: bool = True,
+    overlap_warmup_threshold: Optional[float] = None,
+    force_tc01_cp_candidate: bool = False,
     normalize_qk: bool = False,
     raw_cu_seqlens: Optional[Tuple[int, ...]] = None,
     raw_gate_a: Optional[torch.Tensor] = None,   # [T,H] b16
@@ -250,106 +258,138 @@ def chunk_gated_delta_rule_fwd(
     ``final_state``: ``final_state_dtype`` selects it and must agree with
     ``initial_state`` when one is supplied, defaulting to that dtype, or to fp32
     when there is no incoming state.
+
+    CP preserves full prefix history, including states created by early tokens
+    when initial_state is None. No log-decay threshold truncates that history.
+    ``overlap_warmup_threshold`` enables the overlap-replay candidate for CP
+    plans. Indexed state is snapshotted before replay so continuation CTAs never
+    race the final-state writer. Legacy nonzero state keeps the established
+    prepare/correct path. ``force_tc01_cp_candidate`` is an offline sweep hook
+    that bypasses production admission while preserving planner feasibility.
     """
-    if not q.is_cuda:
-        raise ValueError("q must be a CUDA tensor")
+    global _input_validation_signature
     raw_gate_args = (raw_gate_a, raw_beta_b, A_log, dt_bias)
     use_raw_gating = any(tensor is not None for tensor in raw_gate_args)
-    if use_raw_gating and not all(tensor is not None for tensor in raw_gate_args):
-        raise ValueError(
-            "raw_gate_a, raw_beta_b, A_log, and dt_bias must be supplied together")
-    if use_raw_gating and not normalize_qk:
-        raise ValueError("raw GDN gating requires normalize_qk=True")
-    if not use_raw_gating and (g is None or beta is None):
-        raise ValueError("g and beta are required unless raw GDN gating is used")
-
-    named_inputs = [("k", k), ("v", v)]
-    if use_raw_gating:
-        named_inputs.extend((
-            ("raw_gate_a", raw_gate_a), ("raw_beta_b", raw_beta_b),
-            ("A_log", A_log), ("dt_bias", dt_bias),
-        ))
-    else:
-        named_inputs.extend((("g", g), ("beta", beta)))
-    for name, tensor in named_inputs:
-        if tensor.device != q.device:
-            raise ValueError(f"{name} must be on {q.device}, got {tensor.device}")
-    if initial_state is not None and initial_state.device != q.device:
-        raise ValueError(
-            f"initial_state must be on {q.device}, got {initial_state.device}")
-    if initial_state_indices is not None and initial_state is None:
-        raise ValueError("initial_state is required with initial_state_indices")
-
-    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
-        raise ValueError("q, k, and v must be rank-4 tensors")
-    if use_raw_gating:
-        if raw_gate_a.ndim != 2 or raw_beta_b.ndim != 2:
-            raise ValueError("raw_gate_a and raw_beta_b must be rank-2 tensors")
-        if A_log.ndim != 1 or dt_bias.ndim != 1:
-            raise ValueError("A_log and dt_bias must be rank-1 tensors")
-    elif g.ndim != 3 or beta.ndim != 3:
-        raise ValueError("g and beta must be rank-3 tensors")
-    for name, tensor in (("q", q), *named_inputs):
-        if use_raw_gating and name in ("raw_gate_a", "raw_beta_b"):
-            if tensor.stride(1) != 1 or tensor.stride(0) < tensor.size(1):
-                raise ValueError(
-                    f"{name} must be head-contiguous with a positive token stride")
-        elif use_raw_gating and name in ("q", "k", "v"):
-            if (tensor.ndim != 4 or tensor.stride(3) != 1 or
-                    tensor.stride(2) != tensor.size(3) or
-                    tensor.stride(1) < tensor.size(2) * tensor.size(3)):
-                raise ValueError(
-                    f"{name} must be head-contiguous with a positive token stride")
-        elif not tensor.is_contiguous():
-            raise ValueError(f"{name} must be contiguous")
-    if q.dtype not in (torch.float16, torch.bfloat16):
-        raise ValueError("q, k, and v must be fp16 or bf16")
-    if k.dtype != q.dtype or v.dtype != q.dtype:
-        raise ValueError("q, k, and v must have the same dtype")
-    if use_raw_gating:
-        if raw_gate_a.dtype != q.dtype or raw_beta_b.dtype != q.dtype:
-            raise ValueError("raw_gate_a and raw_beta_b must match q dtype")
-        if A_log.dtype != torch.float32 or dt_bias.dtype != torch.float32:
-            raise ValueError("A_log and dt_bias must be fp32")
-    elif g.dtype != torch.float32 or beta.dtype != torch.float32:
-        raise ValueError("g and beta must be fp32")
-
     num_tokens = q.size(1)
     H = v.size(2)
     Hg = k.size(2)
-    if q.size(0) != 1 or k.size(0) != 1 or v.size(0) != 1:
-        raise ValueError("q, k, and v must have batch dimension 1")
-    if k.size(1) != num_tokens or v.size(1) != num_tokens:
-        raise ValueError("q, k, and v must have the same token length")
-    if q.size(2) != Hg:
-        raise ValueError(
-            f"q and k must have the same number of heads, got {q.size(2)} and {Hg}")
-    if use_raw_gating:
-        if (raw_gate_a.shape != (num_tokens, H) or
-                raw_beta_b.shape != (num_tokens, H)):
-            raise ValueError(
-                f"raw_gate_a and raw_beta_b must be [{num_tokens},{H}]")
-        if A_log.numel() != H or dt_bias.numel() != H:
-            raise ValueError(f"A_log and dt_bias must have H={H} elements")
-    else:
-        if (g.size(0) != 1 or beta.size(0) != 1 or
-                g.size(1) != num_tokens or beta.size(1) != num_tokens):
-            raise ValueError(
-                "g and beta must be [1,T,H] with the same token length as q")
-        if g.size(2) != H or beta.size(2) != H:
-            raise ValueError(f"g and beta must have H={H} value heads")
-    if (H, Hg) not in SUPPORTED_HEAD_CONFIGS:
-        raise ValueError(
-            f"FlashQLA does not support head configuration (H={H}, Hg={Hg})")
-    if q.size(-1) != DK or k.size(-1) != DK or v.size(-1) != DV:
-        raise ValueError(
-            "FlashQLA requires q/k head_dim=128 and v head_dim=128, got "
-            f"q={q.size(-1)}, k={k.size(-1)}, v={v.size(-1)}")
-
-    if num_tokens == 0:
-        raise ValueError("FlashQLA does not support an empty token dimension")
     if scale is None:
         scale = q.size(-1) ** -0.5
+    validation_tensors = (
+        q, k, v, g, beta, raw_gate_a, raw_beta_b, A_log, dt_bias,
+        initial_state, initial_state_indices,
+    )
+    validation_signature = (
+        tuple(
+            None if tensor is None else (
+                tensor.device.type, tensor.device.index, tensor.dtype,
+                tuple(tensor.shape), tuple(tensor.stride()),
+            )
+            for tensor in validation_tensors
+        ),
+        normalize_qk, auto_cp, overlap_warmup_threshold,
+        force_tc01_cp_candidate,
+    )
+    if validation_signature != _input_validation_signature:
+        if not q.is_cuda:
+            raise ValueError("q must be a CUDA tensor")
+        if (overlap_warmup_threshold is not None and
+                (not math.isfinite(overlap_warmup_threshold) or
+                 overlap_warmup_threshold >= 0.0)):
+            raise ValueError("overlap_warmup_threshold must be finite and negative")
+        if force_tc01_cp_candidate and not auto_cp:
+            raise ValueError("force_tc01_cp_candidate requires auto_cp=True")
+        if use_raw_gating and not all(tensor is not None for tensor in raw_gate_args):
+            raise ValueError(
+                "raw_gate_a, raw_beta_b, A_log, and dt_bias must be supplied together")
+        if use_raw_gating and not normalize_qk:
+            raise ValueError("raw GDN gating requires normalize_qk=True")
+        if not use_raw_gating and (g is None or beta is None):
+            raise ValueError("g and beta are required unless raw GDN gating is used")
+
+        named_inputs = [("k", k), ("v", v)]
+        if use_raw_gating:
+            named_inputs.extend((
+                ("raw_gate_a", raw_gate_a), ("raw_beta_b", raw_beta_b),
+                ("A_log", A_log), ("dt_bias", dt_bias),
+            ))
+        else:
+            named_inputs.extend((("g", g), ("beta", beta)))
+        for name, tensor in named_inputs:
+            if tensor.device != q.device:
+                raise ValueError(f"{name} must be on {q.device}, got {tensor.device}")
+        if initial_state is not None and initial_state.device != q.device:
+            raise ValueError(
+                f"initial_state must be on {q.device}, got {initial_state.device}")
+        if initial_state_indices is not None and initial_state is None:
+            raise ValueError("initial_state is required with initial_state_indices")
+
+        if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+            raise ValueError("q, k, and v must be rank-4 tensors")
+        if use_raw_gating:
+            if raw_gate_a.ndim != 2 or raw_beta_b.ndim != 2:
+                raise ValueError("raw_gate_a and raw_beta_b must be rank-2 tensors")
+            if A_log.ndim != 1 or dt_bias.ndim != 1:
+                raise ValueError("A_log and dt_bias must be rank-1 tensors")
+        elif g.ndim != 3 or beta.ndim != 3:
+            raise ValueError("g and beta must be rank-3 tensors")
+        for name, tensor in (("q", q), *named_inputs):
+            if use_raw_gating and name in ("raw_gate_a", "raw_beta_b"):
+                if tensor.stride(1) != 1 or tensor.stride(0) < tensor.size(1):
+                    raise ValueError(
+                        f"{name} must be head-contiguous with a positive token stride")
+            elif use_raw_gating and name in ("q", "k", "v"):
+                if (tensor.ndim != 4 or tensor.stride(3) != 1 or
+                        tensor.stride(2) != tensor.size(3) or
+                        tensor.stride(1) < tensor.size(2) * tensor.size(3)):
+                    raise ValueError(
+                        f"{name} must be head-contiguous with a positive token stride")
+            elif not tensor.is_contiguous():
+                raise ValueError(f"{name} must be contiguous")
+        if q.dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError("q, k, and v must be fp16 or bf16")
+        if k.dtype != q.dtype or v.dtype != q.dtype:
+            raise ValueError("q, k, and v must have the same dtype")
+        if use_raw_gating:
+            if raw_gate_a.dtype != q.dtype or raw_beta_b.dtype != q.dtype:
+                raise ValueError("raw_gate_a and raw_beta_b must match q dtype")
+            if A_log.dtype != torch.float32 or dt_bias.dtype != torch.float32:
+                raise ValueError("A_log and dt_bias must be fp32")
+        elif g.dtype != torch.float32 or beta.dtype != torch.float32:
+            raise ValueError("g and beta must be fp32")
+
+        if q.size(0) != 1 or k.size(0) != 1 or v.size(0) != 1:
+            raise ValueError("q, k, and v must have batch dimension 1")
+        if k.size(1) != num_tokens or v.size(1) != num_tokens:
+            raise ValueError("q, k, and v must have the same token length")
+        if q.size(2) != Hg:
+            raise ValueError(
+                f"q and k must have the same number of heads, got {q.size(2)} and {Hg}")
+        if use_raw_gating:
+            if (raw_gate_a.shape != (num_tokens, H) or
+                    raw_beta_b.shape != (num_tokens, H)):
+                raise ValueError(
+                    f"raw_gate_a and raw_beta_b must be [{num_tokens},{H}]")
+            if A_log.numel() != H or dt_bias.numel() != H:
+                raise ValueError(f"A_log and dt_bias must have H={H} elements")
+        else:
+            if (g.size(0) != 1 or beta.size(0) != 1 or
+                    g.size(1) != num_tokens or beta.size(1) != num_tokens):
+                raise ValueError(
+                    "g and beta must be [1,T,H] with the same token length as q")
+            if g.size(2) != H or beta.size(2) != H:
+                raise ValueError(f"g and beta must have H={H} value heads")
+        if (H, Hg) not in SUPPORTED_HEAD_CONFIGS:
+            raise ValueError(
+                f"FlashQLA does not support head configuration (H={H}, Hg={Hg})")
+        if q.size(-1) != DK or k.size(-1) != DK or v.size(-1) != DV:
+            raise ValueError(
+                "FlashQLA requires q/k head_dim=128 and v head_dim=128, got "
+                f"q={q.size(-1)}, k={k.size(-1)}, v={v.size(-1)}")
+
+        if num_tokens == 0:
+            raise ValueError("FlashQLA does not support an empty token dimension")
+        _input_validation_signature = validation_signature
 
     raw_cu = _sanity.offsets(
         cu_seqlens, num_tokens, raw_cu_seqlens, reference=q)
@@ -431,40 +471,80 @@ def chunk_gated_delta_rule_fwd(
         k, beta, cu32, H,
         chunk_indices if batch > 1 or valid_num_tokens < num_tokens else None)
 
+    production_overlap_threshold = None
+    if (auto_cp and overlap_warmup_threshold is None and
+            not force_tc01_cp_candidate):
+        production_overlap_threshold = tc01_overlap_warmup_threshold(
+            cu32, raw_cu, CHUNK_SIZE, H, Hg,
+            use_raw_gating=use_raw_gating,
+            indexed_state=indexed_state,
+            has_initial_state=initial_state is not None,
+        )
+
     cp_plan = (
         calc_cp_seqs(
-            cu32, CHUNK_SIZE, H, raw_cu, num_k_heads=Hg
+            cu32, CHUNK_SIZE, H, raw_cu, num_k_heads=Hg,
+            tc01_force_candidate=force_tc01_cp_candidate,
+            tc01_enable_overlap_candidate=(
+                production_overlap_threshold is not None),
+            tc01_packed_raw_gate=use_raw_gating,
         ) if auto_cp else None
     )
 
-    # Step 3: CP decision + preprocessing (get_warmup -> prepare_h -> correct_h0).
-    # Mirrors csrc_sm90/flashqla_cuda_ops.py::intra_card_cp_preprocess. Splits
-    # eligible sequences into cp_batch segments so fused_fwd's grid better fills
-    # the 39 CUs. prepare_h computes both the additive state and the homogeneous
-    # transition used by correct_h0 when gate decay cannot discard the incoming
-    # state.
+    # Step 3: CP decision + state reconstruction. The established path computes
+    # every segment state before fused_fwd. The overlap candidate instead gives
+    # each continuation CTA enough predecessor chunks to reconstruct its state.
     cp_h0 = None
+    raw_state_input = None
+    num_warmup_flat = fallback_mask_flat = None
     cp_cu_i32 = cp_seq_map_i32 = raw_cu_i32 = None
     if cp_plan is not None:
         use_cp, cp_cu_seqlens, seq_map_r2c, seq_map_c2r, ht_mask = cp_plan
         if use_cp:
             cp_cu_i32 = cp_cu_seqlens.to(torch.int32)
             cp_batch = cp_cu_i32.numel() - 1
-            num_warmup, fallback_mask = flashqla_cute.get_warmup_chunks(
-                g_cum_32, ht_mask, cp_cu_i32)
-            ht_buf, mt_buf = flashqla_cute.prepare_h(
-                k, v, A, g_cum_32, beta, cp_cu_i32,
-                num_warmup.reshape(-1).contiguous(), H, Hg)
-            ht_buf = ht_buf.view(cp_batch, H, DK, DV)
-            mt_buf = mt_buf.view(cp_batch, H, DK, DK)
-            fb_2d = fallback_mask.view(cp_batch, H).contiguous()
-            # cp_h0 goes straight back into fused_fwd as its h0, so it is
-            # produced in the state pool's own dtype.
-            cp_h0 = flashqla_cute.correct_h0(
-                ht_buf, mt_buf, fb_2d, seq_map_r2c.to(torch.int32),
-                batch, initial_state,
-                initial_state_indices if indexed_state else None,
-                indexed_state, state_dtype == torch.bfloat16)
+            effective_overlap_threshold = (
+                overlap_warmup_threshold
+                if overlap_warmup_threshold is not None
+                else production_overlap_threshold
+            )
+            # A fresh sequence starts at zero, but earlier tokens can create
+            # the entire state consumed by a continuation segment. Log decay
+            # alone bounds neither that state's magnitude nor relative error.
+            # Preserve all prefix updates and incoming-state transitions in
+            # both overlap replay and prepare/correct, even without raw h0.
+            segment_chunks = torch.div(
+                cp_cu_i32[1:] - cp_cu_i32[:-1] + CHUNK_SIZE - 1,
+                CHUNK_SIZE, rounding_mode="floor")
+            num_warmup = segment_chunks[:, None].expand(-1, H).contiguous()
+            fallback_mask = torch.ones(
+                (cp_batch, H), dtype=torch.int8, device=q.device)
+            use_overlap_warmup = (
+                effective_overlap_threshold is not None and
+                (indexed_state or initial_state is None)
+            )
+            if use_overlap_warmup:
+                num_warmup_flat = num_warmup.reshape(-1).contiguous()
+                fallback_mask_flat = fallback_mask.reshape(-1).contiguous()
+                if indexed_state:
+                    # The compact read-only snapshot prevents first/final CP
+                    # CTAs from racing through the in-place serving state pool.
+                    raw_state_input = torch.index_select(
+                        initial_state, 0, initial_state_indices)
+            else:
+                ht_buf, mt_buf = flashqla_cute.prepare_h(
+                    k, v, A, g_cum_32, beta, cp_cu_i32,
+                    num_warmup.reshape(-1).contiguous(), H, Hg)
+                ht_buf = ht_buf.view(cp_batch, H, DK, DV)
+                mt_buf = mt_buf.view(cp_batch, H, DK, DK)
+                fb_2d = fallback_mask.view(cp_batch, H).contiguous()
+                # cp_h0 goes straight back into fused_fwd as its h0, so it is
+                # produced in the state pool's own dtype.
+                cp_h0 = flashqla_cute.correct_h0(
+                    ht_buf, mt_buf, fb_2d, seq_map_r2c.to(torch.int32),
+                    batch, initial_state,
+                    initial_state_indices if indexed_state else None,
+                    indexed_state, state_dtype == torch.bfloat16)
             cp_seq_map_i32 = seq_map_c2r.to(torch.int32)
             raw_cu_i32 = cu32
 
@@ -475,7 +555,8 @@ def chunk_gated_delta_rule_fwd(
             valid_num_tokens, H, Hg, float(scale), cp_h0,
             initial_state if indexed_state else None,
             initial_state_indices if indexed_state else None,
-            output_final_state, state_dtype == torch.bfloat16)
+            output_final_state, state_dtype == torch.bfloat16,
+            raw_state_input, num_warmup_flat, fallback_mask_flat)
     else:
         h0 = (initial_state if initial_state is not None and not indexed_state
               else torch.empty(0, device=q.device))
@@ -484,7 +565,8 @@ def chunk_gated_delta_rule_fwd(
             valid_num_tokens, H, Hg, float(scale), h0,
             initial_state if indexed_state else None,
             initial_state_indices if indexed_state else None,
-            output_final_state, state_dtype == torch.bfloat16)
+            output_final_state, state_dtype == torch.bfloat16,
+            None, None, None)
 
     if output_final_state:
         ht = initial_state[initial_state_indices] if indexed_state else ht
@@ -508,6 +590,8 @@ def gdn_prefill_packed_qkv_fwd(
     initial_state_indices: Optional[torch.Tensor] = None,
     output_final_state: bool = True,
     auto_cp: bool = True,
+    overlap_warmup_threshold: Optional[float] = None,
+    force_tc01_cp_candidate: bool = False,
     raw_cu_seqlens: Optional[Tuple[int, ...]] = None,
     final_state_dtype: Optional[torch.dtype] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, None, Optional[torch.Tensor]]:
@@ -569,6 +653,8 @@ def gdn_prefill_packed_qkv_fwd(
         cu_seqlens=cu_seqlens,
         output_final_state=output_final_state,
         auto_cp=auto_cp,
+        overlap_warmup_threshold=overlap_warmup_threshold,
+        force_tc01_cp_candidate=force_tc01_cp_candidate,
         normalize_qk=True,
         raw_cu_seqlens=raw_cu_seqlens,
         raw_gate_a=raw_gate_a,

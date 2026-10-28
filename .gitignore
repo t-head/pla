@@ -1,0 +1,31 @@
+# Build artifacts
+build/
+dist/
+*.egg-info/
+*.so
+*.o
+*.pyc
+__pycache__/
+
+# Test / benchmark output
+fail.log
+logs/
+reports/gpu*/
+# Raw per-case JSON from caselist sweeps: ~1MB per caselist, mostly the
+# seq_lens lists. reports/perf_prefill_caselist.csv is the committed digest.
+reports/caselist/
+
+# Keep branch-local documentation out of new commits.
+/docs/
+
+# Editor / OS junk. A live vim swap file for .gitmodules once got picked up by
+# `git add -A` and committed, so these are ignored explicitly.
+*.swp
+*.swo
+*.swn
+*~
+*.orig
+*.rej
+.DS_Store
+.vscode/
+.idea/

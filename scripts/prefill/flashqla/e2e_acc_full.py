@@ -32,7 +32,7 @@
 all supported dispatch shapes, exercising both non-CP and CP paths.
 
 Tests:
-  1. All 16 (H,Hg) dispatch combos at T=2048 (automatic planner)
+  1. All 17 (H,Hg) dispatch combos at T=2048 (automatic planner)
   2. GVA deployment shapes at T={2048,4096,8192,16384,32768} (exercises CP)
   3. CP-path validation with fast-decay gates (ensures fallback_mask=0)
   4. h0 (initial state) path
@@ -640,14 +640,14 @@ if __name__ == "__main__":
     results = []
     generalized_result = None
 
-    # === Section 1: All 16 dispatch shapes, T=2048, automatic planner ===
+    # === Section 1: All 17 dispatch shapes, T=2048, automatic planner ===
     print("=" * 80)
-    print("SECTION 1: All 16 dispatch combos (T=2048, pipeline E2E)")
+    print("SECTION 1: All 17 dispatch combos (T=2048, pipeline E2E)")
     print("=" * 80)
     DISPATCH_COMBOS = [
         (128, 16), (64, 16), (64, 8), (48, 16), (32, 16),
         (32, 8), (32, 4), (24, 8), (16, 8), (16, 4),
-        (16, 2), (12, 4), (8, 4), (8, 2), (6, 2), (4, 2),
+        (16, 2), (12, 4), (8, 4), (8, 2), (8, 1), (6, 2), (4, 2),
     ]
     for (H, Hg) in DISPATCH_COMBOS:
         ok = run_e2e(2048, H, Hg)
