@@ -84,6 +84,53 @@ DEFAULT_TOL = 2e-2
 MAX_SGLANG_FUSED_QKV_SPLIT_DIM = 8192
 GDN_GATE_DECAY_DIVISOR = 16
 GDN_SWA_RATIO = 0.75
+_GDN_REAL_GATE: dict[str, torch.Tensor] | None = None
+
+
+def load_gdn_real_gate(path: Path) -> dict[str, torch.Tensor]:
+    """Load one audited raw-gating corpus and keep it resident on the device."""
+    data = torch.load(path, map_location="cpu", weights_only=True)
+    required = ("raw_gate_a", "raw_beta_b", "A_log", "dt_bias")
+    missing = [name for name in required if name not in data]
+    if missing:
+        raise ValueError(f"real-gating corpus is missing tensors: {missing}")
+    raw_gate_a = data["raw_gate_a"]
+    raw_beta_b = data["raw_beta_b"]
+    A_log = data["A_log"]
+    dt_bias = data["dt_bias"]
+    if raw_gate_a.ndim != 2 or raw_beta_b.shape != raw_gate_a.shape:
+        raise ValueError("raw_gate_a/raw_beta_b must have the same [T,H] shape")
+    if A_log.ndim != 1 or dt_bias.shape != A_log.shape:
+        raise ValueError("A_log/dt_bias must have the same [H] shape")
+    if raw_gate_a.shape[1] != A_log.numel():
+        raise ValueError("gate corpus token and per-head tensors disagree")
+    return {
+        name: tensor.contiguous().to("cuda")
+        for name, tensor in (
+            ("raw_gate_a", raw_gate_a),
+            ("raw_beta_b", raw_beta_b),
+            ("A_log", A_log.float()),
+            ("dt_bias", dt_bias.float()),
+        )
+    }
+
+
+def real_gdn_gate(T: int, H: int) -> tuple[torch.Tensor, ...] | None:
+    """Return an exact prefix/head slice from the configured real-gating corpus."""
+    if _GDN_REAL_GATE is None:
+        return None
+    available_T, available_H = _GDN_REAL_GATE["raw_gate_a"].shape
+    if T > available_T or H > available_H:
+        raise ValueError(
+            f"real-gating corpus [T={available_T},H={available_H}] cannot cover "
+            f"case [T={T},H={H}]"
+        )
+    return (
+        _GDN_REAL_GATE["raw_gate_a"][:T, :H],
+        _GDN_REAL_GATE["raw_beta_b"][:T, :H],
+        _GDN_REAL_GATE["A_log"][:H],
+        _GDN_REAL_GATE["dt_bias"][:H],
+    )
 
 
 def _split_fields(text: str) -> list[str]:
@@ -219,9 +266,6 @@ def make_gdn_inputs(record: dict[str, Any], accuracy: bool, seed: int):
             (1, T, H, D), 0.01,
             dtype=torch.bfloat16, device="cuda",
         )
-        g, beta_logits, swa_mask = _make_gdn_perf_gating(T, H, seed)
-        g[:, :, ~swa_mask] = 0.0
-        beta = beta_logits.sigmoid()
     else:
         gen = _generator(seed)
         q = F.normalize(
@@ -233,6 +277,21 @@ def make_gdn_inputs(record: dict[str, Any], accuracy: bool, seed: int):
         v = (torch.randn(1, T, H, D, device="cuda", generator=gen) * 0.1).to(
             torch.bfloat16
         )
+
+    real_gate = real_gdn_gate(T, H)
+    if real_gate is not None:
+        raw_gate_a, raw_beta_b, A_log, dt_bias = real_gate
+        g = (
+            -A_log.exp()[None, None, :]
+            * F.softplus(raw_gate_a.float()[None, :, :] + dt_bias[None, None, :])
+        )
+        beta = raw_beta_b.float().sigmoid()[None, :, :]
+    elif not accuracy:
+        g, beta_logits, swa_mask = _make_gdn_perf_gating(T, H, seed)
+        g[:, :, ~swa_mask] = 0.0
+        beta = beta_logits.sigmoid()
+    else:
+        gen = _generator(seed ^ 0x4744_4E47)
         g = F.logsigmoid(
             torch.randn(1, T, H, device="cuda", generator=gen)
         )
@@ -253,6 +312,26 @@ def make_gdn_optimized_inputs(
         packed_qkv = torch.full(
             (T, width), 0.01, dtype=torch.bfloat16, device="cuda",
         )
+        state_pool = torch.zeros(
+            record["N"] + 4, H, D, D, dtype=torch.float32, device="cuda",
+        )
+    else:
+        gen = _generator(seed)
+        packed_qkv = (
+            torch.randn(T, width, device="cuda", generator=gen) * 0.1
+        ).to(torch.bfloat16)
+        state_pool = (
+            torch.randn(
+                record["N"] + 4, H, D, D, device="cuda", generator=gen,
+                dtype=torch.float32,
+            )
+            * 0.01
+        )
+
+    real_gate = real_gdn_gate(T, H)
+    if real_gate is not None:
+        raw_gate_a, raw_beta_b, A_log, dt_bias = real_gate
+    elif not accuracy:
         base_g, beta_logits, swa_mask = _make_gdn_perf_gating(T, H, seed)
         # With A=1 and dt_bias=0, inverse-softplus(-g) makes the serving
         # fused-gating path reproduce ``logsigmoid(randn) / 16``.  A_log=0
@@ -262,14 +341,8 @@ def make_gdn_optimized_inputs(
         A_log = torch.zeros(H, dtype=torch.float32, device="cuda")
         A_log[~swa_mask] = -torch.inf
         dt_bias = torch.zeros(H, dtype=torch.float32, device="cuda")
-        state_pool = torch.zeros(
-            record["N"] + 4, H, D, D, dtype=torch.float32, device="cuda",
-        )
     else:
-        gen = _generator(seed)
-        packed_qkv = (
-            torch.randn(T, width, device="cuda", generator=gen) * 0.1
-        ).to(torch.bfloat16)
+        gen = _generator(seed ^ 0x4744_4E47)
         raw_ba = (
             torch.randn(T, 2 * H, device="cuda", generator=gen) * 0.1
         ).to(torch.bfloat16)
@@ -278,13 +351,6 @@ def make_gdn_optimized_inputs(
         )
         dt_bias = torch.linspace(
             -0.2, 0.1, H, dtype=torch.float32, device="cuda",
-        )
-        state_pool = (
-            torch.randn(
-                record["N"] + 4, H, D, D, device="cuda", generator=gen,
-                dtype=torch.float32,
-            )
-            * 0.01
         )
         raw_beta_b, raw_gate_a = raw_ba.split(H, dim=-1)
     return {
@@ -346,6 +412,8 @@ def run_gdn_optimized_path(
     record: dict[str, Any],
     auto_cp: bool,
     ops: tuple[Callable[..., Any], Callable[..., Any], Callable[..., Any] | None],
+    overlap_warmup_threshold: float | None = None,
+    force_tc01_cp_candidate: bool = False,
 ):
     """Run one explicit serving-style GDN ABI path."""
     split_op, legacy_op, packed_op = ops
@@ -357,6 +425,10 @@ def run_gdn_optimized_path(
         "auto_cp": auto_cp,
         "raw_cu_seqlens": tuple(record["cu"]),
     }
+    if overlap_warmup_threshold is not None:
+        common["overlap_warmup_threshold"] = overlap_warmup_threshold
+    if force_tc01_cp_candidate:
+        common["force_tc01_cp_candidate"] = True
     if path == "split":
         packed_qkv = inputs["packed_qkv"]
         logical_width = (2 * record["Hg"] + record["H"]) * D
@@ -613,6 +685,8 @@ def accuracy_gdn(
     path: str = "legacy",
     ops: tuple[Callable[..., Any], Callable[..., Any], Callable[..., Any] | None]
     | None = None,
+    overlap_warmup_threshold: float | None = None,
+    force_tc01_cp_candidate: bool = False,
 ) -> dict[str, Any]:
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
@@ -622,6 +696,8 @@ def accuracy_gdn(
         q, k, v, g, beta, cu = make_gdn_inputs(record, True, seed)
         candidate = chunk_gated_delta_rule_fwd(
             q, k, v, g, beta, cu_seqlens=cu, output_final_state=True,
+            overlap_warmup_threshold=overlap_warmup_threshold,
+            force_tc01_cp_candidate=force_tc01_cp_candidate,
         )
         out, state = candidate[2], candidate[4]
         del candidate
@@ -637,6 +713,8 @@ def accuracy_gdn(
         initial_state = inputs["state_pool"][selected].clone()
         candidate = run_gdn_optimized_path(
             path, inputs, record, auto_cp=True, ops=ops,
+            overlap_warmup_threshold=overlap_warmup_threshold,
+            force_tc01_cp_candidate=force_tc01_cp_candidate,
         )
         out, state = candidate[2], inputs["state_pool"][selected]
         q, k, v = ops[0](
@@ -692,6 +770,8 @@ def accuracy_gdn_serial(
     path: str = "legacy",
     ops: tuple[Callable[..., Any], Callable[..., Any], Callable[..., Any] | None]
     | None = None,
+    overlap_warmup_threshold: float | None = None,
+    force_tc01_cp_candidate: bool = False,
 ) -> dict[str, Any]:
     if path == "legacy":
         from pla.prefill.flashqla import chunk_gated_delta_rule_fwd
@@ -700,6 +780,8 @@ def accuracy_gdn_serial(
         candidate = chunk_gated_delta_rule_fwd(
             q, k, v, g, beta, cu_seqlens=cu,
             output_final_state=True, auto_cp=True,
+            overlap_warmup_threshold=overlap_warmup_threshold,
+            force_tc01_cp_candidate=force_tc01_cp_candidate,
         )
         reference = chunk_gated_delta_rule_fwd(
             q, k, v, g, beta, cu_seqlens=cu,
@@ -721,6 +803,8 @@ def accuracy_gdn_serial(
         # CP changes from the packed-QKV adapter itself.
         candidate = run_gdn_optimized_path(
             path, candidate_inputs, record, auto_cp=True, ops=ops,
+            overlap_warmup_threshold=overlap_warmup_threshold,
+            force_tc01_cp_candidate=force_tc01_cp_candidate,
         )
         reference = run_gdn_optimized_path(
             "split", reference_inputs, record, auto_cp=False, ops=ops,
@@ -901,6 +985,8 @@ def perf_gdn(
     ops: tuple[Callable[..., Any], Callable[..., Any], Callable[..., Any] | None]
     | None = None,
     record_first_call: bool = False,
+    overlap_warmup_threshold: float | None = None,
+    force_tc01_cp_candidate: bool = False,
 ) -> tuple[float, float | None]:
     if path == "legacy":
         from pla.prefill.flashqla import chunk_gated_delta_rule_fwd
@@ -909,6 +995,8 @@ def perf_gdn(
         q, k, v, g, beta, cu = inputs
         call = lambda: chunk_gated_delta_rule_fwd(
             q, k, v, g, beta, cu_seqlens=cu, auto_cp=auto_cp,
+            overlap_warmup_threshold=overlap_warmup_threshold,
+            force_tc01_cp_candidate=force_tc01_cp_candidate,
         )
     else:
         if ops is None:
@@ -916,6 +1004,8 @@ def perf_gdn(
         optimized_inputs = make_gdn_optimized_inputs(record, False, seed)
         call = lambda: run_gdn_optimized_path(
             path, optimized_inputs, record, auto_cp=auto_cp, ops=ops,
+            overlap_warmup_threshold=overlap_warmup_threshold,
+            force_tc01_cp_candidate=force_tc01_cp_candidate,
         )
     return median_ms(
         call,
@@ -1020,11 +1110,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="enable production automatic context parallelism in GDN perf mode",
     )
     parser.add_argument(
+        "--gdn-overlap-warmup-threshold", type=float,
+        help=(
+            "enable CP overlap replay with this negative gate threshold; "
+            "omit to retain production prepare_h/correct_h0"
+        ),
+    )
+    parser.add_argument(
+        "--gdn-force-tc01-cp-candidate", action="store_true",
+        help="bypass tc01 production admission but retain planner feasibility",
+    )
+    parser.add_argument(
         "--gdn-path", choices=("legacy", "split", "packed"), default="legacy",
         help=(
             "GDN ABI: activated q/k/v/g/beta (legacy), fused Triton QKV split "
             "+ raw gating (split), or direct post-convolution Q|K|V (packed)"
         ),
+    )
+    parser.add_argument(
+        "--gdn-real-gate", type=Path,
+        help="audited Qwen raw-gating corpus used for every compatible GDN case",
     )
     parser.add_argument(
         "--kda-exact-b1-cu", action="store_true",
@@ -1056,6 +1161,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--warmup must be non-negative")
     if args.repeat <= 0:
         parser.error("--repeat must be positive")
+    if (args.gdn_overlap_warmup_threshold is not None and
+            (not math.isfinite(args.gdn_overlap_warmup_threshold) or
+             args.gdn_overlap_warmup_threshold >= 0.0)):
+        parser.error("--gdn-overlap-warmup-threshold must be finite and negative")
+    if args.gdn_force_tc01_cp_candidate and not args.gdn_auto_cp:
+        parser.error("--gdn-force-tc01-cp-candidate requires --gdn-auto-cp")
     return args
 
 
@@ -1080,6 +1191,8 @@ def selected_abi_metadata(
             "gdn_path": args.gdn_path,
             "gdn_reference_path": reference_path,
             "gdn_auto_cp": auto_cp,
+            "gdn_overlap_warmup_threshold": args.gdn_overlap_warmup_threshold,
+            "gdn_force_tc01_cp_candidate": args.gdn_force_tc01_cp_candidate,
             "gdn_gating_abi": (
                 "activated" if args.gdn_path == "legacy" else "raw"
             ),
@@ -1087,13 +1200,23 @@ def selected_abi_metadata(
                 "legacy" if args.gdn_path == "legacy" else "indexed_pool"
             ),
             "gdn_gate_distribution": (
-                "flashqla_slow_decay_swa75"
+                "qwen38_max_layer0_real"
+                if args.gdn_real_gate is not None
+                else "flashqla_slow_decay_swa75"
                 if args.mode == "perf" else "accuracy_stress"
             ),
-            "gdn_gate_decay_divisor": (
-                GDN_GATE_DECAY_DIVISOR if args.mode == "perf" else None
+            "gdn_real_gate_path": (
+                str(args.gdn_real_gate) if args.gdn_real_gate is not None else None
             ),
-            "gdn_swa_ratio": GDN_SWA_RATIO if args.mode == "perf" else None,
+            "gdn_real_gate_sha256": args.gdn_real_gate_sha256,
+            "gdn_gate_decay_divisor": (
+                GDN_GATE_DECAY_DIVISOR
+                if args.mode == "perf" and args.gdn_real_gate is None else None
+            ),
+            "gdn_swa_ratio": (
+                GDN_SWA_RATIO
+                if args.mode == "perf" and args.gdn_real_gate is None else None
+            ),
         }
     return {
         "kda_api": (
@@ -1118,7 +1241,16 @@ def selected_abi_metadata(
 
 
 def main(argv: list[str] | None = None) -> int:
+    global _GDN_REAL_GATE
     args = parse_args(argv)
+    args.gdn_real_gate_sha256 = None
+    if args.gdn_real_gate is not None:
+        if args.family == "kda":
+            raise ValueError("--gdn-real-gate requires --family gdn or all")
+        args.gdn_real_gate_sha256 = hashlib.sha256(
+            args.gdn_real_gate.read_bytes()
+        ).hexdigest()
+        _GDN_REAL_GATE = load_gdn_real_gate(args.gdn_real_gate)
 
     inventory_files = discover_case_lists(args.list_dir, args.family)
     records = load_records(args.list_dir, args.family)
@@ -1251,10 +1383,14 @@ def main(argv: list[str] | None = None) -> int:
                     if record["family"] == "gdn" and args.reference == "fla":
                         metrics = accuracy_gdn(
                             record, seed, args.gdn_path, gdn_ops,
+                            args.gdn_overlap_warmup_threshold,
+                            args.gdn_force_tc01_cp_candidate,
                         )
                     elif record["family"] == "gdn":
                         metrics = accuracy_gdn_serial(
                             record, seed, args.gdn_path, gdn_ops,
+                            args.gdn_overlap_warmup_threshold,
+                            args.gdn_force_tc01_cp_candidate,
                         )
                     elif args.reference == "fla":
                         metrics = accuracy_kda(
@@ -1290,6 +1426,8 @@ def main(argv: list[str] | None = None) -> int:
                         record, seed, args.warmup, args.repeat,
                         args.gdn_auto_cp, args.gdn_path, gdn_ops,
                         args.record_first_call,
+                        args.gdn_overlap_warmup_threshold,
+                        args.gdn_force_tc01_cp_candidate,
                     )
                     row.update({
                         "ms": ms,

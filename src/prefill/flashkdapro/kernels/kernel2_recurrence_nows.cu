@@ -161,6 +161,10 @@ __device__ __forceinline__ float k2n_state_to_f32(FP16 x) {
     return __half2float(x);
 }
 
+__device__ __forceinline__ float k2n_state_to_f32(float x) {
+    return x;
+}
+
 template <typename StateT>
 __device__ __forceinline__ StateT k2n_state_from_f32(float x);
 
@@ -174,6 +178,11 @@ __device__ __forceinline__ FP16 k2n_state_from_f32<FP16>(float x) {
     return __float2half(x);
 }
 
+template <>
+__device__ __forceinline__ float k2n_state_from_f32<float>(float x) {
+    return x;
+}
+
 __device__ __forceinline__ uint16_t k2n_state_as_bf16_bits(BF16 x) {
     return x.storage;
 }
@@ -182,12 +191,20 @@ __device__ __forceinline__ uint16_t k2n_state_as_bf16_bits(FP16 x) {
     return BF16(__half2float(x)).storage;
 }
 
+__device__ __forceinline__ uint16_t k2n_state_as_bf16_bits(float x) {
+    return BF16(x).storage;
+}
+
 __device__ __forceinline__ uint16_t k2n_state_bits(BF16 x) {
     return x.storage;
 }
 
 __device__ __forceinline__ uint16_t k2n_state_bits(FP16 x) {
     return __half_as_ushort(x);
+}
+
+__device__ __forceinline__ uint32_t k2n_state_bits(float x) {
+    return __float_as_uint(x);
 }
 
 template <bool Fp16State>
@@ -496,11 +513,11 @@ inline K2NStateOutAccessor<CompactBf16> make_k2n_state_out_accessor(
 // Only the small generic selection remains dynamic; the recurrence body itself
 // is not duplicated.
 template <typename StateT, int NThreads, int CtaDV, int DKSplitWarps,
-          bool DedicatedLeader>
+          bool DedicatedLeader, typename MasterT>
 __device__ __forceinline__ void k2n_load_state(
     const StateT* isp, int dv_base, int dv0, int dk_warp, int tid,
     bool is_dk_worker, const int* crow, const int* ccol,
-    StateT* rstate, unsigned char* smem) {
+    MasterT* rstate, unsigned char* smem) {
     using C = K2NConfig<NThreads, CtaDV, DKSplitWarps, DedicatedLeader>;
     using S = K2NSmem<NThreads, CtaDV, DKSplitWarps, DedicatedLeader>;
     constexpr int COLB = C::COLB;
@@ -526,12 +543,16 @@ __device__ __forceinline__ void k2n_load_state(
                     int m = dk_warp * LOCAL_DKB + ml;
                     int dk = m * 16 + crow[e];
                     int dv = dv0 + bi * 16 + ccol[e];
+                    StateT value;
                     if constexpr (CtaDV < DV)
-                        rstate[(ml * COLB + bi) * 8 + e] =
-                            sState[int64_t(dv - dv_base) * DK + dk];
+                        value = sState[int64_t(dv - dv_base) * DK + dk];
+                    else
+                        value = isp[int64_t(dv) * DK + dk];
+                    if constexpr (std::is_same<MasterT, StateT>::value)
+                        rstate[(ml * COLB + bi) * 8 + e] = value;
                     else
                         rstate[(ml * COLB + bi) * 8 + e] =
-                            isp[int64_t(dv) * DK + dk];
+                            k2n_state_from_f32<MasterT>(k2n_state_to_f32(value));
                 }
     }
 }
@@ -666,7 +687,13 @@ flashkda_recurrence_nows_kernel(
     constexpr int COLB = C::COLB;
     constexpr int LOCAL_DKB = DKB / DKSplitWarps;
     constexpr int ZSPLIT = DV / CtaDV;
-    using StateT = typename std::conditional<Fp16State, FP16, BF16>::type;
+    using StorageStateT = typename std::conditional<Fp16State, FP16, BF16>::type;
+#if defined(FLASHKDA_ARCH_150)
+    constexpr bool Fp32MasterState = !UseSegTable || !Fp16State;
+#else
+    constexpr bool Fp32MasterState = false;
+#endif
+    using StateT = typename std::conditional<Fp32MasterState, float, StorageStateT>::type;
     using KdT = typename std::conditional<Fp16State, cute::half_t, BF16>::type;
     using QdT = typename std::conditional<Fp16State, cute::half_t, BF16>::type;
     extern __shared__ __align__(128) unsigned char smem[];
@@ -782,15 +809,15 @@ flashkda_recurrence_nows_kernel(
         // Full-DV nows cannot fit the 32 KiB state tile in its 13.5 KiB ws slot,
         // so it retains the original direct path.
         if constexpr (CompactBf16State) {
-            k2n_load_state<StateT,
+            k2n_load_state<StorageStateT,
                 NThreads, CtaDV, DKSplitWarps, DedicatedLeader>(
-                reinterpret_cast<const StateT*>(init_state.bf16_ptr(state_off)),
+                reinterpret_cast<const StorageStateT*>(init_state.bf16_ptr(state_off)),
                 dv_base, dv0, dk_warp, tid, is_dk_worker, crow, ccol,
                 &rstate[0][0][0], smem);
         } else if (!init_state.is_fp32()) {
-            k2n_load_state<StateT,
+            k2n_load_state<StorageStateT,
                 NThreads, CtaDV, DKSplitWarps, DedicatedLeader>(
-                reinterpret_cast<const StateT*>(init_state.bf16_ptr(state_off)),
+                reinterpret_cast<const StorageStateT*>(init_state.bf16_ptr(state_off)),
                 dv_base, dv0, dk_warp, tid, is_dk_worker, crow, ccol,
                 &rstate[0][0][0], smem);
         } else if (is_dk_worker) {
@@ -1380,6 +1407,7 @@ flashkda_recurrence_nows_kernel(
                 uint32_t* sZ = reinterpret_cast<uint32_t*>(smem + S::O_scr);
                 if (tid == 0) *sZ = 0u;
                 __syncthreads();
+                constexpr uint32_t MagnitudeMask = Fp32MasterState ? 0x7fffffffu : 0x7fffu;
                 uint32_t bits = 0;
                 if (is_dk_worker) {
                     CUTE_UNROLL
@@ -1389,7 +1417,7 @@ flashkda_recurrence_nows_kernel(
                             CUTE_UNROLL
                             for (int e = 0; e < 8; ++e)
                                 bits |= uint32_t(k2n_state_bits(rstate[ml][bi][e]))
-                                        & 0x7fffu;
+                                        & MagnitudeMask;
                 }
                 if (bits) atomicOr(sZ, 1u);
                 __syncthreads();
@@ -1422,6 +1450,11 @@ flashkda_recurrence_nows_kernel(
                     reinterpret_cast<StateT*>(final_state.bf16_ptr(state_off)),
                     dv_base, dv0, dk_warp, tid, is_dk_worker, crow, ccol,
                     &rstate[0][0][0], smem);
+            } else if constexpr (CompactBf16State && Fp32MasterState) {
+                k2n_store_bf16_state_converted<StateT,
+                    NThreads, CtaDV, DKSplitWarps, DedicatedLeader>(
+                    final_state.bf16_ptr(state_off), dv_base, dv0, dk_warp, tid,
+                    is_dk_worker, crow, ccol, &rstate[0][0][0], smem);
             } else if constexpr (CompactBf16State) {
                 k2n_store_state<StateT,
                     NThreads, CtaDV, DKSplitWarps, DedicatedLeader>(
@@ -1577,9 +1610,15 @@ void launch_flashkda_recurrence_nows(
     bool short_high_head_varlen_dvsplit = is_varlen && T_total <= 4096
         && ((H == 96 && has_state_in && N >= 3)
             || (H == 48 && (has_state_in || N <= 3)));
+    // Paired with the outer H32 short-varlen promotion. BV32/DK1 reduces
+    // the wide shared-state CTA's synchronization and residency costs while
+    // retaining the existing FP32 master/BF16 MMA split. Other shapes and
+    // explicit BV/DK overrides keep their established dispatch rules.
+    const bool short_h32_tc02_dvsplit = !is_tc01 && N == 1 && H == 32
+        && T_total < 256;
     bool auto_varlen_dvsplit =
         is_varlen && (H <= 24 || large_batch_longseq_dvsplit
-                      || short_high_head_varlen_dvsplit);
+                      || short_high_head_varlen_dvsplit || short_h32_tc02_dvsplit);
     if (is_tc01) {
         // ZW810E has 64 CUs and needs its own BV/DK/high-head policy.  Exact
         // Kimi replay (both state modes, alternating order) establishes:
@@ -1724,10 +1763,16 @@ void launch_flashkda_recurrence_nows(
                     && (T_total < 32 || T_total >= 128)));
         bool auto_fixed_short_dk2 = !is_varlen && N == 1
             && H == 24 && T_total >= 64 && T_total < 128;
+        // tc02 FP32 master state: split DK across four worker warps for a
+        // single low-head sequence. All 30 ABBA pairs for H6/H8, T=1024..16387,
+        // and three initial-state forms reduced latency. Preserve BV16,
+        // non-affine math, and explicit DKSPLIT override semantics.
+        const bool auto_fp32_low_head_dk4 = !is_tc01 && is_varlen
+            && N == 1 && (H == 6 || H == 8) && T_total >= 1024 && use_bv16;
         int requested_dk_split = edk && edk[0]
             ? atoi(edk)
             : ((auto_bv16_dk4lead || auto_varlen_bv16_dk4
-                || auto_fixed_short_dk4) ? 4
+                || auto_fixed_short_dk4 || auto_fp32_low_head_dk4) ? 4
                 : (auto_fixed_short_dk2 ? 2 : 1));
         if (is_tc01 && !(edk && edk[0])) {
             const bool long_affine_dk4 = is_varlen && N == 1

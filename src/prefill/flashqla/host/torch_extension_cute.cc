@@ -59,7 +59,8 @@
 void launch_get_warmup_chunks_cute(
     const float* g, const signed char* ht_mask, const int* cu_seqlens,
     int* num_warmup_chunks, signed char* fallback_mask,
-    int batch_size, int num_tokens, int H, hggcStream_t stream);
+    int batch_size, int num_tokens, int H, float threshold,
+    hggcStream_t stream);
 
 void launch_kkt_solve_cute(
     const void* K, const float* beta, void* A, const int* cu_seqlens,
@@ -95,9 +96,10 @@ void launch_fused_fwd_cp_cute(
     void* o, const void* q, const void* k, const void* v,
     const void* a, const float* beta, const float* g,
     const void* h0, void* ht_out, void* raw_state,
-    bool state_bf16,
+    const void* raw_state_input, bool state_bf16,
     const int* raw_state_indices,
     const int* cu_seqlens, const int* cp_seq_map, const int* raw_cu_seqlens,
+    const int* num_warmup_chunks, const signed char* fallback_mask,
     int batch_size, int num_tokens, int raw_batch_size,
     int H, int Hg, float scale, int dtype_tag,
     int64_t v_token_stride,
@@ -224,7 +226,7 @@ bool is_supported_head_config(int64_t H, int64_t Hg) {
            (H == 24 && Hg == 8) ||
            (H == 16 && (Hg == 8 || Hg == 4 || Hg == 2)) ||
            (H == 12 && Hg == 4) ||
-           (H == 8 && (Hg == 4 || Hg == 2)) ||
+           (H == 8 && (Hg == 4 || Hg == 2 || Hg == 1)) ||
            (H == 6 && Hg == 2) ||
            (H == 4 && Hg == 2);
 }
@@ -455,7 +457,8 @@ std::vector<torch::Tensor> chunk_local_cumsum_qk_norm_gated(
 std::vector<torch::Tensor> get_warmup_chunks(
     torch::Tensor g,           // [1, T, H] fp32 chunk-local cumsum gate
     torch::Tensor ht_mask,     // [batch] int8
-    torch::Tensor cu_seqlens   // [batch+1] int32
+    torch::Tensor cu_seqlens,  // [batch+1] int32
+    double threshold
 ) {
     if (pla::bypass::enabled()) {
         if (pla::instrument::show_params()) pla::instrument::dump_metadata("flashqla.get_warmup_chunks",
@@ -484,6 +487,9 @@ std::vector<torch::Tensor> get_warmup_chunks(
     check_same_cuda_device(g, cu_seqlens, "cu_seqlens");
     TORCH_CHECK(cu_seqlens.dtype() == torch::kInt32, "cu_seqlens must be int32");
     TORCH_CHECK(ht_mask.dtype() == torch::kInt8, "ht_mask must be int8");
+    TORCH_CHECK(std::isfinite(threshold) && threshold < 0.0 &&
+                    std::isfinite(static_cast<float>(threshold)),
+                "threshold must be finite, negative, and representable as fp32");
     at::cuda::CUDAGuard device_guard(g.device());
 
     int T = g.size(1);
@@ -502,7 +508,7 @@ std::vector<torch::Tensor> get_warmup_chunks(
         cu_seqlens.data_ptr<int>(),
         num_warmup.data_ptr<int>(),
         reinterpret_cast<signed char*>(fallback.data_ptr<int8_t>()),
-        batch_size, T, H, stream);
+        batch_size, T, H, static_cast<float>(threshold), stream);
 
     return {num_warmup, fallback};
 }
@@ -851,7 +857,10 @@ std::vector<torch::Tensor> fused_fwd(
     c10::optional<torch::Tensor> raw_state_opt,
     c10::optional<torch::Tensor> raw_state_indices_opt,
     bool output_final_state,
-    bool final_state_bf16
+    bool final_state_bf16,
+    c10::optional<torch::Tensor> raw_state_input_opt,
+    c10::optional<torch::Tensor> num_warmup_opt,
+    c10::optional<torch::Tensor> fallback_mask_opt
 ) {
     if (pla::bypass::enabled()) {
         const c10::cuda::OptionalCUDAGuard guard(q.is_cuda()
@@ -863,7 +872,10 @@ std::vector<torch::Tensor> fused_fwd(
              {"cp_seq_map", cp_seq_map_opt.has_value() ? &cp_seq_map_opt.value() : nullptr},
              {"h0", h0_opt.has_value() ? &h0_opt.value() : nullptr},
              {"raw_state", raw_state_opt.has_value() ? &raw_state_opt.value() : nullptr},
-             {"raw_state_indices", raw_state_indices_opt.has_value() ? &raw_state_indices_opt.value() : nullptr}},
+             {"raw_state_indices", raw_state_indices_opt.has_value() ? &raw_state_indices_opt.value() : nullptr},
+             {"raw_state_input", raw_state_input_opt.has_value() ? &raw_state_input_opt.value() : nullptr},
+             {"num_warmup", num_warmup_opt.has_value() ? &num_warmup_opt.value() : nullptr},
+             {"fallback_mask", fallback_mask_opt.has_value() ? &fallback_mask_opt.value() : nullptr}},
             "valid_num_tokens=" + std::to_string(valid_num_tokens) +
             " scale=" + std::to_string(scale) +
             " output_final_state=" + std::to_string(output_final_state));
@@ -931,6 +943,12 @@ std::vector<torch::Tensor> fused_fwd(
                                  (!cp_seq_map_opt.has_value() &&
                                   sp::same_view(raw_state_opt.value(), h0_opt.value())),
                              "raw_state/h0 overlap is unsafe for CP or partial state views");
+            if (raw_state_input_opt.has_value()) {
+                sanity.tensor(raw_state_input_opt.value(), "raw_state_input");
+                sanity.check(!sp::overlaps(raw_state_opt.value(),
+                                           raw_state_input_opt.value()),
+                             "raw_state_input must be a disjoint overlap snapshot");
+            }
         }
     }
     TORCH_CHECK(q.is_cuda(), "q must be CUDA");
@@ -1015,6 +1033,41 @@ std::vector<torch::Tensor> fused_fwd(
     }
     TORCH_CHECK(raw_state_opt.has_value() == raw_state_indices_opt.has_value(),
                 "raw_state and raw_state_indices must be provided together");
+    TORCH_CHECK(num_warmup_opt.has_value() == fallback_mask_opt.has_value(),
+                "num_warmup and fallback_mask must be provided together");
+    TORCH_CHECK(!num_warmup_opt.has_value() || cp_seq_map_opt.has_value(),
+                "overlap warmup metadata requires a CP sequence map");
+    TORCH_CHECK(!raw_state_input_opt.has_value() ||
+                    (raw_state_opt.has_value() && num_warmup_opt.has_value()),
+                "raw_state_input is only valid for indexed overlap warmup");
+    TORCH_CHECK(!num_warmup_opt.has_value() || !raw_state_opt.has_value() ||
+                    raw_state_input_opt.has_value(),
+                "indexed overlap warmup requires a read-only raw_state_input");
+    TORCH_CHECK(!num_warmup_opt.has_value() || !h0_opt.has_value() ||
+                    h0_opt->numel() == 0,
+                "overlap warmup cannot consume precomputed CP h0");
+
+    const int* num_warmup_ptr = nullptr;
+    const signed char* fallback_mask_ptr = nullptr;
+    torch::Tensor num_warmup;
+    torch::Tensor fallback_mask;
+    if (num_warmup_opt.has_value()) {
+        num_warmup = num_warmup_opt.value();
+        fallback_mask = fallback_mask_opt.value();
+        check_same_cuda_device(q, num_warmup, "num_warmup");
+        check_same_cuda_device(q, fallback_mask, "fallback_mask");
+        TORCH_CHECK(num_warmup.dtype() == torch::kInt32 &&
+                        num_warmup.is_contiguous() &&
+                        num_warmup.numel() == cp_batch * H,
+                    "num_warmup must be contiguous int32 [cp_batch*H]");
+        TORCH_CHECK(fallback_mask.dtype() == torch::kInt8 &&
+                        fallback_mask.is_contiguous() &&
+                        fallback_mask.numel() == cp_batch * H,
+                    "fallback_mask must be contiguous int8 [cp_batch*H]");
+        num_warmup_ptr = num_warmup.data_ptr<int>();
+        fallback_mask_ptr = reinterpret_cast<const signed char*>(
+            fallback_mask.data_ptr<int8_t>());
+    }
 
     if (g_ppu_lib_show_params) {
         std::cout << generate_nvtx_tag(
@@ -1055,8 +1108,10 @@ std::vector<torch::Tensor> fused_fwd(
     }
 
     void* raw_state_ptr = nullptr;
+    const void* raw_state_input_ptr = nullptr;
     const int* raw_state_indices_ptr = nullptr;
     torch::Tensor raw_state;
+    torch::Tensor raw_state_input;
     torch::Tensor raw_state_indices;
     if (raw_state_opt.has_value()) {
         raw_state = raw_state_opt.value();
@@ -1082,6 +1137,22 @@ std::vector<torch::Tensor> fused_fwd(
         raw_state_ptr = raw_state.data_ptr();
         raw_state_indices_ptr = raw_state_indices.data_ptr<int>();
     }
+    if (raw_state_input_opt.has_value()) {
+        raw_state_input = raw_state_input_opt.value();
+        check_same_cuda_device(q, raw_state_input, "raw_state_input");
+        TORCH_CHECK(raw_state_input.dtype() ==
+                        (final_state_bf16 ? torch::kBFloat16 : torch::kFloat32),
+                    "raw_state_input dtype must match raw_state");
+        TORCH_CHECK(raw_state_input.is_contiguous(),
+                    "raw_state_input must be contiguous");
+        TORCH_CHECK(raw_state_input.dim() == 4 &&
+                        raw_state_input.size(0) == raw_batch &&
+                        raw_state_input.size(1) == H &&
+                        raw_state_input.size(2) == DV &&
+                        raw_state_input.size(3) == DK,
+                    "raw_state_input must be [raw_batch,H,DV,DK]");
+        raw_state_input_ptr = raw_state_input.data_ptr();
+    }
 
     const auto device = logical_device_info(q);
     const hggcStream_t stream = pla::current_stream();
@@ -1099,9 +1170,9 @@ std::vector<torch::Tensor> fused_fwd(
         data_ptr_b16(o), data_ptr_b16(q), data_ptr_b16(k), data_ptr_b16(v), data_ptr_b16(a),
         beta.data_ptr<float>(), g.data_ptr<float>(),
         h0_ptr, ht_out.numel() > 0 ? ht_out.data_ptr() : nullptr,
-        raw_state_ptr, final_state_bf16, raw_state_indices_ptr,
-        cu_seqlens.data_ptr<int>(), cp_seq_map_ptr,
-        raw_cu_seqlens.data_ptr<int>(),
+        raw_state_ptr, raw_state_input_ptr, final_state_bf16,
+        raw_state_indices_ptr, cu_seqlens.data_ptr<int>(), cp_seq_map_ptr,
+        raw_cu_seqlens.data_ptr<int>(), num_warmup_ptr, fallback_mask_ptr,
         cp_batch, T, raw_batch, (int)H, (int)Hg, (float)scale, dtype_tag(q),
         v.stride(1),
         device.index, device.num_cu, device.compute_capability, stream);
@@ -1133,7 +1204,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("q"), py::arg("k"), py::arg("valid_num_tokens") = -1);
     m.def("get_warmup_chunks", &get_warmup_chunks,
           "FlashQLA CuTe get_warmup_chunks (Task 2)",
-          py::arg("g"), py::arg("ht_mask"), py::arg("cu_seqlens"));
+          py::arg("g"), py::arg("ht_mask"), py::arg("cu_seqlens"),
+          py::arg("threshold") = -10.0);
     m.def("kkt_solve", &kkt_solve,
           "FlashQLA CuTe kkt_solve (Task 3)",
           py::arg("K"), py::arg("beta"), py::arg("cu_seqlens"), py::arg("H"),
@@ -1162,5 +1234,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("raw_state") = c10::optional<torch::Tensor>(),
           py::arg("raw_state_indices") = c10::optional<torch::Tensor>(),
           py::arg("output_final_state") = true,
-          py::arg("final_state_bf16") = false);
+          py::arg("final_state_bf16") = false,
+          py::arg("raw_state_input") = c10::optional<torch::Tensor>(),
+          py::arg("num_warmup") = c10::optional<torch::Tensor>(),
+          py::arg("fallback_mask") = c10::optional<torch::Tensor>());
 }

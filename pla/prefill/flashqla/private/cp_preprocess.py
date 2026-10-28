@@ -37,7 +37,6 @@ No CUDA kernels involved — this is dispatch logic only.
 Authority: csrc_sm90/flashqla_cuda_ops.py::calc_cp_seqs + prepare_chunk_offsets.
 """
 import math
-import os
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Optional, Sequence, Tuple
@@ -52,12 +51,33 @@ from ... import _sanity
 # architecture keeps both its physical occupancy count and fused-head topology.
 MULTI_PROCESSOR_COUNT = 39
 CHUNK_SIZE = 32
-TC01_TFU_PROCESSOR_COUNT = 20
+# Retained as a compatibility name for sweep harnesses. The real-gating tc01
+# dispatch no longer admits the former 20-TFU additive candidate.
 TC01_TFU_MODEL_ENV = "PLA_FLASHQLA_CP_TC01_TFU_MODEL"
+# Widest threshold with zero strict-5% failures across all 3,881 feasible tc01
+# planner candidates under Qwen3.8-Max layer-0 raw gating.
+TC01_OVERLAP_WARMUP_THRESHOLD = -4.0
+# The 24K-30K H16/Hg2 single-sequence band was separately validated with
+# 100-sample balanced ABBA timing and stateful accuracy on ZW810E.
+TC01_B1_OVERLAP_WARMUP_THRESHOLD = -3.25
+# The low-margin H16/Hg2 bands use a shorter replay window. Fifteen boundary
+# and representative cases passed 100-sample balanced ABBA and stateful checks.
+TC01_LOW_MARGIN_OVERLAP_WARMUP_THRESHOLD = -0.75
+# Packed raw-gating paths use family-specific replay windows. These candidates
+# were validated separately from the precomputed-gating planner regions.
+TC01_PACKED_H16_OVERLAP_WARMUP_THRESHOLD = -0.75
+TC01_PACKED_H32_OVERLAP_WARMUP_THRESHOLD = -0.5
 # The table below was profiled only with the production CS=32 path. Keep this
 # value independent from CHUNK_SIZE so a future default change cannot silently
 # move the calibration to a different kernel geometry.
 TC02_SINGLE_SEQ_CALIBRATED_CHUNK_SIZE = 32
+# Chunk-aligned conservative suffixes from the complete tc02 OperatorsForge
+# real-gating ABBA sweep. The guard below only filters existing planner plans.
+_TC02_REAL_GATE_CP_MIN_TOKENS = {
+    8: {1: 448, 2: 2080, 3: 2272, 4: 7168, 5: 5024},
+    16: {1: 1504, 2: 4608, 3: 10496, 4: 14304},
+    24: {1: 2080, 2: 22688, 3: 11168},
+}
 # Empirical latency-model factor for optimal L_cp.
 # SM90 (78 SMs) used 3; keeping 3 for PPU1.5 — fewer CP segments, better CU fill.
 LCP_EMPIRICAL_FACTOR = 3
@@ -91,19 +111,14 @@ class _PlannerExecutionModel:
     represented by the existing architecture-specific, complete-API E2E
     thresholds.
 
-    Keeping ``architecture`` independent from ``fused_head_shards`` is
-    essential for the tc01 TFU admission model: its candidate has one fused
-    task per value head but must still use the tc01 segmentation and acceptance
-    policy rather than falling through to the tc02 route.  The candidate is a
-    conservative union with the legacy model: it may promote a legacy serial
-    decision, but never replaces an existing legacy CP plan or its layout.
+    ``architecture`` remains independent from ``fused_head_shards`` so tc01
+    and tc02 keep their architecture-specific planning routes.
     """
 
     architecture: str
     physical_cu_count: int
     fused_cu_count: int
     fused_head_shards: int
-    tc01_tfu_union_enabled: bool = False
     preprocessing_cu_count: Optional[int] = None
     preprocessing_model: str = "architecture_e2e_thresholds"
 
@@ -150,16 +165,357 @@ def _tc01_cp_min_tokens(num_v_heads: int) -> int:
     return 16384
 
 
-def _tc01_tfu_model_enabled() -> bool:
-    """Return whether the validated tc01 fused TFU model is enabled.
+def _tc01_real_gate_cp_allowed(
+    raw_cu: Tuple[int, ...],
+    chunk_size: int,
+    num_v_heads: int,
+) -> bool:
+    """Return the conservative tc01 CP suffix measured with real gating.
 
-    The conservative TFU admission union is the tc01 production default.  Only
-    the exact value ``"0"`` rolls back to the legacy planner; an unset variable
-    and every non-zero spelling keep the validated default enabled.  Keeping
-    the rollback check exact makes it safe to toggle in a live process without
-    accepting ambiguous false-like spellings.
+    The rule comes from an interleaved auto/serial sweep of every current GDN
+    prefill shape with Qwen3.8-Max layer-0 raw gating. Only existing legacy CP
+    plans are retained; this gate never promotes a shape that the calibrated
+    planner previously kept serial. Hg=2 and Hg=4 had equivalent boundaries.
     """
-    return os.environ.get(TC01_TFU_MODEL_ENV) != "0"
+    if chunk_size != CHUNK_SIZE or num_v_heads != 8:
+        return False
+    batch = len(raw_cu) - 1
+    max_seqlen = max(
+        raw_cu[index + 1] - raw_cu[index] for index in range(batch)
+    )
+    if batch == 1:
+        return max_seqlen >= 10000
+    if batch in (2, 3):
+        return max_seqlen >= 24000
+    return False
+
+
+def _tc01_balanced_segment_chunks(
+    num_chunks: Sequence[int], target_segments: int
+) -> Tuple[int, ...]:
+    """Return per-sequence chunk caps for a balanced segment count."""
+    splits = [1] * len(num_chunks)
+    while sum(splits) < target_segments:
+        index = max(
+            range(len(num_chunks)),
+            key=lambda i: (num_chunks[i] / splits[i], num_chunks[i], -i),
+        )
+        splits[index] += 1
+    return tuple(
+        max(1, _cdiv(chunks, split))
+        for chunks, split in zip(num_chunks, splits)
+    )
+
+
+def _tc01_low_margin_target_segments(
+    raw_cu: Tuple[int, ...],
+    num_v_heads: int,
+    num_k_heads: Optional[int],
+) -> Optional[int]:
+    """Return the separately validated low-margin H16/Hg2 geometry."""
+    if num_v_heads != 16 or num_k_heads != 2:
+        return None
+    batch = len(raw_cu) - 1
+    total_tokens = raw_cu[-1]
+    max_seqlen = max(
+        raw_cu[index + 1] - raw_cu[index] for index in range(batch)
+    )
+    if batch == 1 and 8192 <= total_tokens < 24000:
+        return 5
+    if (batch == 2 and total_tokens == 32768 and
+            70 * total_tokens <= 100 * max_seqlen < 75 * total_tokens):
+        return 7
+    if (batch == 3 and total_tokens == 32768 and
+            40 * total_tokens <= 100 * max_seqlen < 42 * total_tokens):
+        return 5
+    return None
+
+
+def _tc01_legacy_measured_target_segments(
+    raw_cu: Tuple[int, ...],
+    num_v_heads: int,
+    num_k_heads: Optional[int],
+) -> Optional[int]:
+    """Return the established precomputed-gating-compatible geometry."""
+    batch = len(raw_cu) - 1
+    total_tokens = raw_cu[-1]
+    max_seqlen = max(
+        raw_cu[index + 1] - raw_cu[index] for index in range(batch)
+    )
+    if num_v_heads == 16 and num_k_heads == 2:
+        if batch == 1 and total_tokens >= 24000:
+            return 7
+        if (batch == 2 and total_tokens >= 8192 and
+                4 * max_seqlen >= 3 * total_tokens):
+            return 5
+        if batch == 3 and 100 * max_seqlen >= 42 * total_tokens:
+            return 5 if total_tokens < 24000 else 9
+    if (num_v_heads == 32 and num_k_heads == 4 and batch == 3 and
+            total_tokens == 16384 and
+            100 * max_seqlen >= 79 * total_tokens):
+        return 4
+    return None
+
+
+# Exact measured overrides are keyed by topology and raw cumulative sequence
+# lengths, never by benchmark case ID. They cover isolated frontier winners
+# whose geometry or replay window cannot safely generalize.
+_TC01_PACKED_RAW_GATE_EXACT_SPECS = {
+    (16, 2, (0, 411, 3127)): (5, -0.75),
+    (32, 4, (0, 6397, 8192)): (4, -0.5),
+    (32, 4, (0, 6957, 8192)): (4, -0.3125),
+    (32, 4, (0, 7173, 8192)): (4, -0.25),
+    (32, 4, (0, 1093, 8301)): (4, -0.3125),
+    (32, 4, (0, 2186, 16603)): (5, -0.25),
+    (32, 4, (0, 13216, 16384)): (5, -0.25),
+    (32, 4, (0, 13515, 16384)): (5, -0.25),
+    (32, 4, (0, 13913, 16384)): (5, -0.25),
+    (32, 4, (0, 14309, 16384)): (5, -0.25),
+    (32, 4, (0, 1888, 14339, 16384)): (6, -0.25),
+    (32, 4, (0, 12521, 16384)): (5, -0.25),
+    (32, 4, (0, 4770, 12633, 21207)): (8, -0.34375),
+    (32, 4, (0, 15104, 16384)): (6, -0.25),
+    (32, 4, (0, 15900, 16384)): (5, -0.3125),
+    (32, 4, (0, 13118, 27535, 32768)): (11, -0.25),
+    (32, 4, (0, 4173, 13347, 23350)): (8, -0.25),
+    (32, 4, (0, 1988, 15095, 16384)): (6, -0.25),
+    (64, 8, (0, 27029, 32768)): (6, -0.0625),
+    (16, 2, (0, 897, 6810, 13258, 20650, 27919, 32559, 32768)):
+        (12, -1.25),
+}
+# This measured H32/Hg4 shape is faster on the serial production path. Keep it
+# out of the surrounding B2 bucket instead of encoding a case-specific branch.
+_TC01_PACKED_RAW_GATE_SERIAL_OVERRIDES = frozenset({
+    (32, 4, (0, 7950, 8192)),
+})
+
+
+def _tc01_packed_raw_gate_spec(
+    raw_cu: Tuple[int, ...],
+    num_v_heads: int,
+    num_k_heads: Optional[int],
+) -> Optional[Tuple[int, float]]:
+    """Return the measured packed raw-gating geometry and replay threshold.
+
+    The broad regions are bounded by the accepted P2 corpus topology and token
+    neighbors. Exact cumulative-length overrides retain isolated frontier
+    winners without making benchmark IDs part of production dispatch.
+    """
+    key = (num_v_heads, num_k_heads, raw_cu)
+    if key in _TC01_PACKED_RAW_GATE_SERIAL_OVERRIDES:
+        return None
+    exact = _TC01_PACKED_RAW_GATE_EXACT_SPECS.get(key)
+    if exact is not None:
+        return exact
+
+    batch = len(raw_cu) - 1
+    total_tokens = raw_cu[-1]
+    if num_v_heads == 16 and num_k_heads == 2:
+        if batch == 1 and total_tokens >= 3500:
+            return 5, TC01_PACKED_H16_OVERLAP_WARMUP_THRESHOLD
+        if batch == 2 and total_tokens >= 3864:
+            return 7, TC01_PACKED_H16_OVERLAP_WARMUP_THRESHOLD
+        if batch == 3 and total_tokens >= 4657:
+            return 9, TC01_PACKED_H16_OVERLAP_WARMUP_THRESHOLD
+        if batch == 4 and total_tokens >= 8192:
+            return 12, TC01_PACKED_H16_OVERLAP_WARMUP_THRESHOLD
+        if batch == 5 and total_tokens >= 32768:
+            return 12, TC01_PACKED_H16_OVERLAP_WARMUP_THRESHOLD
+        if batch == 6 and total_tokens >= 21998:
+            return 12, TC01_PACKED_H16_OVERLAP_WARMUP_THRESHOLD
+    if num_v_heads == 32 and num_k_heads == 4:
+        if ((batch == 2 and 8192 <= total_tokens <= 20975) or
+                (batch == 2 and total_tokens == 32768)):
+            return 6, TC01_PACKED_H32_OVERLAP_WARMUP_THRESHOLD
+        if batch == 3 and total_tokens in (8192, 16384, 32768):
+            return 6, TC01_PACKED_H32_OVERLAP_WARMUP_THRESHOLD
+        if batch == 4 and 16384 <= total_tokens <= 32768:
+            return 9, TC01_PACKED_H32_OVERLAP_WARMUP_THRESHOLD
+    return None
+
+
+def _tc01_measured_segment_chunks(
+    raw_cu: Tuple[int, ...],
+    chunk_size: int,
+    num_v_heads: int,
+    num_k_heads: Optional[int],
+    *,
+    use_packed_raw_spec: bool = False,
+) -> Optional[Tuple[int, ...]]:
+    """Return zero-regression tc01 geometries from the full P2 real-gate sweep.
+
+    The admitted H16/Hg2 long-tail regions use five, seven, or nine balanced
+    segments to repair serial grid underfill. One H32/Hg4 boundary shape uses
+    four segments. All admitted P2 cases passed stateful accuracy and beat
+    FLA-Triton in same-process balanced ABBA measurements on ZW810E.
+    """
+    if chunk_size != CHUNK_SIZE:
+        return None
+    batch = len(raw_cu) - 1
+    seqlens = [raw_cu[i + 1] - raw_cu[i] for i in range(batch)]
+    total_tokens = raw_cu[-1]
+    max_seqlen = max(seqlens)
+    target_segments = None
+    if use_packed_raw_spec:
+        packed_raw_spec = _tc01_packed_raw_gate_spec(
+            raw_cu, num_v_heads, num_k_heads
+        )
+        if packed_raw_spec is not None:
+            target_segments = packed_raw_spec[0]
+    if target_segments is None:
+        target_segments = _tc01_low_margin_target_segments(
+            raw_cu, num_v_heads, num_k_heads
+        )
+    if target_segments is None:
+        target_segments = _tc01_legacy_measured_target_segments(
+            raw_cu, num_v_heads, num_k_heads
+        )
+    if target_segments is None:
+        return None
+    num_chunks = [_cdiv(seqlen, chunk_size) for seqlen in seqlens]
+    return _tc01_balanced_segment_chunks(num_chunks, target_segments)
+
+
+def _tc01_overlap_warmup_allowed(
+    raw_cu: Tuple[int, ...],
+    chunk_size: int,
+    num_v_heads: int,
+    num_k_heads: Optional[int],
+    *,
+    use_packed_raw_spec: bool = False,
+) -> bool:
+    """Return zero-regression overlap regions from full real-gate ABBA sweeps.
+
+    Measured segment geometries cover the P1/P2 long-tail additions. The
+    remaining regions preserve the earlier planner-feasible 32K calibration.
+    Every admitted P2 case passed stateful accuracy and beat FLA-Triton.
+    """
+    if chunk_size != CHUNK_SIZE or num_k_heads is None:
+        return False
+    if _tc01_measured_segment_chunks(
+            raw_cu, chunk_size, num_v_heads, num_k_heads,
+            use_packed_raw_spec=use_packed_raw_spec) is not None:
+        return True
+    if raw_cu[-1] != 32768:
+        return False
+    batch = len(raw_cu) - 1
+    max_seqlen = max(
+        raw_cu[index + 1] - raw_cu[index] for index in range(batch)
+    )
+    if batch == 2:
+        return (
+            (num_v_heads == 16 and num_k_heads in (2, 4, 8) and
+             max_seqlen >= 27826) or
+            (num_v_heads == 48 and num_k_heads == 16) or
+            (num_v_heads == 64 and
+             (num_k_heads == 8 or
+              (num_k_heads == 16 and max_seqlen >= 24817)))
+        )
+    if batch == 3:
+        return (
+            (num_v_heads == 16 and num_k_heads in (2, 4, 8) and
+             max_seqlen <= 15900) or
+            (num_v_heads == 32 and num_k_heads in (4, 8, 16) and
+             max_seqlen >= 17039) or
+            (num_v_heads == 48 and num_k_heads == 16) or
+            (num_v_heads == 64 and num_k_heads in (8, 16))
+        )
+    if batch == 4:
+        return (num_v_heads == 16 and num_k_heads in (2, 4, 8) and
+                max_seqlen <= 14293)
+    if batch == 5:
+        return num_v_heads == 32 and num_k_heads in (4, 8, 16)
+    return False
+
+
+def tc01_overlap_warmup_threshold(
+    raw_cu_seqlens: torch.Tensor,
+    raw_cu: Tuple[int, ...],
+    chunk_size: int,
+    num_v_heads: int,
+    num_k_heads: Optional[int],
+    *,
+    use_raw_gating: bool,
+    indexed_state: bool,
+    has_initial_state: bool,
+) -> Optional[float]:
+    """Return the production threshold for a race-free tc01 serving ABI."""
+    # Raw gating can safely use the established prepare/correct fallback when a
+    # non-indexed initial state is present. Only indexed state enables overlap
+    # replay; precomputed gating retains the previous conservative ABI guard.
+    if has_initial_state and not indexed_state and not use_raw_gating:
+        return None
+    if _device_execution_model(raw_cu_seqlens).architecture != "tc01":
+        return None
+    packed_raw_spec = _tc01_packed_raw_gate_spec(
+        raw_cu, num_v_heads, num_k_heads
+    )
+    measured_shape = _tc01_measured_segment_chunks(
+        raw_cu, chunk_size, num_v_heads, num_k_heads
+    ) is not None
+    # Raw-only specs never alter precomputed-gating admission or geometry.
+    if not use_raw_gating and not measured_shape:
+        return None
+    if not _tc01_overlap_warmup_allowed(
+            raw_cu, chunk_size, num_v_heads, num_k_heads,
+            use_packed_raw_spec=use_raw_gating):
+        return None
+    if use_raw_gating and packed_raw_spec is not None:
+        return packed_raw_spec[1]
+    if _tc01_low_margin_target_segments(
+            raw_cu, num_v_heads, num_k_heads) is not None:
+        return TC01_LOW_MARGIN_OVERLAP_WARMUP_THRESHOLD
+    if (num_v_heads == 16 and num_k_heads == 2 and len(raw_cu) == 2 and
+            24000 <= raw_cu[-1] < 30000):
+        return TC01_B1_OVERLAP_WARMUP_THRESHOLD
+    return TC01_OVERLAP_WARMUP_THRESHOLD
+
+
+def _tc02_real_gate_cp_allowed(
+    raw_cu: Tuple[int, ...],
+    chunk_size: int,
+    num_v_heads: int,
+    num_cp_segments: int,
+) -> bool:
+    """Return the conservative tc02 CP region measured with real gating.
+
+    This is a final admission filter over plans produced by the existing tc02
+    model. It neither admits a new shape nor changes segment geometry. The
+    aligned suffixes cover stable length regions; four integer long-tail
+    rectangles retain additional underfilled packed winners without embedding
+    corpus-specific floating-point effective-batch values.
+    """
+    if num_v_heads < 8:
+        return True
+    if chunk_size != TC02_SINGLE_SEQ_CALIBRATED_CHUNK_SIZE:
+        return False
+    batch = len(raw_cu) - 1
+    seqlens = [
+        raw_cu[index + 1] - raw_cu[index] for index in range(batch)
+    ]
+    max_seqlen = max(seqlens)
+    threshold = _TC02_REAL_GATE_CP_MIN_TOKENS.get(
+        num_v_heads, {}
+    ).get(batch)
+    if threshold is not None and max_seqlen >= threshold:
+        return True
+
+    num_chunks = [_cdiv(length, chunk_size) for length in seqlens]
+    total_chunks = sum(num_chunks)
+    max_chunks = max(num_chunks)
+    if num_v_heads == 8 and batch == 4:
+        return (
+            max_seqlen >= 3680 and
+            2 * total_chunks <= 7 * max_chunks and
+            num_cp_segments >= 14
+        )
+    if num_v_heads == 16 and batch == 3:
+        return max_seqlen >= 5280 and total_chunks <= 2 * max_chunks
+    if num_v_heads == 24 and batch == 2:
+        return max_seqlen >= 6400 and 5 * total_chunks <= 7 * max_chunks
+    if num_v_heads == 24 and batch == 3:
+        return max_seqlen >= 6560 and 2 * total_chunks <= 3 * max_chunks
+    return False
 
 
 def _architecture_from_compute_capability(major: int, minor: int) -> str:
@@ -179,33 +535,13 @@ def _planner_execution_model_from_properties(
     major: int,
     minor: int,
     physical_cu_count: int,
-    tc01_tfu_model: Optional[bool] = None,
 ) -> _PlannerExecutionModel:
-    """Build a planner model without conflating architecture and CTA shards.
-
-    The tc01 default reflects the current production fused kernel: its MMA
-    instructions select the 20-TFU-CU domain and NGRP=2 is internal to one CTA,
-    so it contributes one head task.  Dispatch uses that model only as an
-    additive CP admission candidate after the calibrated legacy model returns
-    serial; existing legacy CP plans and layouts remain byte-for-byte exact.
-    Exact environment value ``"0"`` restores the complete legacy model.  tc02
-    ignores this tc01-only rollback switch.
-    """
+    """Build the architecture-specific physical-CU planner model."""
     architecture = _architecture_from_compute_capability(major, minor)
     if physical_cu_count <= 0:
         raise RuntimeError(
             "CUDA device properties must expose a positive "
             "multi_processor_count"
-        )
-    if tc01_tfu_model is None:
-        tc01_tfu_model = _tc01_tfu_model_enabled()
-    if architecture == "tc01" and tc01_tfu_model:
-        return _PlannerExecutionModel(
-            architecture=architecture,
-            physical_cu_count=physical_cu_count,
-            fused_cu_count=TC01_TFU_PROCESSOR_COUNT,
-            fused_head_shards=1,
-            tc01_tfu_union_enabled=True,
         )
     return _PlannerExecutionModel(
         architecture=architecture,
@@ -232,13 +568,7 @@ def _cuda_device_properties(device_index: int) -> Tuple[int, int, int]:
 
 
 def _cuda_execution_model(device_index: int) -> _PlannerExecutionModel:
-    """Return the current model while caching only immutable device facts.
-
-    The environment-controlled tc01 rollback selection is deliberately
-    evaluated on every planner call.  Caching it with device properties would
-    make toggling the switch in one process silently reuse the first mode
-    forever.  The selected execution model remains part of the plan cache key.
-    """
+    """Return the execution model from cached immutable device facts."""
     major, minor, num_cu = _cuda_device_properties(device_index)
     return _planner_execution_model_from_properties(major, minor, num_cu)
 
@@ -449,19 +779,17 @@ def _calc_tc01_plan(
     fused_head_shards: int,
     device,
     seqlen_dtype,
+    num_k_heads: Optional[int] = None,
+    use_packed_raw_spec: bool = False,
 ) -> Tuple[bool, Optional[torch.Tensor], Optional[torch.Tensor],
            Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Build the verified tc01 plan without changing tc02 calibration.
 
-    The legacy tc01 model uses the two-shard/physical-CU assumption.  The
-    default conservative union may separately evaluate one head task on the 20
-    TFU CUs, but only after this function returns serial; exact environment
-    value ``"0"`` suppresses that second evaluation.  Both evaluations use the original
-    power-of-two segment cap, fixed-size (possibly short-tail) boundaries,
-    wave-based occupancy gates, and architecture-specific length floors.
-    Keeping those preprocessing-related floors unchanged isolates the fused
-    execution-domain hypothesis, while tc02's balanced segments and newer
-    measured thresholds remain byte-for-byte on their existing path.
+    The tc01 model uses the established two-shard/physical-CU assumption and
+    the original power-of-two segment cap, fixed-size (possibly short-tail)
+    boundaries, wave-based occupancy gates, and architecture-specific length
+    floors. tc02's balanced segments and measured thresholds remain on their
+    existing path.
     """
     raw_batch = len(raw_cu) - 1
     seqlens = [raw_cu[i + 1] - raw_cu[i] for i in range(raw_batch)]
@@ -476,17 +804,27 @@ def _calc_tc01_plan(
                   * LCP_EMPIRICAL_FACTOR)
     )
     max_local_chunks = max(max_local_chunks, 4)
+    segment_chunks = _tc01_measured_segment_chunks(
+        raw_cu, chunk_size, num_v_heads, num_k_heads,
+        use_packed_raw_spec=use_packed_raw_spec,
+    )
+    measured_geometry = segment_chunks is not None
+    if segment_chunks is None:
+        segment_chunks = (max_local_chunks,) * raw_batch
+    else:
+        max_local_chunks = max(segment_chunks)
 
     cp_cu_seqlens = []
     ht_mask = []
     seq_map_c2r = []
     seq_map_r2c = [0]
-    max_local_tokens = max_local_chunks * chunk_size
-    for i, chunks in enumerate(num_chunks):
+    for i, (chunks, local_chunks) in enumerate(
+            zip(num_chunks, segment_chunks)):
         start = raw_cu[i]
         end = raw_cu[i + 1]
-        if chunks > max_local_chunks:
+        if chunks > local_chunks:
             # tc01 was calibrated with fixed-size segments and a short tail.
+            max_local_tokens = local_chunks * chunk_size
             while start < end:
                 cp_cu_seqlens.append(start)
                 ht_mask.append(False)
@@ -575,7 +913,7 @@ def _calc_tc01_plan(
          min_chunks <= 22 and
          5 * raw_wave_chunks < 6 * cp_wave_chunks)
     )
-    use_cp = (
+    use_cp = measured_geometry or (
         occupancy_ok and has_split and
         max_seqlen >= _tc01_cp_min_tokens(H) and
         not tc01_h16_single_short and
@@ -595,18 +933,32 @@ def _calc_tc01_plan(
     return use_cp, cp_cu_seqlens, seq_map_r2c, seq_map_c2r, ht_mask
 
 
+def _tc01_serial_lpt_allowed(
+    raw_cu: Tuple[int, ...], chunk_size: int,
+    num_v_heads: int, num_k_heads: Optional[int],
+) -> bool:
+    return (chunk_size == 32 and num_v_heads == 16 and num_k_heads == 2
+            and len(raw_cu) in (3, 4) and 16384 <= raw_cu[-1] <= 32768)
+
+
 def calc_cp_seqs(
     raw_cu_seqlens: torch.Tensor,
     chunk_size: int,
     num_v_heads: int,
     raw_cu: Optional[Tuple[int, ...]] = None,
     num_k_heads: Optional[int] = None,
+    tc01_force_candidate: bool = False,
+    tc01_enable_overlap_candidate: bool = False,
+    tc01_packed_raw_gate: bool = False,
 ) -> Tuple[bool, Optional[torch.Tensor], Optional[torch.Tensor],
            Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Decide CP and compute the sub-sequence split for the active PPU.
 
     Returns (use_cp, cp_cu_seqlens, seq_map_r2c, seq_map_c2r, ht_mask).
-    Tensors are None when CP is disabled.
+    Tensors are None when CP is disabled. ``tc01_force_candidate`` bypasses only
+    the production real-gate admission rule; the candidate planner still rejects
+    shapes for which it cannot form a useful split. The overlap candidate is
+    admitted only when the caller can execute its race-free state ABI.
     """
     if _sanity.enabled():
         _sanity.check(chunk_size > 0 and num_v_heads > 0,
@@ -640,6 +992,9 @@ def calc_cp_seqs(
         chunk_size,
         num_v_heads,
         num_k_heads,
+        tc01_force_candidate,
+        tc01_enable_overlap_candidate,
+        tc01_packed_raw_gate,
         execution_model,
         raw_cu,
     )
@@ -657,22 +1012,26 @@ def calc_cp_seqs(
             return cached_plan
 
     if execution_model.architecture == "tc01":
-        # The calibrated legacy decision is authoritative.  In particular, do
-        # not let the 20-TFU model withdraw CP or replace its segment topology:
-        # paired 810E E2E showed that the extra legacy segments can shorten the
-        # recurrent critical path even though fused MMA executes on 20 CUs.
-        plan = _calc_tc01_plan(
-            raw_cu, chunk_size, num_v_heads,
-            execution_model.physical_cu_count, 2,
-            device, seqlen_dtype)
-        if (not plan[0] and
-                execution_model.tc01_tfu_union_enabled):
-            # Conservative union: the TFU execution-domain model is an
-            # additive CP admission path for legacy-serial shapes only.
+        # Keep only the measured real-gating suffix of existing legacy plans.
+        # The former 20-TFU additive candidate regressed every newly admitted
+        # shape in the complete OperatorsForge inventory and is not evaluated.
+        if (not tc01_force_candidate and tc01_packed_raw_gate and
+                _tc01_serial_lpt_allowed(
+                    raw_cu, chunk_size, num_v_heads, num_k_heads)):
+            plan = (False, None, None, None, None)
+        elif (tc01_force_candidate or
+                _tc01_real_gate_cp_allowed(raw_cu, chunk_size, num_v_heads) or
+                (tc01_enable_overlap_candidate and
+                 _tc01_overlap_warmup_allowed(
+                     raw_cu, chunk_size, num_v_heads, num_k_heads,
+                     use_packed_raw_spec=tc01_packed_raw_gate))):
             plan = _calc_tc01_plan(
                 raw_cu, chunk_size, num_v_heads,
-                fused_cu_count, fused_head_shards,
-                device, seqlen_dtype)
+                execution_model.physical_cu_count, 2,
+                device, seqlen_dtype, num_k_heads=num_k_heads,
+                use_packed_raw_spec=tc01_packed_raw_gate)
+        else:
+            plan = (False, None, None, None, None)
         ready_event, active_streams = _plan_ready_event(plan)
         # Publish only the complete plan and its allocator/stream-lifetime
         # metadata.  This is the same bounded value-keyed LRU used by tc02.
@@ -1056,8 +1415,12 @@ def calc_cp_seqs(
         min_tokens = (_single_seq_cp_min_tokens(
                           H, num_k_heads, max_seqlen, chunk_size)
                       if raw_batch == 1 else cp_min_tokens(H))
-    use_cp = (occupancy_ok and has_split and
-              max_seqlen >= min_tokens)
+    use_cp = (
+        occupancy_ok and has_split and max_seqlen >= min_tokens and
+        _tc02_real_gate_cp_allowed(
+            raw_cu, chunk_size, H, num_cp_segments
+        )
+    )
 
     if use_cp:
         cp_cu_seqlens = torch.tensor(cp_cu_seqlens, dtype=seqlen_dtype, device=device)

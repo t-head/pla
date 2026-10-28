@@ -128,7 +128,8 @@ torch::Tensor fused_sigmoid_gating_delta_rule_forward_k_last(
     std::optional<std::variant<torch::Tensor, int64_t>> cache_steps_or_num_accept,
     std::optional<torch::Tensor> retrieve_parent_token,
     std::optional<float> lower_bound,
-    std::optional<bool> is_sglang
+    std::optional<bool> is_sglang,
+    std::optional<torch::Tensor> out
 );
 
 // Defined next to the kernel entry point: does a call with this shape take the
@@ -300,7 +301,8 @@ std::tuple<torch::Tensor, torch::Tensor> fused_recurrent_kda(
         num_accepted,   // cache_steps_or_num_accept
         std::nullopt,   // retrieve_parent_token (sglang-only eagle tree)
         lower_bound_f,
-        is_sglang
+        is_sglang,
+        std::nullopt    // out: copied into the caller's buffer below
     );
 
     if (out.has_value()) {

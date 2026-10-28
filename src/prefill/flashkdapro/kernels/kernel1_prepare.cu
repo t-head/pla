@@ -332,6 +332,11 @@ __global__ void __launch_bounds__(NThreads) flashkda_prepare_kernel(
     half_t* sL = smem.main.phase_b.L.data;
     half_t* sINV = smem.main.phase_b.INV.data;
     half_t* sPow = smem.pow.data;
+#if defined(FLASHKDA_ARCH_150)
+    // The Neumann scratch is unused until after the diagonal is consumed.
+    // Reuse its first 16 BF16 entries without growing shared memory or the ABI.
+    BF16* sMqkDiag = reinterpret_cast<BF16*>(sPow);
+#endif
     half_t* sTmp = sL;
     BF16* sMqk = smem.main.phase_b.Mqk.data;
 
@@ -408,11 +413,28 @@ __global__ void __launch_bounds__(NThreads) flashkda_prepare_kernel(
                 ks += __shfl_xor_sync(0xFFFFFFFF, ks, d);
             }
             float qn = rsqrtf(qs + 1e-6f), kn = rsqrtf(ks + 1e-6f);
+#if defined(FLASHKDA_ARCH_150)
+            float qk_dot = 0.f;
+#endif
             #pragma unroll
             for (int i = 0; i < EPT; ++i) {
-                sq[row * D + col + i] = BF16(qv[i] * qn);
-                sk[row * D + col + i] = BF16(kv[i] * kn);
+                const BF16 nq = BF16(qv[i] * qn);
+                const BF16 nk = BF16(kv[i] * kn);
+                sq[row * D + col + i] = nq;
+                sk[row * D + col + i] = nk;
+#if defined(FLASHKDA_ARCH_150)
+                qk_dot += fk::bf16_to_f32(nq) * fk::bf16_to_f32(nk);
+#endif
             }
+#if defined(FLASHKDA_ARCH_150)
+            // On the diagonal the gate factors cancel exactly. Accumulate the
+            // normalized BF16 operands in FP32 before applying scale, rather
+            // than multiplying separately rounded q*exp(g) and k*exp(-g).
+            #pragma unroll
+            for (int d = 8; d >= 1; d >>= 1)
+                qk_dot += __shfl_xor_sync(0xFFFFFFFF, qk_dot, d);
+            if (col == 0) sMqkDiag[row] = BF16(qk_dot * scale);
+#endif
         }
     }
     // --- 3. gate activation + cumsum (threads 0..127 = one column each) ---
@@ -493,6 +515,9 @@ __global__ void __launch_bounds__(NThreads) flashkda_prepare_kernel(
         sL[i * CHUNK + j] = x;
         // Mqk: keep lower triangle (i>=j), zero strictly-upper
         if (i < j) sMqk[i * CHUNK + j] = BF16(0.f);
+#if defined(FLASHKDA_ARCH_150)
+        if (i == j) sMqk[i * CHUNK + j] = sMqkDiag[i];
+#endif
         // The split front leaves INV construction to its one-warp MMA tail.
         if constexpr (!FmaFront)
             sINV[i * CHUNK + j] = (i == j) ? half_t(1.f) : half_t(-float(x));

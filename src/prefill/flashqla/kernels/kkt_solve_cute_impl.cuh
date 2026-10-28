@@ -736,8 +736,7 @@ __device__ __forceinline__ void kkt_compute_tri_quad_tc01(
     Element* A_out, const float* Gram, const float* beta,
     float* A_fp32, int chunk_start, int actual, int head,
     int num_tokens, int H, int lane) {
-    for (int idx = lane; idx < KKT_CS * KKT_FP32_LD; idx += 32)
-        A_fp32[idx] = 0.0f;
+    // Active column groups overwrite every strict-lower element before use.
     A_fp32[lane * KKT_FP32_LD + lane] = 1.0f;
     __syncwarp();
 
@@ -746,7 +745,7 @@ __device__ __forceinline__ void kkt_compute_tri_quad_tc01(
     for (int row = 0; row < KKT_CS; ++row) {
         if (row < actual) {
             CUTE_UNROLL
-            for (int col_group = 0; col_group < 4; ++col_group) {
+            for (int col_group = 0; col_group < (row + 7) / 8; ++col_group) {
                 const int col = (lane >> 2) + col_group * 8;
                 float sum = 0.0f;
                 if (col < row) {
@@ -766,7 +765,8 @@ __device__ __forceinline__ void kkt_compute_tri_quad_tc01(
     for (int idx = lane; idx < actual * KKT_CS; idx += 32) {
         const int row = idx / KKT_CS;
         const int col = idx % KKT_CS;
-        if ((chunk_start + row) < num_tokens) {
+        if ((H != 32 || col <= row) &&
+            (chunk_start + row) < num_tokens) {
             A_out[((int64_t)(chunk_start + row)) * H * KKT_CS +
                   head * KKT_CS + col] =
                 fq::float_to_element<Element>(A_fp32[row * KKT_FP32_LD + col]);
@@ -1567,8 +1567,9 @@ void FLASHQLA_KKT_LAUNCHER(
         !single_sequence && heads_per_k == 4 &&
         2LL * quad_tasks > 5LL * nsm &&
         quad_tasks <= 3LL * nsm + H / 4;
-    const bool use_oct = FLASHQLA_KKT_HOST_ARCH_100 && single_sequence &&
-        heads_per_k == 8 && oct_tasks >= (nsm + 1) / 2;
+    const bool use_oct = FLASHQLA_KKT_HOST_ARCH_100 &&
+        heads_per_k == 8 && oct_tasks >= (nsm + 1) / 2 &&
+        (single_sequence || H == 16);
     const bool use_quad = !use_oct && FLASHQLA_KKT_HOST_ARCH_100 &&
         (single_sequence || !packed_quad_hole) &&
         heads_per_k % 4 == 0 && quad_tasks >= quad_min_tasks;

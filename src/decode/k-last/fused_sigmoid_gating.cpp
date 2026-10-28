@@ -74,7 +74,8 @@ torch::Tensor fused_sigmoid_gating_delta_rule_forward_k_last(
     std::optional<std::variant<torch::Tensor, int64_t>> cache_steps_or_num_accept,
     std::optional<torch::Tensor> retrieve_parent_token,
     std::optional<float> lower_bound,
-    std::optional<bool> is_sglang
+    std::optional<bool> is_sglang,
+    std::optional<torch::Tensor> out
 );
 
 torch::Tensor fused_sigmoid_gating_delta_rule_forward_k_last_packed(
@@ -108,7 +109,8 @@ torch::Tensor fused_sigmoid_gating_delta_rule_forward_k_last_tunable(
     std::optional<torch::Tensor> retrieve_parent_token,
     int bv, int wn, int sn, int hv_per_cta,
     std::optional<bool> is_sglang,
-    std::optional<float> lower_bound
+    std::optional<float> lower_bound,
+    std::optional<torch::Tensor> out
 );
 
 torch::Tensor fused_sigmoid_gating_delta_rule_forward_k_last_packed_tunable(
@@ -185,7 +187,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("cache_steps_or_num_accept"),
           py::arg("retrieve_parent_token"),
           py::arg("lower_bound") = py::none(),
-          py::arg("is_sglang") = py::none());
+          py::arg("is_sglang") = py::none(),
+          py::arg("out") = py::none());
     m.def("fused_sigmoid_gating_delta_rule_forward_k_last_packed", &fused_sigmoid_gating_delta_rule_forward_k_last_packed,
           "k-last packed format forward",
           py::arg("mixed_qkv"), py::arg("a"), py::arg("b"),
@@ -215,7 +218,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("retrieve_parent_token"),
           py::arg("bv"), py::arg("wn"), py::arg("sn"), py::arg("hv_per_cta"),
           py::arg("is_sglang") = py::none(),
-          py::arg("lower_bound") = py::none());
+          py::arg("lower_bound") = py::none(),
+          py::arg("out") = py::none());
     m.def("fused_sigmoid_gating_delta_rule_forward_k_last_packed_tunable", &fused_sigmoid_gating_delta_rule_forward_k_last_packed_tunable,
           "k-last packed format forward with explicit template params for auto-tuning",
           py::arg("mixed_qkv"), py::arg("a"), py::arg("b"),
