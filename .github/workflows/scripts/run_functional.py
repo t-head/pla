@@ -18,7 +18,7 @@ from zipfile import ZipFile
 from functional_cases import BASELINE, cases
 
 ROOT = Path(__file__).resolve().parents[3]
-BOARDS = ("OAM-810E", "ZW-M890P")
+BOARDS = ("ZW-810E", "ZW-M890P")
 PHASES = ("decode", "prefill")
 EXTENSION_DIRS = {
     "pla/decode", "pla/decode/gdn/v_last", "pla/decode/kda_mtp_sglang",

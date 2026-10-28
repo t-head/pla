@@ -20,7 +20,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        board: [OAM-810E, ZW-M890P]
+        board: [ZW-810E, ZW-M890P]
     env:
       REPORT_ROOT: /wl_nas/devops/${{ github.repository_id }}-${{ github.run_id }}-${{ github.run_attempt }}/pla/${{ matrix.board }}
       WORKER_REPORT_ROOT: /mnt/wl_nas/devops/${{ github.repository_id }}-${{ github.run_id }}-${{ github.run_attempt }}/pla/${{ matrix.board }}
@@ -42,7 +42,7 @@ jobs:
         run: python3 .github/workflows/scripts/test_ci_functional.py
       - name: Build and Test on PPU
         id: ppu-test
-        uses: t-head/ppu-scheduler-action@main
+        uses: t-head/ci-infra/cluster-run@main
         with:
           image: ${{ env.SAIL_IMAGE }}
           nnodes: 0

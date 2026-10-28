@@ -157,7 +157,7 @@ class FunctionalCITests(unittest.TestCase):
         with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(self.root / "github.md")}):
             with redirect_stdout(io.StringIO()):
                 self.assertEqual(runner.summarize(self.root), 0)
-        self.assertIn("OAM-810E", (self.root / "github.md").read_text())
+        self.assertIn("ZW-810E", (self.root / "github.md").read_text())
         self.assertIn("ZW-M890P", (self.root / "github.md").read_text())
 
     def test_board_summary_does_not_require_other_board(self):
@@ -201,7 +201,7 @@ class FunctionalCITests(unittest.TestCase):
         workflow = (runner.ROOT / ".github/workflows/pla-basic-test-ppu.yml").read_text()
         header = workflow.split("  build-test:\n", 1)[1].split("    steps:\n", 1)[0]
         self.assertIn("name: Build & Test (${{ matrix.board }})", header)
-        self.assertIn("board: [OAM-810E, ZW-M890P]", header)
+        self.assertIn("board: [ZW-810E, ZW-M890P]", header)
         self.assertIn("fail-fast: false", header)
         self.assertIn("runs-on: k8s-runner-group-cpu-thead", header)
         self.assertNotIn("needs:", header)
@@ -209,7 +209,7 @@ class FunctionalCITests(unittest.TestCase):
         self.assertIn("image: ghcr.io/actions/actions-runner:latest", header)
         self.assertNotIn("sdk2.2.0", header)
         self.assertIn("timeout-minutes: 900", header)
-        self.assertEqual(workflow.count("uses: t-head/ppu-scheduler-action@main"), 1)
+        self.assertEqual(workflow.count("uses: t-head/ci-infra/cluster-run@main"), 1)
         worker = workflow.split("          command: |\n", 1)[1].split("      - name:", 1)[0]
         self.assertEqual(worker.count("python setup.py "), 1)
         self.assertIn("python setup.py bdist_wheel", worker)
@@ -301,7 +301,7 @@ class FunctionalCITests(unittest.TestCase):
                     "children": [runner.item(status.lower(), status)]}
                    for status in ("PASS", "FAIL", "SKIP")]
         records.append(runner.item("pending", "NOT_RUN"))
-        report = {"board": "OAM-810E", "phase": "decode", "results": records}
+        report = {"board": "ZW-810E", "phase": "decode", "results": records}
         runner.save_report(report, self.root)
         for name in ("summary.md", "results.json", "junit.xml"):
             self.assertTrue((self.root / name).read_text().isascii())
@@ -321,7 +321,7 @@ class FunctionalCITests(unittest.TestCase):
                 self.assertEqual(runner.summarize(self.root), 1)
 
     def test_pending_groups_are_not_reported_as_passed(self):
-        report = {"board": "OAM-810E", "phase": "decode",
+        report = {"board": "ZW-810E", "phase": "decode",
                   "results": [runner.item("not-started", "NOT_RUN")]}
         runner.save_report(report, self.root)
         self.assertEqual(ET.parse(self.root / "junit.xml").getroot().get("failures"), "1")
