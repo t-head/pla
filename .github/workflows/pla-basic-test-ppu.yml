@@ -20,7 +20,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        board: [ZW-810E, ZW-M890P]
+        board: [OAM-810E, ZW-M890P]
     env:
       REPORT_ROOT: /wl_nas/devops/${{ github.repository_id }}-${{ github.run_id }}-${{ github.run_attempt }}/pla/${{ matrix.board }}
       WORKER_REPORT_ROOT: /mnt/wl_nas/devops/${{ github.repository_id }}-${{ github.run_id }}-${{ github.run_attempt }}/pla/${{ matrix.board }}
