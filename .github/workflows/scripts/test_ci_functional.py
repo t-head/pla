@@ -209,7 +209,7 @@ class FunctionalCITests(unittest.TestCase):
         self.assertIn("image: ghcr.io/actions/actions-runner:latest", header)
         self.assertNotIn("sdk2.2.0", header)
         self.assertIn("timeout-minutes: 900", header)
-        self.assertEqual(workflow.count("uses: t-head/ppu-scheduler-action@main"), 1)
+        self.assertEqual(workflow.count("uses: t-head/ci-infra/cluster-run@main"), 1)
         worker = workflow.split("          command: |\n", 1)[1].split("      - name:", 1)[0]
         self.assertEqual(worker.count("python setup.py "), 1)
         self.assertIn("python setup.py bdist_wheel", worker)

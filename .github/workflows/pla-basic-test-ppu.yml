@@ -42,7 +42,7 @@ jobs:
         run: python3 .github/workflows/scripts/test_ci_functional.py
       - name: Build and Test on PPU
         id: ppu-test
-        uses: t-head/ppu-scheduler-action@main
+        uses: t-head/ci-infra/cluster-run@main
         with:
           image: ${{ env.SAIL_IMAGE }}
           nnodes: 0
