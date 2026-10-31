@@ -43,6 +43,11 @@ using Token = hggcError_t (*)(const void*, const void*, const float*, const uint
                              void*, float*, void*, float, const int32_t*, int, int, int, hggcStream_t);
 using Inter = hggcError_t (*)(const void*, const void*, const float*, const uint16_t*, int64_t, const float*,
                              void*, void*, float, const int32_t*, const int32_t*, int, int, int, int, hggcStream_t);
+using TokenL2 = hggcError_t (*)(const void*, const void*, void*, void*, const float*, const uint16_t*, int64_t,
+                               void*, float*, void*, void*, void*, void*, float, const int32_t*, int, int, hggcStream_t);
+using InterPrepared = hggcError_t (*)(const void*, const void*, const float*, const uint16_t*, int64_t,
+                                     float*, void*, void*, void*, void*, void*, float, const int32_t*,
+                                     const int32_t*, int, int, int, int, hggcStream_t);
 using Recompute = hggcError_t (*)(const void*, const void*, const uint16_t*, int64_t, const void*, const float*,
                                  void*, void*, void*, const int32_t*, const int32_t*, int, int, int, int, hggcStream_t);
 using Recurrence = hggcError_t (*)(const void*, const void*, const void*, void*, const float*, float*,
@@ -64,9 +69,21 @@ struct Launchers {
   Recurrence recurrence;
   Output output;
   CpRecurrenceOutput cp_recurrence_output;
+  // Optional fused stages are present only in the matching static head adapter.
+  TokenL2 token_l2;
+  InterPrepared inter_solve_prepared;
 };
 const Launchers& launchers_for(int heads);
 }  // namespace fla_runtime
+
+extern "C" hggcError_t launch_fla_inter_prepared__fla_h4(
+    const void*, const void*, const float*, const uint16_t*, int64_t,
+    float*, void*, void*, void*, void*, void*, float, const int32_t*,
+    const int32_t*, int, int, int, int, hggcStream_t);
+extern "C" hggcError_t launch_fla_inter_prepared__fla_h8(
+    const void*, const void*, const float*, const uint16_t*, int64_t,
+    float*, void*, void*, void*, void*, void*, float, const int32_t*,
+    const int32_t*, int, int, int, int, hggcStream_t);
 
 hggcError_t launch_fla_l2norm_bf16_d128_bt16(const void*, void*, int64_t, hggcStream_t);
 hggcError_t launch_fla_l2norm2_bf16_d128_bt16(const void*, void*, const void*, void*, int64_t, hggcStream_t);
