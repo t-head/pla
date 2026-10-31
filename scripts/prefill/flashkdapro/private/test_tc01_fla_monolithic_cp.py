@@ -335,9 +335,146 @@ def check_graph(module, heads, seed):
         raise AssertionError("warm CP Graph replay did not rewrite the captured output")
 
 
+def device_trusted_reference(heads, tokens, length):
+    # H4 long device buckets launch a fixed CP5 graph. Inside the trusted CP5
+    # AUTO bucket they must match trusted AUTO bit for bit; all other effective
+    # lengths keep segment zero only and must match the serial path.
+    return heads == 4 and tokens in (16384, 32768) and 12288 <= length <= 65536
+
+
+def check_device_target_graph(module, heads, tokens, dtype, cu_dtype):
+    data = inputs(tokens, heads, 20261028 + heads)
+    q, k, v, g, beta, a_log, dt_bias, original_cu = data
+    cu = original_cu.to(cu_dtype)
+    indices = torch.tensor([1], device="cuda", dtype=torch.int32)
+    initial = (torch.randn((4, heads, 128, 128), device="cuda") * 0.02).to(dtype)
+    pool, serial_pool = initial.clone(), initial.clone()
+    output, serial_output = torch.empty_like(q), torch.empty_like(q)
+    keys = ("PLA_FLASHKDA_TC01_FLA_CP", "PLA_FLASHKDA_TC01_FLA_CP_ALGO")
+    saved = {key: os.environ.get(key) for key in keys}
+
+    def invoke(out, state):
+        module.forward(q, k, v, g, beta, a_log, dt_bias, out, None, -5.0,
+                       None, None, cu, state, indices, None)
+
+    try:
+        for key in keys:
+            os.environ.pop(key, None)
+        invoke(output, pool)
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            invoke(output, pool)
+        side.synchronize()
+        captured = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(captured, stream=side):
+            invoke(output, pool)
+        lengths = (tokens, tokens // 2 + 1, 65, 0, 19, tokens - 1, tokens)
+        for step, length in enumerate(lengths):
+            slot = 1 + step % 2
+            cu.copy_(torch.tensor([0, length], device="cuda", dtype=cu_dtype))
+            indices.fill_(slot)
+            serial_pool.copy_(initial)
+            serial_output.fill_(float("nan"))
+            if device_trusted_reference(heads, tokens, length):
+                module.forward(q, k, v, g, beta, a_log, dt_bias, serial_output, None, -5.0,
+                               None, None, cu, serial_pool, indices, (0, length))
+            else:
+                os.environ[keys[0]] = "off"
+                invoke(serial_output, serial_pool)
+                os.environ.pop(keys[0], None)
+            for replay in (False, True, True):
+                pool.copy_(initial)
+                output.fill_(float("nan"))
+                if replay:
+                    captured.replay()
+                else:
+                    invoke(output, pool)
+                torch.cuda.synchronize()
+                label = (heads, tokens, dtype, cu_dtype, length, slot, replay)
+                if not torch.equal(output, serial_output) or not torch.equal(pool, serial_pool):
+                    raise AssertionError(f"device AUTO/reference mismatch: {label}")
+                if not torch.isfinite(output.float()).all() or torch.count_nonzero(output[length:]):
+                    raise AssertionError(f"device prefix padding is invalid: {label}")
+                for guard in range(4):
+                    if guard != slot and not torch.equal(pool[guard], initial[guard]):
+                        raise AssertionError(f"unselected state slot changed: {label}")
+                if length == 0 and not torch.equal(pool[slot], initial[slot].bfloat16().to(dtype)):
+                    raise AssertionError(f"empty state boundary changed: {label}")
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def check_device_target_states(module, heads, tokens):
+    q, k, v, g, beta, a_log, dt_bias, cu = inputs(tokens, heads, 20261029)
+    packed_beta = torch.zeros((tokens, 2 * heads), device="cuda", dtype=beta.dtype)
+    packed_beta[:, :heads].copy_(beta)
+    beta = packed_beta[:, :heads]
+    keys = ("PLA_FLASHKDA_TC01_FLA_CP", "PLA_FLASHKDA_TC01_FLA_CP_ALGO")
+    saved = {key: os.environ.get(key) for key in keys}
+    try:
+        for key in keys:
+            os.environ.pop(key, None)
+        for dtype in (torch.bfloat16, torch.float32):
+            initial = (torch.randn((1, heads, 128, 128), device="cuda") * 0.02).to(dtype)
+            before = initial.clone()
+            for with_initial in (False, True):
+                for with_final in (False, True):
+                    out, expected = torch.empty_like(q), torch.empty_like(q)
+                    final = torch.empty_like(initial) if with_final else None
+                    expected_final = torch.empty_like(initial) if with_final else None
+
+                    def invoke(output, state, raw=None):
+                        module.forward(q, k, v, g, beta, a_log, dt_bias, output, None, -5.0,
+                                       initial if with_initial else None, state, cu, None, None, raw)
+
+                    if device_trusted_reference(heads, tokens, tokens):
+                        invoke(expected, expected_final, (0, tokens))
+                    else:
+                        os.environ[keys[0]] = "off"
+                        invoke(expected, expected_final)
+                        os.environ.pop(keys[0], None)
+                    invoke(out, final)
+                    side = torch.cuda.Stream()
+                    side.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(side):
+                        invoke(out, final)
+                    side.synchronize()
+                    captured = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(captured, stream=side):
+                        invoke(out, final)
+                    for replay in (False, True, True):
+                        out.fill_(float("nan"))
+                        if final is not None:
+                            final.fill_(float("nan"))
+                        if replay:
+                            captured.replay()
+                        else:
+                            invoke(out, final)
+                        torch.cuda.synchronize()
+                        label = (heads, tokens, dtype, with_initial, with_final, replay)
+                        if not torch.equal(out, expected) or not torch.isfinite(out).all():
+                            raise AssertionError(f"device state-mode output mismatch: {label}")
+                        if final is not None and not torch.equal(final, expected_final):
+                            raise AssertionError(f"device state-mode final mismatch: {label}")
+                        if not torch.equal(initial, before):
+                            raise AssertionError(f"compact initial state changed: {label}")
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--module")
+    parser.add_argument("--device-targets-only", action="store_true")
     parser.add_argument("--heads", type=int, default=0,
                         help="one CP head, or 0 to test H4/H6/H8/H12")
     args = parser.parse_args()
@@ -358,6 +495,18 @@ def main():
             not set(expected_cp_heads).issubset(set(getattr(module, "supported_heads", ())))):
         raise RuntimeError("loaded extension is not the requested CP-capable monolithic build")
     heads_to_test = (4, 6, 8, 12) if args.heads == 0 else (args.heads,)
+    if args.device_targets_only:
+        for heads in heads_to_test:
+            if heads not in (4, 8):
+                continue
+            for tokens in (4096, 8192):
+                for dtype in (torch.bfloat16, torch.float32):
+                    for cu_dtype in (torch.int32, torch.int64):
+                        check_device_target_graph(module, heads, tokens, dtype, cu_dtype)
+                        print("DEVICE_TARGET_GRAPH_OK", heads, tokens, dtype, cu_dtype, flush=True)
+                check_device_target_states(module, heads, tokens)
+                print("DEVICE_TARGET_STATES_OK", heads, tokens, flush=True)
+        return
     for index, heads in enumerate(heads_to_test):
         seed = 2026092401 + 100 * index
         check_cold_capture(module, heads, seed)

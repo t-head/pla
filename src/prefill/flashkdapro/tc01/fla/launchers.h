@@ -68,6 +68,15 @@ struct Launchers {
 const Launchers& launchers_for(int heads);
 }  // namespace fla_runtime
 
+extern "C" hggcError_t launch_fla_inter_prepared__fla_h4(
+    const void*, const void*, const float*, const uint16_t*, int64_t,
+    float*, void*, void*, void*, void*, void*, float, const int32_t*,
+    const int32_t*, int, int, int, int, hggcStream_t);
+extern "C" hggcError_t launch_fla_inter_prepared__fla_h8(
+    const void*, const void*, const float*, const uint16_t*, int64_t,
+    float*, void*, void*, void*, void*, void*, float, const int32_t*,
+    const int32_t*, int, int, int, int, hggcStream_t);
+
 hggcError_t launch_fla_l2norm_bf16_d128_bt16(const void*, void*, int64_t, hggcStream_t);
 hggcError_t launch_fla_l2norm2_bf16_d128_bt16(const void*, void*, const void*, void*, int64_t, hggcStream_t);
 hggcError_t launch_fla_metadata(const void*, bool, int32_t*, int64_t*, int32_t*, int32_t*,

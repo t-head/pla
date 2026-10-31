@@ -143,6 +143,22 @@ CUTE_DEVICE void prefetch_bf16(unsigned char* target,uint16_t const* input,
   }
   commit();
 }
+// A rows land in the native AIU cube; each 8-column run stays contiguous.
+// Runs of the six strictly-upper 16x16 tiles are zero-filled without a read:
+// the solve writes only the ten block-lower tiles and the workspace is not
+// cleared.
+CUTE_DEVICE void prefetch_a(unsigned char* target,uint16_t const* input,
+    int64_t first,int rows,int head) {
+  int tid=threadIdx.x,c=8*(tid%8);
+  CUTE_UNROLL
+  for(int h=0;h<2;++h) {
+    int r=tid/8+32*h;
+    bool valid=r<rows && c<16*(r/16+1);
+    int64_t source=valid ? offset(first+r,head,c,64) : offset(first,head,0,64);
+    copy16(target+2*aiu_a_offset(r,c),input+source,valid);
+  }
+  commit();
+}
 CUTE_DEVICE void prefetch_gate(unsigned char* target,float const* input,
     int64_t first,int rows,int head,int panel,bool drain=false) {
   int tid=threadIdx.x,c=8*(tid%8);
@@ -262,12 +278,14 @@ CUTE_DEVICE void publish_u(unsigned char* raw,unsigned char* rounded,float const
 }
 
 CUTE_DEVICE void publish_w_kg(unsigned char* raw_k,unsigned char* raw_g,
-    unsigned char* rounded,float const (&beta)[2],float const* gate,uint16_t* kg,
+    unsigned char* rounded,float const (&beta)[2],uint16_t* kg,
     int64_t first,int rows,int head,int panel) {
   int tid=threadIdx.x,c=8*(tid%8);
+  // The last valid gate row is already staged by the panel prefetch.
   float last[8];
+  auto const* last_row=reinterpret_cast<float const*>(raw_g)+64*(rows-1)+c;
   CUTE_UNROLL
-  for(int j=0;j<8;++j) last[j]=gate[offset(first+rows-1,head,64*panel+c+j)];
+  for(int j=0;j<8;++j) last[j]=last_row[j];
   CUTE_UNROLL
   for(int h=0;h<2;++h) {
     int r=tid/8+32*h;
@@ -310,43 +328,44 @@ void fla_recompute_h8_bf16_d128_bt64(uint16_t const* k,uint16_t const* v,
   if(bos<0 || eos>total_tokens || first>=eos) return;
   int remaining=eos-int(first);
   int rows=remaining<64 ? remaining : 64;
+  // Raw V owns [0,16K), G1 [16K,32K), K [32K,48K), A [48K,56K) and the
+  // rounded U/W operand [56K,64K). Everything but G0 is issued up front;
+  // groups in issue order: A, V0, V1, K0, K1, G1, then G0 into raw V.
+  prefetch_a(shared+49152,A,first,rows,head);
   prefetch_bf16(shared,v,first,rows,head,0);
+  prefetch_bf16(shared+8192,v,first,rows,head,1);
+  prefetch_bf16(shared+32768,k,first,rows,head,0);
+  prefetch_bf16(shared+40960,k,first,rows,head,1);
+  prefetch_gate(shared+16384,g,first,rows,head,1);
   float b[2];
   CUTE_UNROLL
   for(int h=0;h<2;++h) {
-    int r=tid/8+32*h,c=8*(tid%8);
+    int r=tid/8+32*h;
     b[h]=r<rows ? fla_sigmoid_bf16(beta_raw[(first+r)*beta_stride+head]) : 0.0f;
-    uint4 data=make_uint4(0,0,0,0);
-    if(r<rows) data=*reinterpret_cast<uint4 const*>(A+offset(first+r,head,c,64));
-    *reinterpret_cast<uint4*>(shared+49152+2*aiu_a_offset(r,c))=data;
   }
-  // U: two raw V buffers, one rounded-B/output exchange buffer. A stays live.
-  __syncthreads();
-  prefetch_bf16(shared+8192,v,first,rows,head,1);
   CUTE_UNROLL
   for(int panel=0;panel<2;++panel) {
-    wait<1>(); __syncthreads();
-    publish_u(shared+8192*panel,shared+16384,b);
-    dot_and_store(shared+49152,shared+16384,u,first,rows,head,panel);
-    prefetch_bf16(shared+8192*panel,v,first,rows,head,panel,true);
+    if(panel==0) wait<4>();
+    else wait<3>();
+    __syncthreads();
+    publish_u(shared+8192*panel,shared+57344,b);
+    // publish_u ends with a barrier: both raw V panels are consumed, so G0
+    // may land in [0,16K) while the last U product still reads [56K,64K).
+    if(panel==1) prefetch_gate(shared,g,first,rows,head,0);
+    dot_and_store(shared+49152,shared+57344,u,first,rows,head,panel);
   }
-  wait<0>(); __syncthreads(); // No outstanding V writes when G aliases low TSM.
-  // W: K0/G0/K1/G1 groups; both raw G panels consume the former U region.
-  prefetch_bf16(shared+32768,k,first,rows,head,0);
-  prefetch_gate(shared,g,first,rows,head,0);
-  __syncthreads();
-  prefetch_bf16(shared+40960,k,first,rows,head,1);
-  prefetch_gate(shared+16384,g,first,rows,head,1);
+  // W panels are independent; panel 1 runs first so the late G0 load hides
+  // under it. Each wait/barrier also retires the previous rounded operand.
   #pragma unroll 1
-  for(int panel=0;panel<2;++panel) {
-    wait<2>(); __syncthreads();
+  for(int step=0;step<2;++step) {
+    int panel=1-step;
+    if(step==0) wait<1>();
+    else wait<0>();
+    __syncthreads();
     publish_w_kg(shared+32768+8192*panel,shared+16384*panel,shared+57344,b,
-                 g,kg,first,rows,head,panel);
+                 kg,first,rows,head,panel);
     dot_and_store(shared+49152,shared+57344,w,first,rows,head,panel);
-    prefetch_bf16(shared+32768+8192*panel,k,first,rows,head,panel,true);
-    prefetch_gate(shared+16384*panel,g,first,rows,head,panel,true);
   }
-  wait<0>(); __syncthreads();
 #else
   __trap();
 #endif

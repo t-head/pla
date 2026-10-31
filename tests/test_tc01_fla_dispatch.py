@@ -44,6 +44,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import types
 import unittest
 from unittest.mock import Mock, patch
@@ -451,6 +452,214 @@ class BuildTests(unittest.TestCase):
         self.assertEqual(kernels, {p.name for p in SOURCE.glob('*.cu')})
         with self.assertRaisesRegex(ValueError, 'list is incomplete'):
             self.build.object_groups({})
+
+    def test_cp_auto_short_buckets_and_explicit_overrides(self):
+        compiler = shutil.which('c++')
+        if not compiler:
+            self.skipTest('requires a C++17 host compiler')
+        runtime = (SOURCE / 'runtime.cc').read_text()
+        selectors = runtime.split('struct CpSelection {', 1)[1].split(
+            'std::shared_mutex init_mutex;', 1)[0]
+        source = r'''
+#include "cp_plan.h"
+#include <cassert>
+#include <cstdlib>
+#include <cstring>
+#include <optional>
+#include <vector>
+using namespace fla_runtime;
+struct Arguments { std::optional<std::vector<int64_t>> raw; };
+struct Shape { int n; int h; int64_t t = 0; };
+struct Launchers {
+  void (*cp_recurrence_output)();
+  Launchers(bool available) : cp_recurrence_output(available ? +[]{} : nullptr) {}
+};
+void require(bool ok, const char* message) {
+  if (!ok) throw std::invalid_argument(message);
+}
+struct CpSelection {
+''' + selectors + r'''
+int main() {
+  unsetenv("PLA_FLASHKDA_TC01_FLA_CP");
+  unsetenv("PLA_FLASHKDA_TC01_FLA_CP_ALGO");
+  for (int h : {4, 6, 8}) {
+    assert(select_fla_cp_auto_split(h, 0) == 0);
+    assert(select_fla_cp_auto_split(h, -1) == 0);
+    assert(select_fla_cp_auto_split(h, 102401) == 0);
+    for (int t : {1, 16, 19, 32, 63, 64, 65, 96, 127, 128}) {
+      Arguments a{std::vector<int64_t>{0, t}};
+      assert(select_cp(a, {1, h}, {true}).split == 1);
+      assert(select_cp_algorithm(1, h, t) == CpAlgorithm::State);
+      assert(!select_cp(Arguments{}, {1, h}, {true}).active());
+      assert(!select_cp(a, {2, h}, {true}).active());
+      assert(!select_cp(a, {1, h}, {false}).active());
+      setenv("PLA_FLASHKDA_TC01_FLA_CP", "off", 1);
+      assert(!select_cp(a, {1, h}, {true}).active());
+      setenv("PLA_FLASHKDA_TC01_FLA_CP", "1", 1);
+      assert(select_cp_algorithm(1, h, t) == CpAlgorithm::Legacy);
+      setenv("PLA_FLASHKDA_TC01_FLA_CP_ALGO", "state", 1);
+      assert(select_cp_algorithm(1, h, t) == CpAlgorithm::State);
+      setenv("PLA_FLASHKDA_TC01_FLA_CP", "auto", 1);
+      setenv("PLA_FLASHKDA_TC01_FLA_CP_ALGO", "legacy", 1);
+      assert(select_cp_algorithm(1, h, t) == CpAlgorithm::Legacy);
+      if (h == 4) assert(!select_cp(a, {1, h}, {true}).active());
+      unsetenv("PLA_FLASHKDA_TC01_FLA_CP_ALGO");
+    }
+  }
+  for (int t : {2049, 8192, 12287, 65537, 102400})
+    assert(select_fla_cp_auto_split(4, t) == 0);
+  assert(select_fla_cp_auto_split(4, 2048) == 1);
+  for (int t : {12288, 16384, 65536}) {
+    assert(select_fla_cp_auto_split(4, t) == 5);
+    assert(select_cp_algorithm(5, 4, t) == CpAlgorithm::State);
+  }
+  for (int h : {6, 8}) {
+    assert(select_fla_cp_auto_split(h, 102400) == 1);
+    assert(select_cp_algorithm(1, h, 65536) == CpAlgorithm::State);
+    assert(select_cp_algorithm(1, h, 65537) == CpAlgorithm::Legacy);
+  }
+  assert(select_fla_cp_auto_split(12, 8191) == 0);
+  assert(select_fla_cp_auto_split(12, 8192) == 1);
+  for (int h : {1, 5, 16, 24, 96})
+    assert(select_fla_cp_auto_split(h, 19) == 0);
+  for (int h : {4, 6, 8, 12}) {
+    for (int t : {4095, 4096, 4097, 8191, 8192, 8193}) {
+      for (const char* automatic : {static_cast<const char*>(nullptr), "", "auto"}) {
+        if (automatic) setenv("PLA_FLASHKDA_TC01_FLA_CP", automatic, 1);
+        else unsetenv("PLA_FLASHKDA_TC01_FLA_CP");
+        for (const char* algorithm : {static_cast<const char*>(nullptr), "", "state", "legacy", "invalid"}) {
+          if (algorithm) setenv("PLA_FLASHKDA_TC01_FLA_CP_ALGO", algorithm, 1);
+          else unsetenv("PLA_FLASHKDA_TC01_FLA_CP_ALGO");
+          const bool expected = h == 8 && (t == 4096 || t == 8192) &&
+              (!algorithm || !algorithm[0] || std::strcmp(algorithm, "state") == 0);
+          const auto cp = select_cp(Arguments{}, {1, h, t}, {true});
+          assert(cp.active() == expected);
+          if (expected) assert(cp.split == 1 && cp.count == 1 && cp.descriptor_row == -1);
+          assert(!select_cp(Arguments{}, {2, h, t}, {true}).active());
+          assert(!select_cp(Arguments{}, {1, h, t}, {false}).active());
+        }
+      }
+      for (const char* opt_out : {"off", "0"}) {
+        setenv("PLA_FLASHKDA_TC01_FLA_CP", opt_out, 1);
+        unsetenv("PLA_FLASHKDA_TC01_FLA_CP_ALGO");
+        assert(!select_cp(Arguments{}, {1, h, t}, {true}).active());
+      }
+      for (const char* forced : {"1", "2", "3", "4", "5", "8"}) {
+        setenv("PLA_FLASHKDA_TC01_FLA_CP", forced, 1);
+        bool rejected = false;
+        try { select_cp(Arguments{}, {1, h, t}, {true}); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        assert(rejected);
+      }
+    }
+  }
+}
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            binary = str(Path(directory) / 'cp_policy')
+            subprocess.run([compiler, '-std=c++17', '-x', 'c++', '-I', str(SOURCE),
+                            '-', '-o', binary], input=source, text=True, check=True)
+            subprocess.run([binary], check=True)
+
+    def test_n1_metadata_matches_device_geometry_and_tail(self):
+        compiler = shutil.which('c++')
+        if not compiler:
+            self.skipTest('requires a C++17 host compiler')
+        metadata = (SOURCE / 'metadata.cu').read_text()
+        geometry = '__global__ void cp_device_geometry(' + metadata.split(
+            '__global__ void cp_device_geometry(', 1)[1].split(
+                '// Device-offset output tail:', 1)[0]
+        fused = 'template<class Offset>\n__global__ void metadata_n1_tail(' + metadata.split(
+            'template<class Offset>\n__global__ void metadata_n1_tail(', 1)[1].split(
+                '}  // namespace', 1)[0]
+        # Run the actual kernel bodies as scalar host functions, executing CTA0 last.
+        # This covers metadata/tail semantics, not device scheduling or performance.
+        source = r'''
+#include <algorithm>
+#include <cassert>
+#include <cstdint>
+#include <stdexcept>
+#include <vector>
+#define __global__
+struct Dim { int x; } blockIdx, threadIdx, blockDim, gridDim;
+struct uint4 { uint32_t x, y, z, w; };
+uint4 make_uint4(uint32_t x, uint32_t y, uint32_t z, uint32_t w) { return {x,y,z,w}; }
+void __trap() { throw std::invalid_argument("invalid device offsets"); }
+''' + geometry + fused + r'''
+template<class Offset> void check(int tokens, int split, int grid) {
+  const int capacity=(tokens+63)/64;
+  constexpr int width=9, row_vectors=64;
+  constexpr uint32_t poison=0x7fc00000u;
+  std::vector<int32_t> indices(2*capacity+2, -7), bounds(width, -7);
+  std::vector<int64_t> cp_offsets(width, -7);
+  int32_t cu[2]={-7,-7}, slot=-7;
+  int64_t offsets[2]={-7,-7};
+  std::vector<uint4> out(int64_t(tokens)*row_vectors+2);
+  blockDim.x=256; gridDim.x=grid;
+  for(int length : {tokens, tokens/2+1, 12289, 12287, 65, 0, 19, tokens-1, tokens}) {
+    if(length>tokens) continue;
+    Offset input[2]={0, static_cast<Offset>(length)};
+    std::fill(out.begin(),out.end(),make_uint4(poison,poison,poison,poison));
+    std::fill(indices.begin(),indices.end(),-7);
+    std::fill(bounds.begin(),bounds.end(),-7);
+    std::fill(cp_offsets.begin(),cp_offsets.end(),-7);
+    cu[0]=cu[1]=slot=-7; offsets[0]=offsets[1]=-7;
+    for(blockIdx.x=grid-1;blockIdx.x>=0;--blockIdx.x)
+      for(threadIdx.x=255;threadIdx.x>=0;--threadIdx.x)
+        metadata_n1_tail(input,cu,offsets,indices.data()+1,&slot,tokens,
+            capacity,bounds.data(),cp_offsets.data(),split,width,12288,65536,
+            out.data()+1,row_vectors);
+    const int chunks=(length+63)/64;
+    assert(cu[0]==0 && cu[1]==length && slot==0);
+    assert(offsets[0]==0 && offsets[1]==chunks);
+    assert(indices.front()==-7 && indices.back()==-7);
+    for(int i=0;i<capacity;++i) {
+      assert(indices[2*i+1]==(i<chunks ? 0 : -1));
+      assert(indices[2*i+2]==(i<chunks ? i : -1));
+    }
+    if(split>1) {
+      std::vector<int32_t> expected_bounds(width,-7);
+      std::vector<int64_t> expected_offsets(width,-7);
+      threadIdx.x=0;
+      cp_device_geometry(cu,expected_bounds.data(),expected_offsets.data(),
+                         split,width,12288,65536);
+      assert(bounds==expected_bounds && cp_offsets==expected_offsets);
+    } else {
+      assert(std::all_of(bounds.begin(),bounds.end(),[](int v){return v==-7;}));
+      assert(std::all_of(cp_offsets.begin(),cp_offsets.end(),[](int64_t v){return v==-7;}));
+    }
+    for(int64_t i=0;i<int64_t(out.size());++i) {
+      const uint32_t expected=i>int64_t(length)*row_vectors &&
+          i<=int64_t(tokens)*row_vectors ? 0 : poison;
+      assert(out[i].x==expected && out[i].y==expected &&
+             out[i].z==expected && out[i].w==expected);
+    }
+  }
+  blockIdx.x=threadIdx.x=0;
+  for(auto input : {std::vector<Offset>{1,19}, std::vector<Offset>{0,-1},
+                    std::vector<Offset>{0,static_cast<Offset>(tokens+1)}}) {
+    bool rejected=false;
+    try { metadata_n1_tail(input.data(),cu,offsets,indices.data()+1,&slot,
+        tokens,capacity,bounds.data(),cp_offsets.data(),split,width,12288,
+        65536,out.data()+1,row_vectors); }
+    catch(const std::invalid_argument&) { rejected=true; }
+    assert(rejected);
+  }
+}
+int main() {
+  for(int tokens : {16384,32768})
+    for(int split : {0,1,5})
+      for(int grid : {3,512}) {
+        check<int32_t>(tokens,split,grid);
+        check<int64_t>(tokens,split,grid);
+      }
+}
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            binary = str(Path(directory) / 'metadata_n1')
+            subprocess.run([compiler, '-std=c++17', '-O2', '-x', 'c++', '-',
+                            '-o', binary], input=source, text=True, check=True)
+            subprocess.run([binary], check=True)
 
     def test_runtime_abi_agrees_with_python_and_build(self):
         contract = {}

@@ -53,6 +53,34 @@
 #include <string>
 #include <tuple>
 
+// Defined with the metadata stage; kept local to the runtime translation unit.
+hggcError_t launch_fla_cp_device_geometry(const int32_t*, int32_t*, int64_t*, int, int,
+                                          int, int, hggcStream_t);
+hggcError_t launch_fla_zero_output_tail(const int32_t*, int, void*, int64_t, int64_t,
+                                        hggcStream_t);
+hggcError_t launch_fla_metadata_n1_tail(const void*, bool, int32_t*, int64_t*,
+    int32_t*, int32_t*, int, int, int32_t*, int64_t*, int, int, int, int,
+    void*, int64_t, hggcStream_t);
+// Defined with the token stage: N=1 L2 + token fusion that also publishes qn/kn
+// and, given w/u/kg, the inter stage's prepared operands and solved diagonal.
+extern "C" hggcError_t launch_fla_token_l2__fla_h4(
+    const void*, const void*, void*, void*, const float*, const uint16_t*, int64_t,
+    void*, float*, void*, void*, void*, void*, float, const int32_t*, int, int,
+    hggcStream_t);
+extern "C" hggcError_t launch_fla_token_l2__fla_h8(
+    const void*, const void*, void*, void*, const float*, const uint16_t*, int64_t,
+    void*, float*, void*, void*, void*, void*, float, const int32_t*, int, int,
+    hggcStream_t);
+// Defined with the inter stage: launch_fla_inter_prepared without its prepare.
+extern "C" hggcError_t launch_fla_inter_solve_prepared__fla_h4(
+    const void*, const void*, const float*, const uint16_t*, int64_t, float*, void*,
+    void*, void*, void*, void*, float, const int32_t*, const int32_t*, int, int, int,
+    int, hggcStream_t);
+extern "C" hggcError_t launch_fla_inter_solve_prepared__fla_h8(
+    const void*, const void*, const float*, const uint16_t*, int64_t, float*, void*,
+    void*, void*, void*, void*, float, const int32_t*, const int32_t*, int, int, int,
+    int, hggcStream_t);
+
 namespace fla_runtime {
 namespace {
 void cuda_check(hggcError_t status, const char* action) {
@@ -144,9 +172,9 @@ CpAlgorithm select_cp_algorithm(int segments, int heads, int64_t tokens) {
     // Only promote measured AUTO buckets. Explicit algorithm
     // and split requests retain their existing semantics.
     if (automatic && tokens <= 65536 &&
-        ((heads == 4 && segments == 1 && tokens >= 128 && tokens <= 2048) ||
+        ((heads == 4 && segments == 1 && tokens > 0 && tokens <= 2048) ||
          (heads == 4 && segments == 5 && tokens >= 12288) ||
-         ((heads == 6 || heads == 8) && segments == 1 && tokens >= 64)))
+         ((heads == 6 || heads == 8) && segments == 1 && tokens > 0)))
       return CpAlgorithm::State;
     return CpAlgorithm::Legacy;
   }
@@ -166,7 +194,19 @@ CpSelection select_cp(const Arguments& a, const Shape& s, const Launchers& table
                      std::strcmp(mode, "0") == 0)) return {};
   int split = 0;
   if (automatic) {
-    if (!a.raw || s.n != 1 || !table.cp_recurrence_output) return {};
+    if (s.n != 1 || !table.cp_recurrence_output) return {};
+    if (!a.raw) {
+      const char* algorithm = std::getenv("PLA_FLASHKDA_TC01_FLA_CP_ALGO");
+      const bool state = !algorithm || !algorithm[0] || std::strcmp(algorithm, "state") == 0;
+      // H4 long device-offset buckets use a fixed CP5 launch whose descriptor
+      // is rebuilt on device from the current effective length.
+      if (s.h == 4 && (s.t == 16384 || s.t == 32768) && state)
+        return {5, 5, cp_split_row(5)};
+      if (((s.h == 8 && (s.t == 4096 || s.t == 8192)) ||
+           (s.h == 8 && (s.t == 16384 || s.t == 32768))) && state)
+        return {1, 1, -1};
+      return {};
+    }
     split = select_fla_cp_auto_split(s.h, (*a.raw)[1] - (*a.raw)[0]);
     // H4 AUTO buckets are qualified for state passing only. An explicit
     // legacy algorithm retains the serial AUTO path for both H4 buckets.
@@ -331,7 +371,9 @@ void forward(Arguments a) {
   // Explicit state also selects its single-segment implementation. AUTO uses
   // the qualified shape buckets; explicit selectors remain authoritative.
   const CpAlgorithm cp_algorithm = cp.active()
-      ? select_cp_algorithm(cp.count, s.h, a.raw->back() - a.raw->front()) : CpAlgorithm::Legacy;
+      ? (a.raw ? select_cp_algorithm(cp.count, s.h, a.raw->back() - a.raw->front())
+               : CpAlgorithm::State)
+      : CpAlgorithm::Legacy;
   const WorkspaceLayout layout(s.t, s.h, s.n, s.chunks, !a.raw, cp.count);
   c10::cuda::CUDAGuard guard(a.q.device());
   // FLA dispatch also keeps the branch's value diagnostics; capture only checks metadata and never reads device values.
@@ -369,17 +411,52 @@ void forward(Arguments a) {
   const int32_t* cp_bounds = nullptr;
   const int64_t* cp_offsets = nullptr;
   if (cp.active()) {
-    TORCH_INTERNAL_ASSERT(plan && cp.descriptor_row >= 0);
-    cp_bounds = reinterpret_cast<int32_t*>(meta_base + ml.cp_bounds.offset)
-        + cp.descriptor_row * kCpDescriptorWidth;
-    cp_offsets = reinterpret_cast<int64_t*>(meta_base + ml.cp_offsets.offset)
-        + cp.descriptor_row * kCpDescriptorWidth;
+    if (plan) {
+      TORCH_INTERNAL_ASSERT(cp.descriptor_row >= 0);
+      cp_bounds = reinterpret_cast<int32_t*>(meta_base + ml.cp_bounds.offset)
+          + cp.descriptor_row * kCpDescriptorWidth;
+      cp_offsets = reinterpret_cast<int64_t*>(meta_base + ml.cp_offsets.offset)
+          + cp.descriptor_row * kCpDescriptorWidth;
+    } else if (cp.count == 1) {
+      // N1 CP1 consumes the current device metadata, including empty/prefix
+      // lengths on Graph replay; physical T never substitutes for effective T.
+      TORCH_INTERNAL_ASSERT(s.n == 1 && cp.descriptor_row == -1);
+      cp_bounds = cu;
+      cp_offsets = offsets;
+    } else {
+      // The descriptor row is rewritten by a device kernel after metadata.
+      TORCH_INTERNAL_ASSERT(s.n == 1 && cp.descriptor_row >= 0);
+      cp_bounds = reinterpret_cast<int32_t*>(meta_base + ml.cp_bounds.offset)
+          + cp.descriptor_row * kCpDescriptorWidth;
+      cp_offsets = reinterpret_cast<int64_t*>(meta_base + ml.cp_offsets.offset)
+          + cp.descriptor_row * kCpDescriptorWidth;
+    }
   }
-  if (!plan) cuda_check(launch_fla_metadata(a.cu.data_ptr(), a.cu.scalar_type() == at::kLong,
-                         cu, offsets, chunks, slots, s.n, s.t, s.chunks, reinterpret_cast<hggcStream_t>(stream.stream())), "metadata");
+  const bool fused_metadata = !plan && s.n == 1 && (s.h == 4 || s.h == 8) &&
+      (s.t == 16384 || s.t == 32768);
+  if (fused_metadata) {
+    cuda_check(launch_fla_metadata_n1_tail(
+        a.cu.data_ptr(), a.cu.scalar_type() == at::kLong, cu, offsets, chunks,
+        slots, s.t, s.chunks, const_cast<int32_t*>(cp_bounds),
+        const_cast<int64_t*>(cp_offsets), cp.count, kCpDescriptorWidth,
+        12288, 65536, a.out.data_ptr(), a.out.nbytes() / s.t,
+        reinterpret_cast<hggcStream_t>(stream.stream())), "N1 metadata + tail");
+  } else {
+    if (!plan) cuda_check(launch_fla_metadata(a.cu.data_ptr(), a.cu.scalar_type() == at::kLong,
+                           cu, offsets, chunks, slots, s.n, s.t, s.chunks, reinterpret_cast<hggcStream_t>(stream.stream())), "metadata");
+    if (!plan && cp.count > 1)
+      cuda_check(launch_fla_cp_device_geometry(
+          cu, const_cast<int32_t*>(cp_bounds), const_cast<int64_t*>(cp_offsets),
+          cp.count, kCpDescriptorWidth, 12288, 65536,
+          reinterpret_cast<hggcStream_t>(stream.stream())), "CP device geometry");
+    // Device offsets clear only rows past the current cu[n]; stages cover the rest.
+    if (!plan && !a.raw && a.out.numel() && s.t > 0 && a.out.nbytes() % s.t == 0)
+      cuda_check(launch_fla_zero_output_tail(cu, s.n, a.out.data_ptr(), a.out.nbytes() / s.t, s.t,
+                                             reinterpret_cast<hggcStream_t>(stream.stream())), "out tail zero-fill");
+    else if ((!a.raw || a.raw->back() < s.t) && a.out.numel())
+      cuda_check(hggcMemsetAsync(a.out.data_ptr(), 0, a.out.nbytes(), reinterpret_cast<hggcStream_t>(stream.stream())), "out zero-fill");
+  }
   const int bucket = a.raw && s.n == 1 ? (s.chunks <= 32 ? 0 : s.chunks <= 128 ? 1 : 2) : -1;
-  if ((!a.raw || a.raw->back() < s.t) && a.out.numel())
-    cuda_check(hggcMemsetAsync(a.out.data_ptr(), 0, a.out.nbytes(), reinterpret_cast<hggcStream_t>(stream.stream())), "out zero-fill");
   // State read/write is fused into the recurrence kernel: initial/final are passed through, and the BF16 rounding at the read/write boundary
   // plus the zero-init semantics without initial are kept by the kernel (bit-identical to the existing host chain).
   const void* initial = a.initial.defined() ? a.initial.data_ptr() : nullptr;
@@ -388,7 +465,13 @@ void forward(Arguments a) {
                                              : a.final.defined() && a.final.scalar_type() == at::kFloat;
   const auto* indices = a.indices.defined() ? a.indices.data_ptr<int32_t>() : nullptr;
   if (s.t && s.chunks) {
-    zero(arena, layout.zeros, reinterpret_cast<hggcStream_t>(stream.stream()));
+    const bool prepared_n1 = s.n == 1 && (s.h == 4 || s.h == 8) &&
+        (s.t == 4096 || s.t == 8192 || s.t == 16384 || s.t == 32768);
+    // Prepared CP consumers need no workspace memset: the token stage writes
+    // Aqk zeros before its diagonal tiles, the solve reads akkd's solved
+    // diagonal only for live rows, and recompute zero-fills the upper inverse.
+    if (!(prepared_n1 && cp.active()))
+      zero(arena, layout.zeros, reinterpret_cast<hggcStream_t>(stream.stream()));
     // beta no longer does a host copy+sigmoid: the consumer kernels compute it from raw bf16 with the same inline implementation.
     const auto* beta_raw = static_cast<const uint16_t*>(a.beta.data_ptr());
     const int64_t beta_stride = a.beta.stride(0);
@@ -397,14 +480,33 @@ void forward(Arguments a) {
     auto aqk = pointer(arena, layout.aqk), inverse = pointer(arena, layout.inverse);
     auto akkd = pointer<float>(arena, layout.akkd);
     auto w = pointer(arena, layout.w), u = pointer(arena, layout.u), kg = pointer(arena, layout.kg);
-    cuda_check(launch_fla_l2norm2_bf16_d128_bt16(a.q.data_ptr(), qn, a.k.data_ptr(), kn,
-                                                 s.t * s.h, reinterpret_cast<hggcStream_t>(stream.stream())), "L2 q+k");
+    if (!prepared_n1)
+      cuda_check(launch_fla_l2norm2_bf16_d128_bt16(a.q.data_ptr(), qn, a.k.data_ptr(), kn,
+                                                   s.t * s.h, reinterpret_cast<hggcStream_t>(stream.stream())), "L2 q+k");
     cuda_check(table.gate(a.g.data_ptr(), a.a_log.data_ptr<float>(), a.dt_bias.data_ptr<float>(), gate,
                          s.t, cu, chunks, s.n, s.chunks, s.h, a.lower_bound, reinterpret_cast<hggcStream_t>(stream.stream())), "gate");
-    cuda_check(table.token(qn, kn, gate, beta_raw, beta_stride, aqk, akkd, qg, a.scale, cu,
-                          s.n, s.t, s.h, reinterpret_cast<hggcStream_t>(stream.stream())), "token");
-    cuda_check(table.inter(qn, kn, gate, beta_raw, beta_stride, akkd, aqk, inverse, a.scale, cu, chunks,
-                          s.chunks, s.t, s.n, s.h, reinterpret_cast<hggcStream_t>(stream.stream())), "inter");
+    if (prepared_n1) {
+      TORCH_INTERNAL_ASSERT(layout.w.bytes == s.t * s.h * 128 * 2 &&
+                            layout.u.bytes == layout.w.bytes &&
+                            layout.kg.bytes == layout.w.bytes && s.chunks <= s.t / 64);
+      auto token_l2 = s.h == 4 ? launch_fla_token_l2__fla_h4 : launch_fla_token_l2__fla_h8;
+      cuda_check(token_l2(a.q.data_ptr(), a.k.data_ptr(), qn, kn, gate, beta_raw, beta_stride,
+                          aqk, akkd, qg, w, u, kg, a.scale, cu, s.t, s.h,
+                          reinterpret_cast<hggcStream_t>(stream.stream())), "L2 + token + prepare");
+    } else {
+      cuda_check(table.token(qn, kn, gate, beta_raw, beta_stride, aqk, akkd, qg, a.scale, cu,
+                            s.n, s.t, s.h, reinterpret_cast<hggcStream_t>(stream.stream())), "token");
+    }
+    if (prepared_n1) {
+      auto prepared = s.h == 4 ? launch_fla_inter_solve_prepared__fla_h4
+                              : launch_fla_inter_solve_prepared__fla_h8;
+      cuda_check(prepared(qn, kn, gate, beta_raw, beta_stride, akkd, aqk, inverse,
+                          w, u, kg, a.scale, cu, chunks, s.chunks, s.t, s.n, s.h,
+                          reinterpret_cast<hggcStream_t>(stream.stream())), "inter prepared");
+    } else {
+      cuda_check(table.inter(qn, kn, gate, beta_raw, beta_stride, akkd, aqk, inverse, a.scale, cu, chunks,
+                            s.chunks, s.t, s.n, s.h, reinterpret_cast<hggcStream_t>(stream.stream())), "inter");
+    }
     cuda_check(table.recompute(kn, a.v.data_ptr(), beta_raw, beta_stride, inverse, gate, w, u, kg, cu, chunks,
                               s.chunks, s.t, s.n, s.h, reinterpret_cast<hggcStream_t>(stream.stream())), "recompute");
     if (cp.active()) {

@@ -89,15 +89,16 @@ inline CpGeometry make_cp_geometry(int64_t tokens, int split) {
 // short bucket and CP5 for the long bucket. H6/H8 use state CP1 through 64K,
 // then retain legacy CP1. H12 retains its established legacy CP1 threshold.
 // Explicit split and algorithm overrides remain authoritative.
+// H4/H6/H8 short sequences also use the qualified single-segment recurrence/output fusion.
 inline int select_fla_cp_auto_split(int heads, int64_t tokens) {
   if (tokens <= 0 || tokens > 102400) return 0;
   switch (heads) {
     case 4:
-      if (tokens >= 128 && tokens <= 2048) return 1;
+      if (tokens <= 2048) return 1;
       return tokens >= 12288 && tokens <= 65536 ? 5 : 0;
     case 6:
     case 8:
-      return tokens >= 64 ? 1 : 0;
+      return 1;
     case 12:
       return tokens >= 8192 ? 1 : 0;
     default:
