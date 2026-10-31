@@ -686,6 +686,121 @@ int main() {
             for name in retired:
                 self.assertNotIn(name, text, str(path))
 
+    def test_partial_head_adapters_link_optional_prepared_stages(self):
+        compiler = shutil.which('c++')
+        if compiler is None:
+            self.skipTest('requires a C++17 host compiler')
+        runtime = (SOURCE / 'runtime.cc').read_text()
+        self.assertNotRegex(runtime, r'launch_fla_(?:token_l2|inter_solve_prepared)__fla_h\d+')
+        self.assertIn('cuda_check(table.token_l2(', runtime)
+        self.assertIn('cuda_check(table.inter_solve_prepared(', runtime)
+        condition = runtime.split('const bool prepared_n1 = ', 1)[1].split(';', 1)[0]
+        main = r'''
+#include "launchers.h"
+#include <cassert>
+#include <initializer_list>
+struct Shape { int n, h; int64_t t; };
+bool prepared(const Shape& s, const fla_runtime::Launchers& table) {
+  return CONDITION;
+}
+int main() {
+  for (int h : {4, 6, 8, 12, 16}) {
+    const auto& table = fla_runtime::launchers_for(h);
+    const bool available = (table.heads == 4 || table.heads == 8);
+    assert(bool(table.token_l2) == available);
+    assert(bool(table.inter_solve_prepared) == available);
+    assert(table.token && table.inter);
+    for (int t : {4095,4096,4097,8192,16384,32768,32769}) {
+      const bool expected = available &&
+          (t == 4096 || t == 8192 || t == 16384 || t == 32768);
+      assert(prepared({1,h,t}, table) == expected);
+      assert(!prepared({2,h,t}, table));
+      auto missing = table;
+      missing.token_l2 = nullptr;
+      assert(!prepared({1,h,t}, missing));
+      missing = table;
+      missing.inter_solve_prepared = nullptr;
+      assert(!prepared({1,h,t}, missing));
+    }
+  }
+}
+'''.replace('CONDITION', condition)
+        # Compile the real adapters and dispatcher. Stubs supply only symbols
+        # for the selected head, so omitted H4/H8 dependencies fail at link time.
+        with tempfile.TemporaryDirectory() as directory:
+            temp = Path(directory)
+            (temp / 'hggc_runtime.h').write_text(
+                '#pragma once\nusing hggcError_t = int; using hggcStream_t = void*;\n')
+            common = [compiler, '-std=c++17', '-I', str(temp), '-I', str(SOURCE)]
+            objects = {}
+            for head in (0, 4, 6, 8):
+                preprocessed = subprocess.run(
+                    common + ['-E', '-P', f'-DFLA_HEADS={head}', str(SOURCE / 'head_adapter.cc')],
+                    capture_output=True, text=True, check=True).stdout
+                declarations = re.findall(r'hggcError_t\s+(\w+)\(([^;{}]*)\);', preprocessed)
+                declarations = [(name, args) for name, args in declarations
+                                if name.endswith(f'__fla_h{head}')]
+                self.assertGreater(len(declarations), 8)
+                optional = [name for name, _ in declarations
+                            if name.startswith(('launch_fla_token_l2__',
+                                                'launch_fla_inter_solve_prepared__'))]
+                self.assertEqual(len(optional), 2 if head in (4, 8) else 0)
+                definitions = '\n'.join(
+                    f'hggcError_t {name}({args}) {{ return 0; }}' for name, args in declarations)
+                output = temp / f'adapter_{head}.o'
+                subprocess.run(common + ['-x', 'c++', '-c', '-', '-o', str(output)],
+                               input=preprocessed + '\n' + definitions, text=True, check=True)
+                objects[head] = output
+            for heads in ((0,), (0, 4), (0, 8), (0, 4, 8), (0, 6)):
+                with self.subTest(heads=heads):
+                    static = ' '.join(f'X({head})' for head in heads if head)
+                    cp = ' '.join(f'X({head})' for head in heads if head in CP_HEADS)
+                    (temp / 'runtime_heads.h').write_text(
+                        f'#define FLA_EACH_STATIC_HEAD(X) {static}\n'
+                        f'#define FLA_EACH_CP_HEAD(X) {cp}\n')
+                    dispatcher = temp / 'dispatch.o'
+                    subprocess.run(common + ['-c', str(SOURCE / 'dispatch.cc'), '-o', str(dispatcher)],
+                                   check=True)
+                    probe = temp / 'probe.o'
+                    subprocess.run(common + ['-x', 'c++', '-c', '-', '-o', str(probe)],
+                                   input=main, text=True, check=True)
+                    binary = temp / ('partial_heads_' + '_'.join(map(str, heads)))
+                    subprocess.run(common + [str(probe), str(dispatcher)] +
+                                   [str(objects[head]) for head in heads] + ['-o', str(binary)],
+                                   check=True)
+                    subprocess.run([str(binary)], check=True)
+
+    def test_device_target_matrix_covers_long_cp_boundaries(self):
+        path = ROOT / 'scripts/prefill/flashkdapro/private/test_tc01_fla_monolithic_cp.py'
+        text = path.read_text()
+        tree = ast.parse(text)
+        selected = [node for node in tree.body
+                    if (isinstance(node, ast.Assign) and any(
+                        isinstance(target, ast.Name) and target.id == 'DEVICE_TARGET_TOKENS'
+                        for target in node.targets)) or
+                    (isinstance(node, ast.FunctionDef) and node.name in
+                     ('device_target_lengths', 'device_trusted_reference'))]
+        self.assertEqual(len(selected), 3)
+        namespace = {}
+        exec(compile(ast.Module(body=selected, type_ignores=[]), str(path), 'exec'), namespace)
+        self.assertEqual(namespace['DEVICE_TARGET_TOKENS'], (4096, 8192, 16384, 32768))
+        self.assertIn('for tokens in DEVICE_TARGET_TOKENS:', text)
+        self.assertIn('lengths = device_target_lengths(tokens)', text)
+        for tokens in namespace['DEVICE_TARGET_TOKENS']:
+            lengths = namespace['device_target_lengths'](tokens)
+            self.assertEqual(lengths[0], tokens)
+            self.assertEqual(lengths[-1], tokens)
+            self.assertIn(0, lengths)
+            self.assertIn(19, lengths)
+            self.assertTrue(all(0 <= length <= tokens for length in lengths))
+            if tokens >= 16384:
+                self.assertTrue({12287, 12288, 12289}.issubset(lengths))
+                reference = namespace['device_trusted_reference']
+                self.assertFalse(reference(4, tokens, 12287))
+                self.assertTrue(reference(4, tokens, 12288))
+                self.assertTrue(reference(4, tokens, 12289))
+                self.assertFalse(reference(8, tokens, 12288))
+
     def test_merged_prepare_uses_shared_probe_abi_and_single_device_guard(self):
         host = (ROOT / 'src/prefill/flashkdapro/host/torch_extension_cute.cc').read_text()
         header = (ROOT / 'src/prefill/flashkdapro/common/launch_api.h').read_text()

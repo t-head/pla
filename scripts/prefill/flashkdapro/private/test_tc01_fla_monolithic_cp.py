@@ -40,6 +40,14 @@ import torch
 
 
 SPLITS = (1, 2, 3, 4, 5, 8)
+DEVICE_TARGET_TOKENS = (4096, 8192, 16384, 32768)
+
+
+def device_target_lengths(tokens):
+    # Cross the CP5 effective-length boundary without recapturing the graph.
+    candidates = (tokens, tokens // 2 + 1, 12287, 12288, 12289,
+                  65, 0, 19, tokens - 1, tokens)
+    return tuple(length for length in candidates if length <= tokens)
 
 
 def load_extension(path):
@@ -369,7 +377,7 @@ def check_device_target_graph(module, heads, tokens, dtype, cu_dtype):
         captured = torch.cuda.CUDAGraph()
         with torch.cuda.graph(captured, stream=side):
             invoke(output, pool)
-        lengths = (tokens, tokens // 2 + 1, 65, 0, 19, tokens - 1, tokens)
+        lengths = device_target_lengths(tokens)
         for step, length in enumerate(lengths):
             slot = 1 + step % 2
             cu.copy_(torch.tensor([0, length], device="cuda", dtype=cu_dtype))
@@ -499,7 +507,7 @@ def main():
         for heads in heads_to_test:
             if heads not in (4, 8):
                 continue
-            for tokens in (4096, 8192):
+            for tokens in DEVICE_TARGET_TOKENS:
                 for dtype in (torch.bfloat16, torch.float32):
                     for cu_dtype in (torch.int32, torch.int64):
                         check_device_target_graph(module, heads, tokens, dtype, cu_dtype)

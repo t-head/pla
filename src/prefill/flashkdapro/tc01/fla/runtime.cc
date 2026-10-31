@@ -61,25 +61,7 @@ hggcError_t launch_fla_zero_output_tail(const int32_t*, int, void*, int64_t, int
 hggcError_t launch_fla_metadata_n1_tail(const void*, bool, int32_t*, int64_t*,
     int32_t*, int32_t*, int, int, int32_t*, int64_t*, int, int, int, int,
     void*, int64_t, hggcStream_t);
-// Defined with the token stage: N=1 L2 + token fusion that also publishes qn/kn
-// and, given w/u/kg, the inter stage's prepared operands and solved diagonal.
-extern "C" hggcError_t launch_fla_token_l2__fla_h4(
-    const void*, const void*, void*, void*, const float*, const uint16_t*, int64_t,
-    void*, float*, void*, void*, void*, void*, float, const int32_t*, int, int,
-    hggcStream_t);
-extern "C" hggcError_t launch_fla_token_l2__fla_h8(
-    const void*, const void*, void*, void*, const float*, const uint16_t*, int64_t,
-    void*, float*, void*, void*, void*, void*, float, const int32_t*, int, int,
-    hggcStream_t);
-// Defined with the inter stage: launch_fla_inter_prepared without its prepare.
-extern "C" hggcError_t launch_fla_inter_solve_prepared__fla_h4(
-    const void*, const void*, const float*, const uint16_t*, int64_t, float*, void*,
-    void*, void*, void*, void*, float, const int32_t*, const int32_t*, int, int, int,
-    int, hggcStream_t);
-extern "C" hggcError_t launch_fla_inter_solve_prepared__fla_h8(
-    const void*, const void*, const float*, const uint16_t*, int64_t, float*, void*,
-    void*, void*, void*, void*, float, const int32_t*, const int32_t*, int, int, int,
-    int, hggcStream_t);
+// Optional head-specialized token/solve stages are resolved by the adapter table.
 
 namespace fla_runtime {
 namespace {
@@ -466,7 +448,8 @@ void forward(Arguments a) {
   const auto* indices = a.indices.defined() ? a.indices.data_ptr<int32_t>() : nullptr;
   if (s.t && s.chunks) {
     const bool prepared_n1 = s.n == 1 && (s.h == 4 || s.h == 8) &&
-        (s.t == 4096 || s.t == 8192 || s.t == 16384 || s.t == 32768);
+        (s.t == 4096 || s.t == 8192 || s.t == 16384 || s.t == 32768) &&
+        table.token_l2 && table.inter_solve_prepared;
     // Prepared CP consumers need no workspace memset: the token stage writes
     // Aqk zeros before its diagonal tiles, the solve reads akkd's solved
     // diagonal only for live rows, and recompute zero-fills the upper inverse.
@@ -489,8 +472,7 @@ void forward(Arguments a) {
       TORCH_INTERNAL_ASSERT(layout.w.bytes == s.t * s.h * 128 * 2 &&
                             layout.u.bytes == layout.w.bytes &&
                             layout.kg.bytes == layout.w.bytes && s.chunks <= s.t / 64);
-      auto token_l2 = s.h == 4 ? launch_fla_token_l2__fla_h4 : launch_fla_token_l2__fla_h8;
-      cuda_check(token_l2(a.q.data_ptr(), a.k.data_ptr(), qn, kn, gate, beta_raw, beta_stride,
+      cuda_check(table.token_l2(a.q.data_ptr(), a.k.data_ptr(), qn, kn, gate, beta_raw, beta_stride,
                           aqk, akkd, qg, w, u, kg, a.scale, cu, s.t, s.h,
                           reinterpret_cast<hggcStream_t>(stream.stream())), "L2 + token + prepare");
     } else {
@@ -498,9 +480,7 @@ void forward(Arguments a) {
                             s.n, s.t, s.h, reinterpret_cast<hggcStream_t>(stream.stream())), "token");
     }
     if (prepared_n1) {
-      auto prepared = s.h == 4 ? launch_fla_inter_solve_prepared__fla_h4
-                              : launch_fla_inter_solve_prepared__fla_h8;
-      cuda_check(prepared(qn, kn, gate, beta_raw, beta_stride, akkd, aqk, inverse,
+      cuda_check(table.inter_solve_prepared(qn, kn, gate, beta_raw, beta_stride, akkd, aqk, inverse,
                           w, u, kg, a.scale, cu, chunks, s.chunks, s.t, s.n, s.h,
                           reinterpret_cast<hggcStream_t>(stream.stream())), "inter prepared");
     } else {
