@@ -51,7 +51,7 @@ master uses an independent FP64 closed form with per-head
     never finish inside the accuracy gate), and ``pro_fast()`` replicates the use_nows gating of kernel2_recurrence.cu
     so the report shows whether a shape hits the pro fast path or the baseline.
 
-## Three test stages
+## Test stages
 
   * ``dispatch``: runs the path matrix of e2e_acc_full, making sure every K2 variant and state contract is hit.
   * ``caselist``: runs the real shapes of ``caselist/prefill/Kimi-K3_prefill_tp{1,2,4,8}_*kda_op.list``
@@ -59,6 +59,8 @@ master uses an independent FP64 closed form with per-head
   * ``master``: tc02 serial FP32 master state; reduce output over valid tokens x V
     and state over V x K, independently per sequence and head. Skip output for
     empty sequences; use the absolute-error fallback for a zero reference.
+  * ``tc01-reference``: validate PLA and the vendored Triton reference against
+    a CPU FP64 natural-log recurrence, including fused and separate intra paths.
 
 ## Output
 
@@ -521,10 +523,125 @@ def case_prepare_diagonal(rep, layout, threads, chunks_per_cta):
         os.environ.update(saved)
 
 
+def case_tc01_reference(rep, heads, lengths, state_dtype, seed, reference_mode,
+                        cp_mode="auto", graph=False):
+    """Validate both implementations against an independent natural-log recurrence."""
+    from unittest.mock import patch
+    import bench_vs_fla as bench
+    from pla.prefill.flashkdapro import flashkda_fwd
+
+    torch.manual_seed(seed)
+    inputs = bench.make_inputs(lengths, heads, torch.bfloat16, "cuda", len(lengths) + 2)
+    q, k, v, raw, logits, beta, a_log, bias, cu, _, initial = inputs
+    slots = torch.arange(len(lengths), 0, -1, dtype=torch.int32, device=q.device)
+    initial = initial.to(state_dtype)
+    offsets = cu.cpu().tolist()
+    # Match the public normalization boundary, not either chunk implementation.
+    qn, kn = [(x[0].cpu().float() * torch.rsqrt(x[0].cpu().float().square().sum(-1, keepdim=True) + 1e-6)
+               ).bfloat16().double() for x in (q, k)]
+    decay = (-5 * torch.sigmoid(a_log.cpu().double().exp()[None, :, None]
+                                * (raw[0].cpu().double() + bias.cpu().double()))).exp()
+    beta64, value64 = logits[0].cpu().double().sigmoid(), v[0].cpu().double()
+    expected = torch.empty_like(value64)
+    final64 = initial.cpu().double().clone()
+    previous_threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        for seq, (begin, end) in enumerate(zip(offsets, offsets[1:])):
+            state = final64[int(slots[seq])]
+            for t in range(begin, end):
+                state *= decay[t, :, None, :]
+                delta = (value64[t] - (state * kn[t, :, None, :]).sum(-1)) * beta64[t, :, None]
+                state += delta[:, :, None] * kn[t, :, None, :]
+                expected[t] = (state * qn[t, :, None, :]).sum(-1) * 128 ** -0.5
+    finally:
+        torch.set_num_threads(previous_threads)
+
+    fla = bench._load_triton_chunk_kda()
+    import ref.kda as reference
+    intra = reference.chunk_kda_fwd_intra
+
+    def select_intra(**kwargs):
+        if reference_mode != "auto":
+            kwargs.update(fuse_diagonal=False, fuse_recompute=False,
+                          safe_gate=reference_mode == "safe")
+        return intra(**kwargs)
+
+    ref_pool = initial.clone()
+    with patch.object(reference, "chunk_kda_fwd_intra", select_intra):
+        ref_out = fla(q=q, k=k, v=v.clone(), g=raw, beta=beta, scale=128 ** -0.5,
+                      initial_state=ref_pool, initial_state_indices=slots,
+                      use_qk_l2norm_in_kernel=True, cu_seqlens=cu,
+                      A_log=a_log, dt_bias=bias, lower_bound=-5.)
+    failures = []
+
+    def check(name, output, pool):
+        for seq, (begin, end) in enumerate(zip(offsets, offsets[1:])):
+            slot = int(slots[seq])
+            for head in range(heads):
+                for target, actual, oracle in (("output", output[begin:end, head], expected[begin:end, head]),
+                                                ("state", pool[slot, head], final64[slot, head])):
+                    rel, absolute, passed = _master_metrics(actual, oracle)
+                    rep.info(f"{name} seq={seq} head={head} {target} relative_rms={rel:.8g} max_abs={absolute:.8g}")
+                    if not passed:
+                        failures.append(f"{name} seq={seq} head={head} {target}: {rel:g}, {absolute:g}")
+        if not torch.equal(pool[0], initial[0]) or not torch.equal(pool[-1], initial[-1]):
+            failures.append(f"{name}: unmapped state slot changed")
+
+    check("triton", ref_out[0], ref_pool)
+    for trusted in (False, True):
+        pool = initial.clone()
+        output = torch.empty_like(v[0])
+        with patch.dict(os.environ, {"PLA_FLASHKDA_TC01_IMPL": "fla",
+                                     "PLA_FLASHKDA_TC01_FLA_CP": cp_mode if trusted else "auto",
+                                     "PLA_FLASHKDA_TC01_FLA_CP_ALGO": "state" if cp_mode == "1" else ""}):
+            def invoke():
+                flashkda_fwd(q[0], k[0], v[0], raw[0], logits[0], a_log, bias, output,
+                             cu_seqlens=cu, raw_cu_seqlens=tuple(offsets) if trusted else None,
+                             state_pool=pool, state_indices=slots)
+
+            invoke()
+            check(f"pla_trusted{int(trusted)}", output, pool)
+            if graph:
+                side = torch.cuda.Stream()
+                side.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(side):
+                    invoke()
+                torch.cuda.current_stream().wait_stream(side)
+                torch.cuda.synchronize()
+                captured = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(captured, stream=side):
+                    invoke()
+                for replay in range(2):
+                    pool.copy_(initial)
+                    captured.replay()
+                    check(f"pla_graph{replay}_trusted{int(trusted)}", output, pool)
+    return failures
+
+
+def case_tc01_chunk_indices(rep):
+    import bench_vs_fla as bench
+    bench._load_triton_chunk_kda()
+    from ref.index import prepare_chunk_indices
+
+    for offsets, pairs in (((0, 0, 19, 84), ((1, 0), (2, 0), (2, 1))),
+                           ((0, 19, 19, 84, 84), ((0, 0), (2, 0), (2, 1))),
+                           ((0, 19, 84), ((0, 0), (1, 0), (1, 1))),
+                           ((0, 0, 0), ())):
+        for device in ("cpu", "cuda"):
+            for dtype in (torch.int32, torch.int64):
+                cu = torch.tensor(offsets, device=device, dtype=dtype)
+                actual = prepare_chunk_indices(cu, 64)
+                expected = torch.tensor(pairs, device=device, dtype=dtype).reshape(-1, 2)
+                assert actual.dtype == cu.dtype and actual.device == cu.device
+                assert torch.equal(actual, expected), (offsets, actual, expected)
+    return []
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--phase", choices=["all", "dispatch", "caselist", "master",
-                                       "master-short", "master-cp", "prepare-diagonal"], default="all")
+                                       "master-short", "master-cp", "prepare-diagonal", "tc01-reference"], default="all")
     ap.add_argument("--list-dir", default=DEFAULT_LIST_DIR,
                     help="prefill caselist directory (relative to the repo root)")
     ap.add_argument("--tp", default=",".join(str(t) for t in DEFAULT_TPS),
@@ -627,14 +744,47 @@ def main():
             print("ERROR: stable prepare diagonal regression requires tc02", file=sys.stderr)
             return 2
 
+    if args.phase in ("all", "tc01-reference"):
+        if torch.cuda.get_device_capability() == (8, 0):
+            plan.append(("tc01_reference_chunk_indices", case_tc01_chunk_indices, ()))
+            for heads in (4, 6, 8):
+                for lengths in ((19,), (64,), (65,), (4096,), (0, 19, 65)):
+                    for dtype in (torch.bfloat16, torch.float32):
+                        plan.append((f"tc01_reference_h{heads}_lens{lengths}_{_dt_tag(dtype)}",
+                                     case_tc01_reference, (heads, lengths, dtype, 0, "auto")))
+            for mode in ("token", "safe"):
+                for lengths in ((19,), (64,), (0, 19, 65)):
+                    plan.append((f"tc01_reference_{mode}_lens{lengths}", case_tc01_reference,
+                                 (4, lengths, torch.float32, 1, mode)))
+            for heads, lengths, cp_mode in (
+                    (4, (19,), "1"), (4, (64,), "1"), (4, (65,), "1"),
+                    (4, (128,), "auto"), (4, (16384,), "auto"),
+                    (6, (19,), "1"), (8, (19,), "1"),
+                    (6, (8192,), "auto"), (8, (8192,), "auto"),
+                    (4, (19, 0, 65, 0), "auto")):
+                for dtype in (torch.bfloat16, torch.float32):
+                    plan.append((f"tc01_graph_h{heads}_lens{lengths}_cp{cp_mode}_{_dt_tag(dtype)}",
+                                 case_tc01_reference, (heads, lengths, dtype, 2, "auto", cp_mode, True)))
+            for heads in (4, 6, 8):
+                for tokens in (1, 16, 19, 32, 63, 64, 65, 96, 127):
+                    for dtype in (torch.bfloat16, torch.float32):
+                        plan.append((f"tc01_short_auto_h{heads}_t{tokens}_{_dt_tag(dtype)}",
+                                     case_tc01_reference,
+                                     (heads, (tokens,), dtype, 3, "auto", "auto", True)))
+        elif args.phase == "tc01-reference":
+            print("ERROR: tc01 reference regression requires an 810E", file=sys.stderr)
+            return 2
+
     # Case file tags the sub-case names with their source; in dispatch-only mode there is no caselist, so tag the script itself
     case_file = sources[0] if sources else "tests/test_kda_prefill_flashkdapro.py"
     rep = CaseReporter("kda_prefill_flashkdapro", case_file, total=len(plan))
     rep.header()
-    if args.phase not in ("master", "master-short", "master-cp", "prepare-diagonal"):
+    if args.phase not in ("master", "master-short", "master-cp", "prepare-diagonal", "tc01-reference"):
         print(f"oracle: fp32 torch ref_fwd (private/test_fwd_e2e.py), "
               f"judge err_ratio < {acc.TOL:g}")
     print(f"phase: {args.phase}")
+    if args.phase in ("all", "tc01-reference"):
+        print("tc01 oracle: CPU FP64 natural-log recurrence; per-head RMS <= 0.05 OR max_abs <= 1e-6")
     if args.phase in ("all", "prepare-diagonal"):
         print("diagonal oracle: FP64 dot of normalized BF16 Q/K; gate invariance; per-head RMS <= 0.05 OR max_abs <= 1e-6")
     if args.phase in ("all", "master", "master-short", "master-cp"):

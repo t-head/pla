@@ -508,6 +508,204 @@ CUTE_DEVICE void diagonal_solve_four(Input const& akkd, int64_t start,
   exchange_diagonal(shared, d3, lane);
 }
 
+template <int First, class Input, class Accum>
+CUTE_DEVICE void diagonal_solve_columns(Input const& akkd, int64_t start,
+    int64_t end, int head, SharedImages& shared, Accum& left, Accum& right,
+    int lane) {
+  const int column = lane & 15;
+  const int half = lane >> 4;
+  const int64_t base = start + (First + half) * kBC;
+  float solved[16] = {};
+  CUTE_UNROLL
+  for (int row = 0; row < kBC; ++row) {
+    const float coefficient = base + row < end && column < row
+        ? -akkd(base + row, head, column) : 0.0f;
+    float value = column == row ? 1.0f : 0.0f;
+    CUTE_UNROLL
+    for (int previous = 0; previous < row; ++previous) {
+      const float broadcast = __shfl_sync(0xffffffffu, coefficient, previous, 16);
+      value = __fadd_rn(value, __fmul_rn(broadcast, solved[previous]));
+    }
+    solved[row] = value;
+    shared.fp32[half][row * kBC + column] = __float_as_uint(value);
+  }
+  __syncthreads();
+  auto coord = c_coordinates(lane);
+  CUTE_UNROLL
+  for (int v = 0; v < size(left); ++v) {
+    auto rc = coord(v);
+    const int index = get<0>(rc) * kBC + get<1>(rc);
+    left(v) = __uint_as_float(shared.fp32[0][index]);
+    right(v) = __uint_as_float(shared.fp32[1][index]);
+  }
+  __syncthreads();
+}
+
+template <int R, class Input, class Accum>
+CUTE_DEVICE void load_prepared_diagonal(Input const& akkd, int64_t start,
+    int64_t end, int head, Accum& result, int lane) {
+  auto coord = c_coordinates(lane);
+  CUTE_UNROLL
+  for (int v = 0; v < size(result); ++v) {
+    auto rc = coord(v);
+    const int row = get<0>(rc), col = get<1>(rc);
+    const int64_t token = start + R * kBC + row;
+    result(v) = token < end ? akkd(token, head, col) : (row == col ? 1.0f : 0.0f);
+  }
+}
+
+template <class T>
+CUTE_DEVICE T* prepared_tile(T* w, T* u, T* kg, int64_t chunk,
+                             int head, int tile) {
+  T* base = tile < 4 ? w : tile < 8 ? u : kg;
+  return base + (chunk * kH + head) * 8192 + (tile % 4) * 2048;
+}
+
+template <bool Clustered = false>
+__global__ __launch_bounds__(128)
+__block_size__((128, 1, 1))
+void prepare_inter_operands(const __ppu_bfloat16* q,
+    const __ppu_bfloat16* k, const float* g, float* akkd, bfloat16_t* w,
+    bfloat16_t* u, bfloat16_t* kg, const int32_t* cu,
+    const int32_t* chunk_indices, int chunks, int total_tokens, int n) {
+  const int chunk = Clustered ? blockIdx.x / 4 : blockIdx.x;
+  const int head = blockIdx.y;
+  const int r = (Clustered ? blockIdx.x % 4 : blockIdx.z) + 1;
+  if (chunk >= chunks) return;
+  const int sequence = chunk_indices[2 * chunk];
+  const int local_chunk = chunk_indices[2 * chunk + 1];
+  if (sequence < 0 || sequence >= n || local_chunk < 0) return;
+  const int64_t bos = cu[sequence], end = cu[sequence + 1];
+  const int64_t start = bos + int64_t(local_chunk) * kBT;
+  if (bos < 0 || end > total_tokens || start >= end) return;
+  if (r == 4) {
+    if (FLA_INTER_FORCE_FP32_DIAGONAL && threadIdx.x < 64) {
+      const int column = threadIdx.x & 15;
+      const int64_t base = start + (threadIdx.x >> 4) * kBC;
+      auto diagonal = global_tensor<kBC>(akkd, total_tokens);
+      float solved[16] = {};
+      CUTE_UNROLL
+      for (int row = 0; row < kBC; ++row) {
+        const float coefficient = base + row < end && column < row
+            ? -diagonal(base + row, head, column) : 0.0f;
+        float value = column == row ? 1.0f : 0.0f;
+        CUTE_UNROLL
+        for (int previous = 0; previous < row; ++previous) {
+          const float broadcast = __shfl_sync(0xffffffffu, coefficient, previous, 16);
+          value = __fadd_rn(value, __fmul_rn(broadcast, solved[previous]));
+        }
+        solved[row] = value;
+        if (base + row < end) diagonal(base + row, head, column) = value;
+      }
+    }
+    return;
+  }
+  const int64_t target = start + r * kBC;
+  const int tile = r == 1 ? 0 : r == 2 ? 3 : 7;
+  auto gQ = global_tensor<kK>(q, total_tokens);
+  auto gK = global_tensor<kK>(k, total_tokens);
+  auto gG = global_tensor<kK>(g, total_tokens);
+  CUTE_UNROLL
+  for (int group = 0; group < 4; ++group) {
+    const int linear = threadIdx.x * 4 + group * 512;
+    const int row = linear / kK, d = linear % kK;
+    float anchor[4] = {};
+    bfloat16_t qv[4] = {}, kv[4] = {};
+    if (target < end) {
+      const float4 av = load_aligned_vector<float4>(&gG(target, head, d));
+      anchor[0] = av.x; anchor[1] = av.y;
+      anchor[2] = av.z; anchor[3] = av.w;
+    }
+    if (target + row < end) {
+      const float4 gv = load_aligned_vector<float4>(&gG(target + row, head, d));
+      const float gate[4] = {gv.x, gv.y, gv.z, gv.w};
+      const uint2 qraw = load_aligned_vector<uint2>(&gQ(target + row, head, d));
+      const uint2 kraw = load_aligned_vector<uint2>(&gK(target + row, head, d));
+      CUTE_UNROLL
+      for (int c = 0; c < 4; ++c) {
+        const float e = natural_exp(__fsub_rn(gate[c], anchor[c]));
+        qv[c] = bfloat16_t(__fmul_rn(bf16_vector_component(qraw, c), e));
+        kv[c] = bfloat16_t(__fmul_rn(bf16_vector_component(kraw, c), e));
+      }
+    }
+    store_bf16x4(prepared_tile(w, u, kg, chunk, head, tile) + linear, qv);
+    store_bf16x4(prepared_tile(w, u, kg, chunk, head, tile + 1) + linear, kv);
+    CUTE_UNROLL
+    for (int s = 0; s < 3; ++s) {
+      if (s < r) {
+        bfloat16_t bv[4] = {};
+        if (target < end) {
+          const int64_t source = start + s * kBC + row;
+          const float4 gv = load_aligned_vector<float4>(&gG(source, head, d));
+          const float gate[4] = {gv.x, gv.y, gv.z, gv.w};
+          const uint2 raw = load_aligned_vector<uint2>(&gK(source, head, d));
+          CUTE_UNROLL
+          for (int c = 0; c < 4; ++c) {
+            const float e = natural_exp(__fsub_rn(anchor[c], gate[c]));
+            bv[c] = bfloat16_t(__fmul_rn(bf16_vector_component(raw, c), e));
+          }
+        }
+        store_bf16x4(prepared_tile(w, u, kg, chunk, head, tile + 2 + s) + linear, bv);
+      }
+    }
+  }
+}
+
+template <bool Async>
+CUTE_DEVICE void copy_prepared_vector(bfloat16_t* destination,
+                                      const bfloat16_t* source) {
+#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ == 100
+  if constexpr (Async) {
+    const uint32_t address = static_cast<uint32_t>(
+        __cvta_generic_to_shared(destination));
+    asm volatile("ppu.cp.async.ca.shared.global [%0 + 0], [%1 + 0], 0x8, 0x8;\n"
+        :: "r"(address), "l"(source) : "memory");
+  } else
+#endif
+  {
+    const uint2 value = load_aligned_vector<uint2>(source);
+    __builtin_memcpy(__builtin_assume_aligned(destination, 8), &value, sizeof(value));
+  }
+}
+
+template <int R, int S, bool Async, class Accum>
+CUTE_DEVICE void prepared_pair(const bfloat16_t* w, const bfloat16_t* u,
+    const bfloat16_t* kg, int64_t chunk, int64_t start, int64_t end,
+    int head, int slab, SharedImages& shared, Accum& cq, Accum& ck, int lane) {
+  if (start + R * kBC >= end) return;
+  constexpr int tile = R == 1 ? 0 : R == 2 ? 3 : 7;
+  auto sq = make_tensor(make_smem_ptr(shared.bf16.q), Bf16WriteLayout{});
+  auto sk = make_tensor(make_smem_ptr(shared.bf16.k), Bf16WriteLayout{});
+  auto sb = make_tensor(make_smem_ptr(shared.bf16.b), Bf16WriteLayout{});
+  __syncthreads();
+  CUTE_UNROLL
+  for (int group = 0; group < 4; ++group) {
+    const int linear = lane * 4 + group * 128;
+    const int row = linear / 32, col = linear % 32;
+    const int offset = row * kK + slab * 32 + col;
+    if constexpr (S == 0) {
+      copy_prepared_vector<Async>(&sq(row, col),
+          prepared_tile(w, u, kg, chunk, head, tile) + offset);
+      copy_prepared_vector<Async>(&sk(row, col),
+          prepared_tile(w, u, kg, chunk, head, tile + 1) + offset);
+    }
+    copy_prepared_vector<Async>(&sb(row, col),
+        prepared_tile(w, u, kg, chunk, head, tile + 2 + S) + offset);
+  }
+#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ == 100
+  if constexpr (Async) {
+    asm volatile("ppu.cp.async.commit_group;\n"
+                 "ppu.cp.async.wait_group 0;\n" ::: "memory");
+  }
+#endif
+  __syncthreads();
+  auto rq = make_tensor(make_smem_ptr(tsm_shared_base<bfloat16_t>(shared.bf16.q)), LogicalLayout<32>{});
+  auto rk = make_tensor(make_smem_ptr(tsm_shared_base<bfloat16_t>(shared.bf16.k)), LogicalLayout<32>{});
+  auto rb = make_tensor(make_smem_ptr(tsm_shared_base<bfloat16_t>(shared.bf16.b)), LogicalLayout<32>{});
+  mma_two_k<Bf16Mma, Bf16Copy>(rq, rb, cq, lane);
+  mma_two_k<Bf16Mma, Bf16Copy>(rk, rb, ck, lane);
+}
+
 template <bool Right, class Accum>
 CUTE_DEVICE void stage_fp32(uint32_t* image, Accum const& value, int lane) {
   auto write = make_tensor(make_smem_ptr(image), Tf32WriteLayout{});
@@ -1283,7 +1481,8 @@ CUTE_DEVICE void run_pair(TensorQ const& q, TensorK const& k,
 
 }  // namespace fla_inter_solve_cute_wide
 
-extern "C" __global__ __launch_bounds__(32, 1)
+template <bool Prepared, bool Async = false>
+__global__ __launch_bounds__(32, 1)
 __block_size__((32, 1, 1))
 void fla_inter_solve_bf16_d128_bt64_bc16_h8_kernel(
     const __ppu_bfloat16* __restrict__ q, const __ppu_bfloat16* __restrict__ k,
@@ -1291,7 +1490,8 @@ void fla_inter_solve_bf16_d128_bt64_bc16_h8_kernel(
     int64_t beta_stride,
     const float* __restrict__ akkd, __ppu_bfloat16* __restrict__ aqk,
     __ppu_bfloat16* __restrict__ akk, float scale, const int32_t* __restrict__ cu,
-    const int32_t* __restrict__ chunk_indices, int chunks, int total_tokens, int n) {
+    const int32_t* __restrict__ chunk_indices, int chunks, int total_tokens, int n,
+    const cute::bfloat16_t* w, const cute::bfloat16_t* u, const cute::bfloat16_t* kg) {
   using namespace fla_inter_solve_cute_legacy;
   extern __shared__ __align__(128) unsigned char shared_bytes[];
   auto& shared = *reinterpret_cast<SharedImages*>(shared_bytes);
@@ -1330,13 +1530,22 @@ void fla_inter_solve_bf16_d128_bt64_bc16_h8_kernel(
     // Four K32 slabs; six expanded pairs yield 24 static BF16 atom calls.
     CUTE_NO_UNROLL
     for (int slab = 0; slab < 4; ++slab) {
-      Source0Cache source0{};
-      bf16_pair<1, 0>(gQ, gK, gG, start, end, head, slab, source0, shared, q10, a10, lane);
-      bf16_pair<2, 0>(gQ, gK, gG, start, end, head, slab, source0, shared, q20, a20, lane);
-      bf16_pair<2, 1>(gQ, gK, gG, start, end, head, slab, source0, shared, q21, a21, lane);
-      bf16_pair<3, 0>(gQ, gK, gG, start, end, head, slab, source0, shared, q30, a30, lane);
-      bf16_pair<3, 1>(gQ, gK, gG, start, end, head, slab, source0, shared, q31, a31, lane);
-      bf16_pair<3, 2>(gQ, gK, gG, start, end, head, slab, source0, shared, q32, a32, lane);
+      if constexpr (Prepared) {
+        prepared_pair<1, 0, Async>(w, u, kg, chunk, start, end, head, slab, shared, q10, a10, lane);
+        prepared_pair<2, 0, Async>(w, u, kg, chunk, start, end, head, slab, shared, q20, a20, lane);
+        prepared_pair<2, 1, Async>(w, u, kg, chunk, start, end, head, slab, shared, q21, a21, lane);
+        prepared_pair<3, 0, Async>(w, u, kg, chunk, start, end, head, slab, shared, q30, a30, lane);
+        prepared_pair<3, 1, Async>(w, u, kg, chunk, start, end, head, slab, shared, q31, a31, lane);
+        prepared_pair<3, 2, Async>(w, u, kg, chunk, start, end, head, slab, shared, q32, a32, lane);
+      } else {
+        Source0Cache source0{};
+        bf16_pair<1, 0>(gQ, gK, gG, start, end, head, slab, source0, shared, q10, a10, lane);
+        bf16_pair<2, 0>(gQ, gK, gG, start, end, head, slab, source0, shared, q20, a20, lane);
+        bf16_pair<2, 1>(gQ, gK, gG, start, end, head, slab, source0, shared, q21, a21, lane);
+        bf16_pair<3, 0>(gQ, gK, gG, start, end, head, slab, source0, shared, q30, a30, lane);
+        bf16_pair<3, 1>(gQ, gK, gG, start, end, head, slab, source0, shared, q31, a31, lane);
+        bf16_pair<3, 2>(gQ, gK, gG, start, end, head, slab, source0, shared, q32, a32, lane);
+      }
     }
     finish_pair<1, 0>(gBeta, gAqk, start, end, head, scale, q10, a10, lane);
     finish_pair<2, 0>(gBeta, gAqk, start, end, head, scale, q20, a20, lane);
@@ -1353,6 +1562,16 @@ void fla_inter_solve_bf16_d128_bt64_bc16_h8_kernel(
     diagonal_poly_full<1>(gAkkd, start, head, shared, d11, lane);
     diagonal_poly_full<2>(gAkkd, start, head, shared, d22, lane);
     diagonal_poly_full<3>(gAkkd, start, head, shared, d33, lane);
+  } else if (Prepared && FLA_INTER_FORCE_FP32_DIAGONAL) {
+    load_prepared_diagonal<0>(gAkkd, start, end, head, d00, lane);
+    load_prepared_diagonal<1>(gAkkd, start, end, head, d11, lane);
+    load_prepared_diagonal<2>(gAkkd, start, end, head, d22, lane);
+    load_prepared_diagonal<3>(gAkkd, start, end, head, d33, lane);
+  } else if (n == 1 && (kH == 4 || kH == 8) &&
+             total_tokens >= 4096 && total_tokens <= 8192) {
+    __syncthreads();
+    diagonal_solve_columns<0>(gAkkd, start, end, head, shared, d00, d11, lane);
+    diagonal_solve_columns<2>(gAkkd, start, end, head, shared, d22, d33, lane);
   } else {
     diagonal_solve_four(gAkkd, start, end, head, shared,
                         d00, d11, d22, d33, lane);
@@ -1659,6 +1878,77 @@ void fla_inter_solve_bf16_d128_bt64_bc16_h8_wide_kernel(
 constexpr int kWideMaxChunksH4 = 16;  // heads <= 4: <= ~1024 tokens per head
 constexpr int kWideMaxChunksH8 = 12;  // heads <= 8: <= ~768 tokens per head
 
+extern "C" hggcError_t FLA_JOIN_HEAD(launch_fla_inter_solve_prepared, FLA_HEADS)(
+    const void* q, const void* k, const float* g, const uint16_t* beta_raw,
+    int64_t beta_stride, float* akkd, void* aqk, void* akk,
+    void* w, void* u, void* kg, float scale, const int32_t* cu,
+    const int32_t* chunk_indices, int chunks, int total_tokens,
+    int n, int heads, hggcStream_t stream);
+
+extern "C" hggcError_t FLA_JOIN_HEAD(launch_fla_inter_prepared, FLA_HEADS)(
+    const void* q, const void* k, const float* g, const uint16_t* beta_raw,
+    int64_t beta_stride, float* akkd, void* aqk, void* akk,
+    void* w, void* u, void* kg, float scale, const int32_t* cu,
+    const int32_t* chunk_indices, int chunks, int total_tokens,
+    int n, int heads, hggcStream_t stream) {
+  if (n != 1 || total_tokens % 64 || chunks < 0 || chunks > total_tokens / 64 ||
+      (heads != 4 && heads != 8) || !w || !u || !kg)
+    return hggcErrorInvalidValue;
+  if (chunks == 0) return hggcSuccess;
+  using namespace fla_inter_solve_cute_legacy;
+  if (total_tokens == 32768 || (heads == 8 && total_tokens == 16384)) {
+    prepare_inter_operands<true><<<dim3(chunks * 4, heads, 1), 128, 0, stream>>>(
+        static_cast<const __ppu_bfloat16*>(q), static_cast<const __ppu_bfloat16*>(k),
+        g, akkd, static_cast<cute::bfloat16_t*>(w), static_cast<cute::bfloat16_t*>(u),
+        static_cast<cute::bfloat16_t*>(kg), cu, chunk_indices, chunks, total_tokens, n);
+  } else {
+    prepare_inter_operands<false><<<dim3(chunks, heads, 4), 128, 0, stream>>>(
+        static_cast<const __ppu_bfloat16*>(q), static_cast<const __ppu_bfloat16*>(k),
+        g, akkd, static_cast<cute::bfloat16_t*>(w), static_cast<cute::bfloat16_t*>(u),
+        static_cast<cute::bfloat16_t*>(kg), cu, chunk_indices, chunks, total_tokens, n);
+  }
+  auto status = hggcGetLastError();
+  if (status != hggcSuccess) return status;
+  return FLA_JOIN_HEAD(launch_fla_inter_solve_prepared, FLA_HEADS)(
+      q, k, g, beta_raw, beta_stride, akkd, aqk, akk, w, u, kg, scale, cu,
+      chunk_indices, chunks, total_tokens, n, heads, stream);
+}
+
+// Solve-only half of launch_fla_inter_prepared, for callers whose token stage
+// already produced the prepared w/u/kg tiles and solved the akkd diagonal.
+extern "C" hggcError_t FLA_JOIN_HEAD(launch_fla_inter_solve_prepared, FLA_HEADS)(
+    const void* q, const void* k, const float* g, const uint16_t* beta_raw,
+    int64_t beta_stride, float* akkd, void* aqk, void* akk,
+    void* w, void* u, void* kg, float scale, const int32_t* cu,
+    const int32_t* chunk_indices, int chunks, int total_tokens,
+    int n, int heads, hggcStream_t stream) {
+  if (n != 1 || total_tokens % 64 || chunks < 0 || chunks > total_tokens / 64 ||
+      (heads != 4 && heads != 8) || !w || !u || !kg)
+    return hggcErrorInvalidValue;
+  if (chunks == 0) return hggcSuccess;
+  using namespace fla_inter_solve_cute_legacy;
+  if (total_tokens == 16384 || total_tokens == 32768) {
+    fla_inter_solve_bf16_d128_bt64_bc16_h8_kernel<true, true><<<
+        dim3(chunks, heads, 1), 32, kSharedBytes, stream>>>(
+        static_cast<const __ppu_bfloat16*>(q), static_cast<const __ppu_bfloat16*>(k),
+        g, reinterpret_cast<const __ppu_bfloat16*>(beta_raw), beta_stride,
+        akkd, static_cast<__ppu_bfloat16*>(aqk), static_cast<__ppu_bfloat16*>(akk),
+        scale, cu, chunk_indices, chunks, total_tokens, n,
+        static_cast<const cute::bfloat16_t*>(w), static_cast<const cute::bfloat16_t*>(u),
+        static_cast<const cute::bfloat16_t*>(kg));
+  } else {
+    fla_inter_solve_bf16_d128_bt64_bc16_h8_kernel<true><<<
+        dim3(chunks, heads, 1), 32, kSharedBytes, stream>>>(
+        static_cast<const __ppu_bfloat16*>(q), static_cast<const __ppu_bfloat16*>(k),
+        g, reinterpret_cast<const __ppu_bfloat16*>(beta_raw), beta_stride,
+        akkd, static_cast<__ppu_bfloat16*>(aqk), static_cast<__ppu_bfloat16*>(akk),
+        scale, cu, chunk_indices, chunks, total_tokens, n,
+        static_cast<const cute::bfloat16_t*>(w), static_cast<const cute::bfloat16_t*>(u),
+        static_cast<const cute::bfloat16_t*>(kg));
+  }
+  return hggcGetLastError();
+}
+
 extern "C" hggcError_t launch_fla_inter_solve_bf16_d128_bt64_bc16_h8(
     const void* q, const void* k, const float* g, const uint16_t* beta_raw,
     int64_t beta_stride,
@@ -1680,13 +1970,13 @@ extern "C" hggcError_t launch_fla_inter_solve_bf16_d128_bt64_bc16_h8(
         akkd, static_cast<__ppu_bfloat16*>(aqk), static_cast<__ppu_bfloat16*>(akk),
         scale, cu, chunk_indices, chunks, total_tokens, n);
   } else {
-    fla_inter_solve_bf16_d128_bt64_bc16_h8_kernel<<<
+    fla_inter_solve_bf16_d128_bt64_bc16_h8_kernel<false><<<
         dim3(chunks, heads, 1), dim3(32, 1, 1),
         fla_inter_solve_cute_legacy::kSharedBytes, stream>>>(
         static_cast<const __ppu_bfloat16*>(q), static_cast<const __ppu_bfloat16*>(k),
         g, reinterpret_cast<const __ppu_bfloat16*>(beta_raw), beta_stride,
         akkd, static_cast<__ppu_bfloat16*>(aqk), static_cast<__ppu_bfloat16*>(akk),
-        scale, cu, chunk_indices, chunks, total_tokens, n);
+        scale, cu, chunk_indices, chunks, total_tokens, n, nullptr, nullptr, nullptr);
   }
   return hggcGetLastError();
 }

@@ -44,6 +44,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import types
 import unittest
 from unittest.mock import Mock, patch
@@ -452,6 +453,214 @@ class BuildTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'list is incomplete'):
             self.build.object_groups({})
 
+    def test_cp_auto_short_buckets_and_explicit_overrides(self):
+        compiler = shutil.which('c++')
+        if not compiler:
+            self.skipTest('requires a C++17 host compiler')
+        runtime = (SOURCE / 'runtime.cc').read_text()
+        selectors = runtime.split('struct CpSelection {', 1)[1].split(
+            'std::shared_mutex init_mutex;', 1)[0]
+        source = r'''
+#include "cp_plan.h"
+#include <cassert>
+#include <cstdlib>
+#include <cstring>
+#include <optional>
+#include <vector>
+using namespace fla_runtime;
+struct Arguments { std::optional<std::vector<int64_t>> raw; };
+struct Shape { int n; int h; int64_t t = 0; };
+struct Launchers {
+  void (*cp_recurrence_output)();
+  Launchers(bool available) : cp_recurrence_output(available ? +[]{} : nullptr) {}
+};
+void require(bool ok, const char* message) {
+  if (!ok) throw std::invalid_argument(message);
+}
+struct CpSelection {
+''' + selectors + r'''
+int main() {
+  unsetenv("PLA_FLASHKDA_TC01_FLA_CP");
+  unsetenv("PLA_FLASHKDA_TC01_FLA_CP_ALGO");
+  for (int h : {4, 6, 8}) {
+    assert(select_fla_cp_auto_split(h, 0) == 0);
+    assert(select_fla_cp_auto_split(h, -1) == 0);
+    assert(select_fla_cp_auto_split(h, 102401) == 0);
+    for (int t : {1, 16, 19, 32, 63, 64, 65, 96, 127, 128}) {
+      Arguments a{std::vector<int64_t>{0, t}};
+      assert(select_cp(a, {1, h}, {true}).split == 1);
+      assert(select_cp_algorithm(1, h, t) == CpAlgorithm::State);
+      assert(!select_cp(Arguments{}, {1, h}, {true}).active());
+      assert(!select_cp(a, {2, h}, {true}).active());
+      assert(!select_cp(a, {1, h}, {false}).active());
+      setenv("PLA_FLASHKDA_TC01_FLA_CP", "off", 1);
+      assert(!select_cp(a, {1, h}, {true}).active());
+      setenv("PLA_FLASHKDA_TC01_FLA_CP", "1", 1);
+      assert(select_cp_algorithm(1, h, t) == CpAlgorithm::Legacy);
+      setenv("PLA_FLASHKDA_TC01_FLA_CP_ALGO", "state", 1);
+      assert(select_cp_algorithm(1, h, t) == CpAlgorithm::State);
+      setenv("PLA_FLASHKDA_TC01_FLA_CP", "auto", 1);
+      setenv("PLA_FLASHKDA_TC01_FLA_CP_ALGO", "legacy", 1);
+      assert(select_cp_algorithm(1, h, t) == CpAlgorithm::Legacy);
+      if (h == 4) assert(!select_cp(a, {1, h}, {true}).active());
+      unsetenv("PLA_FLASHKDA_TC01_FLA_CP_ALGO");
+    }
+  }
+  for (int t : {2049, 8192, 12287, 65537, 102400})
+    assert(select_fla_cp_auto_split(4, t) == 0);
+  assert(select_fla_cp_auto_split(4, 2048) == 1);
+  for (int t : {12288, 16384, 65536}) {
+    assert(select_fla_cp_auto_split(4, t) == 5);
+    assert(select_cp_algorithm(5, 4, t) == CpAlgorithm::State);
+  }
+  for (int h : {6, 8}) {
+    assert(select_fla_cp_auto_split(h, 102400) == 1);
+    assert(select_cp_algorithm(1, h, 65536) == CpAlgorithm::State);
+    assert(select_cp_algorithm(1, h, 65537) == CpAlgorithm::Legacy);
+  }
+  assert(select_fla_cp_auto_split(12, 8191) == 0);
+  assert(select_fla_cp_auto_split(12, 8192) == 1);
+  for (int h : {1, 5, 16, 24, 96})
+    assert(select_fla_cp_auto_split(h, 19) == 0);
+  for (int h : {4, 6, 8, 12}) {
+    for (int t : {4095, 4096, 4097, 8191, 8192, 8193}) {
+      for (const char* automatic : {static_cast<const char*>(nullptr), "", "auto"}) {
+        if (automatic) setenv("PLA_FLASHKDA_TC01_FLA_CP", automatic, 1);
+        else unsetenv("PLA_FLASHKDA_TC01_FLA_CP");
+        for (const char* algorithm : {static_cast<const char*>(nullptr), "", "state", "legacy", "invalid"}) {
+          if (algorithm) setenv("PLA_FLASHKDA_TC01_FLA_CP_ALGO", algorithm, 1);
+          else unsetenv("PLA_FLASHKDA_TC01_FLA_CP_ALGO");
+          const bool expected = h == 8 && (t == 4096 || t == 8192) &&
+              (!algorithm || !algorithm[0] || std::strcmp(algorithm, "state") == 0);
+          const auto cp = select_cp(Arguments{}, {1, h, t}, {true});
+          assert(cp.active() == expected);
+          if (expected) assert(cp.split == 1 && cp.count == 1 && cp.descriptor_row == -1);
+          assert(!select_cp(Arguments{}, {2, h, t}, {true}).active());
+          assert(!select_cp(Arguments{}, {1, h, t}, {false}).active());
+        }
+      }
+      for (const char* opt_out : {"off", "0"}) {
+        setenv("PLA_FLASHKDA_TC01_FLA_CP", opt_out, 1);
+        unsetenv("PLA_FLASHKDA_TC01_FLA_CP_ALGO");
+        assert(!select_cp(Arguments{}, {1, h, t}, {true}).active());
+      }
+      for (const char* forced : {"1", "2", "3", "4", "5", "8"}) {
+        setenv("PLA_FLASHKDA_TC01_FLA_CP", forced, 1);
+        bool rejected = false;
+        try { select_cp(Arguments{}, {1, h, t}, {true}); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        assert(rejected);
+      }
+    }
+  }
+}
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            binary = str(Path(directory) / 'cp_policy')
+            subprocess.run([compiler, '-std=c++17', '-x', 'c++', '-I', str(SOURCE),
+                            '-', '-o', binary], input=source, text=True, check=True)
+            subprocess.run([binary], check=True)
+
+    def test_n1_metadata_matches_device_geometry_and_tail(self):
+        compiler = shutil.which('c++')
+        if not compiler:
+            self.skipTest('requires a C++17 host compiler')
+        metadata = (SOURCE / 'metadata.cu').read_text()
+        geometry = '__global__ void cp_device_geometry(' + metadata.split(
+            '__global__ void cp_device_geometry(', 1)[1].split(
+                '// Device-offset output tail:', 1)[0]
+        fused = 'template<class Offset>\n__global__ void metadata_n1_tail(' + metadata.split(
+            'template<class Offset>\n__global__ void metadata_n1_tail(', 1)[1].split(
+                '}  // namespace', 1)[0]
+        # Run the actual kernel bodies as scalar host functions, executing CTA0 last.
+        # This covers metadata/tail semantics, not device scheduling or performance.
+        source = r'''
+#include <algorithm>
+#include <cassert>
+#include <cstdint>
+#include <stdexcept>
+#include <vector>
+#define __global__
+struct Dim { int x; } blockIdx, threadIdx, blockDim, gridDim;
+struct uint4 { uint32_t x, y, z, w; };
+uint4 make_uint4(uint32_t x, uint32_t y, uint32_t z, uint32_t w) { return {x,y,z,w}; }
+void __trap() { throw std::invalid_argument("invalid device offsets"); }
+''' + geometry + fused + r'''
+template<class Offset> void check(int tokens, int split, int grid) {
+  const int capacity=(tokens+63)/64;
+  constexpr int width=9, row_vectors=64;
+  constexpr uint32_t poison=0x7fc00000u;
+  std::vector<int32_t> indices(2*capacity+2, -7), bounds(width, -7);
+  std::vector<int64_t> cp_offsets(width, -7);
+  int32_t cu[2]={-7,-7}, slot=-7;
+  int64_t offsets[2]={-7,-7};
+  std::vector<uint4> out(int64_t(tokens)*row_vectors+2);
+  blockDim.x=256; gridDim.x=grid;
+  for(int length : {tokens, tokens/2+1, 12289, 12287, 65, 0, 19, tokens-1, tokens}) {
+    if(length>tokens) continue;
+    Offset input[2]={0, static_cast<Offset>(length)};
+    std::fill(out.begin(),out.end(),make_uint4(poison,poison,poison,poison));
+    std::fill(indices.begin(),indices.end(),-7);
+    std::fill(bounds.begin(),bounds.end(),-7);
+    std::fill(cp_offsets.begin(),cp_offsets.end(),-7);
+    cu[0]=cu[1]=slot=-7; offsets[0]=offsets[1]=-7;
+    for(blockIdx.x=grid-1;blockIdx.x>=0;--blockIdx.x)
+      for(threadIdx.x=255;threadIdx.x>=0;--threadIdx.x)
+        metadata_n1_tail(input,cu,offsets,indices.data()+1,&slot,tokens,
+            capacity,bounds.data(),cp_offsets.data(),split,width,12288,65536,
+            out.data()+1,row_vectors);
+    const int chunks=(length+63)/64;
+    assert(cu[0]==0 && cu[1]==length && slot==0);
+    assert(offsets[0]==0 && offsets[1]==chunks);
+    assert(indices.front()==-7 && indices.back()==-7);
+    for(int i=0;i<capacity;++i) {
+      assert(indices[2*i+1]==(i<chunks ? 0 : -1));
+      assert(indices[2*i+2]==(i<chunks ? i : -1));
+    }
+    if(split>1) {
+      std::vector<int32_t> expected_bounds(width,-7);
+      std::vector<int64_t> expected_offsets(width,-7);
+      threadIdx.x=0;
+      cp_device_geometry(cu,expected_bounds.data(),expected_offsets.data(),
+                         split,width,12288,65536);
+      assert(bounds==expected_bounds && cp_offsets==expected_offsets);
+    } else {
+      assert(std::all_of(bounds.begin(),bounds.end(),[](int v){return v==-7;}));
+      assert(std::all_of(cp_offsets.begin(),cp_offsets.end(),[](int64_t v){return v==-7;}));
+    }
+    for(int64_t i=0;i<int64_t(out.size());++i) {
+      const uint32_t expected=i>int64_t(length)*row_vectors &&
+          i<=int64_t(tokens)*row_vectors ? 0 : poison;
+      assert(out[i].x==expected && out[i].y==expected &&
+             out[i].z==expected && out[i].w==expected);
+    }
+  }
+  blockIdx.x=threadIdx.x=0;
+  for(auto input : {std::vector<Offset>{1,19}, std::vector<Offset>{0,-1},
+                    std::vector<Offset>{0,static_cast<Offset>(tokens+1)}}) {
+    bool rejected=false;
+    try { metadata_n1_tail(input.data(),cu,offsets,indices.data()+1,&slot,
+        tokens,capacity,bounds.data(),cp_offsets.data(),split,width,12288,
+        65536,out.data()+1,row_vectors); }
+    catch(const std::invalid_argument&) { rejected=true; }
+    assert(rejected);
+  }
+}
+int main() {
+  for(int tokens : {16384,32768})
+    for(int split : {0,1,5})
+      for(int grid : {3,512}) {
+        check<int32_t>(tokens,split,grid);
+        check<int64_t>(tokens,split,grid);
+      }
+}
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            binary = str(Path(directory) / 'metadata_n1')
+            subprocess.run([compiler, '-std=c++17', '-O2', '-x', 'c++', '-',
+                            '-o', binary], input=source, text=True, check=True)
+            subprocess.run([binary], check=True)
+
     def test_runtime_abi_agrees_with_python_and_build(self):
         contract = {}
         exec((PACKAGE / '_tc01_fla/_contract.py').read_text(), contract)
@@ -476,6 +685,121 @@ class BuildTests(unittest.TestCase):
             text = path.read_text()
             for name in retired:
                 self.assertNotIn(name, text, str(path))
+
+    def test_partial_head_adapters_link_optional_prepared_stages(self):
+        compiler = shutil.which('c++')
+        if compiler is None:
+            self.skipTest('requires a C++17 host compiler')
+        runtime = (SOURCE / 'runtime.cc').read_text()
+        self.assertNotRegex(runtime, r'launch_fla_(?:token_l2|inter_solve_prepared)__fla_h\d+')
+        self.assertIn('cuda_check(table.token_l2(', runtime)
+        self.assertIn('cuda_check(table.inter_solve_prepared(', runtime)
+        condition = runtime.split('const bool prepared_n1 = ', 1)[1].split(';', 1)[0]
+        main = r'''
+#include "launchers.h"
+#include <cassert>
+#include <initializer_list>
+struct Shape { int n, h; int64_t t; };
+bool prepared(const Shape& s, const fla_runtime::Launchers& table) {
+  return CONDITION;
+}
+int main() {
+  for (int h : {4, 6, 8, 12, 16}) {
+    const auto& table = fla_runtime::launchers_for(h);
+    const bool available = (table.heads == 4 || table.heads == 8);
+    assert(bool(table.token_l2) == available);
+    assert(bool(table.inter_solve_prepared) == available);
+    assert(table.token && table.inter);
+    for (int t : {4095,4096,4097,8192,16384,32768,32769}) {
+      const bool expected = available &&
+          (t == 4096 || t == 8192 || t == 16384 || t == 32768);
+      assert(prepared({1,h,t}, table) == expected);
+      assert(!prepared({2,h,t}, table));
+      auto missing = table;
+      missing.token_l2 = nullptr;
+      assert(!prepared({1,h,t}, missing));
+      missing = table;
+      missing.inter_solve_prepared = nullptr;
+      assert(!prepared({1,h,t}, missing));
+    }
+  }
+}
+'''.replace('CONDITION', condition)
+        # Compile the real adapters and dispatcher. Stubs supply only symbols
+        # for the selected head, so omitted H4/H8 dependencies fail at link time.
+        with tempfile.TemporaryDirectory() as directory:
+            temp = Path(directory)
+            (temp / 'hggc_runtime.h').write_text(
+                '#pragma once\nusing hggcError_t = int; using hggcStream_t = void*;\n')
+            common = [compiler, '-std=c++17', '-I', str(temp), '-I', str(SOURCE)]
+            objects = {}
+            for head in (0, 4, 6, 8):
+                preprocessed = subprocess.run(
+                    common + ['-E', '-P', f'-DFLA_HEADS={head}', str(SOURCE / 'head_adapter.cc')],
+                    capture_output=True, text=True, check=True).stdout
+                declarations = re.findall(r'hggcError_t\s+(\w+)\(([^;{}]*)\);', preprocessed)
+                declarations = [(name, args) for name, args in declarations
+                                if name.endswith(f'__fla_h{head}')]
+                self.assertGreater(len(declarations), 8)
+                optional = [name for name, _ in declarations
+                            if name.startswith(('launch_fla_token_l2__',
+                                                'launch_fla_inter_solve_prepared__'))]
+                self.assertEqual(len(optional), 2 if head in (4, 8) else 0)
+                definitions = '\n'.join(
+                    f'hggcError_t {name}({args}) {{ return 0; }}' for name, args in declarations)
+                output = temp / f'adapter_{head}.o'
+                subprocess.run(common + ['-x', 'c++', '-c', '-', '-o', str(output)],
+                               input=preprocessed + '\n' + definitions, text=True, check=True)
+                objects[head] = output
+            for heads in ((0,), (0, 4), (0, 8), (0, 4, 8), (0, 6)):
+                with self.subTest(heads=heads):
+                    static = ' '.join(f'X({head})' for head in heads if head)
+                    cp = ' '.join(f'X({head})' for head in heads if head in CP_HEADS)
+                    (temp / 'runtime_heads.h').write_text(
+                        f'#define FLA_EACH_STATIC_HEAD(X) {static}\n'
+                        f'#define FLA_EACH_CP_HEAD(X) {cp}\n')
+                    dispatcher = temp / 'dispatch.o'
+                    subprocess.run(common + ['-c', str(SOURCE / 'dispatch.cc'), '-o', str(dispatcher)],
+                                   check=True)
+                    probe = temp / 'probe.o'
+                    subprocess.run(common + ['-x', 'c++', '-c', '-', '-o', str(probe)],
+                                   input=main, text=True, check=True)
+                    binary = temp / ('partial_heads_' + '_'.join(map(str, heads)))
+                    subprocess.run(common + [str(probe), str(dispatcher)] +
+                                   [str(objects[head]) for head in heads] + ['-o', str(binary)],
+                                   check=True)
+                    subprocess.run([str(binary)], check=True)
+
+    def test_device_target_matrix_covers_long_cp_boundaries(self):
+        path = ROOT / 'scripts/prefill/flashkdapro/private/test_tc01_fla_monolithic_cp.py'
+        text = path.read_text()
+        tree = ast.parse(text)
+        selected = [node for node in tree.body
+                    if (isinstance(node, ast.Assign) and any(
+                        isinstance(target, ast.Name) and target.id == 'DEVICE_TARGET_TOKENS'
+                        for target in node.targets)) or
+                    (isinstance(node, ast.FunctionDef) and node.name in
+                     ('device_target_lengths', 'device_trusted_reference'))]
+        self.assertEqual(len(selected), 3)
+        namespace = {}
+        exec(compile(ast.Module(body=selected, type_ignores=[]), str(path), 'exec'), namespace)
+        self.assertEqual(namespace['DEVICE_TARGET_TOKENS'], (4096, 8192, 16384, 32768))
+        self.assertIn('for tokens in DEVICE_TARGET_TOKENS:', text)
+        self.assertIn('lengths = device_target_lengths(tokens)', text)
+        for tokens in namespace['DEVICE_TARGET_TOKENS']:
+            lengths = namespace['device_target_lengths'](tokens)
+            self.assertEqual(lengths[0], tokens)
+            self.assertEqual(lengths[-1], tokens)
+            self.assertIn(0, lengths)
+            self.assertIn(19, lengths)
+            self.assertTrue(all(0 <= length <= tokens for length in lengths))
+            if tokens >= 16384:
+                self.assertTrue({12287, 12288, 12289}.issubset(lengths))
+                reference = namespace['device_trusted_reference']
+                self.assertFalse(reference(4, tokens, 12287))
+                self.assertTrue(reference(4, tokens, 12288))
+                self.assertTrue(reference(4, tokens, 12289))
+                self.assertFalse(reference(8, tokens, 12288))
 
     def test_merged_prepare_uses_shared_probe_abi_and_single_device_guard(self):
         host = (ROOT / 'src/prefill/flashkdapro/host/torch_extension_cute.cc').read_text()

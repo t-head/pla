@@ -125,11 +125,19 @@ def flashkda_fwd(
     every call and replay rebuilds the metadata on the GPU, with no hot-path D2H. All mutable scratch
     belongs to this call/Graph. The old BT64/CP environment variables only affect the legacy backend; the monolithic FLA
     tc01 FLA CP uses the separate ``PLA_FLASHKDA_TC01_FLA_CP``: unset, empty or
-    ``auto`` conservatively selects only the validated single-segment fused path (H6 at >=32768 tokens;
-    H8/H12 at >=8192), while H4 and uncalibrated inputs remain serial. ``off``/``0`` rolls back exactly
-    to serial; forced values allow only ``1/2/3/4/5/8``. Forced mode requires N1, trusted host offsets,
-    a supported head and an effective length <=102400, otherwise it raises. Forced multi-segment
-    diagnostics can select ``legacy`` or ``state`` with ``PLA_FLASHKDA_TC01_FLA_CP_ALGO``.
+    ``auto`` enables CP only for qualified N1 shapes with a static CP kernel.
+    With trusted host offsets, H4 uses state CP1 for 1-2048 tokens and state CP5
+    for 12288-65536; other lengths remain serial. H6/H8 use state CP1 for
+    1-65536 and retain legacy CP1 for 65537-102400. H12 retains legacy CP1 for
+    8192-102400. With only device offsets, H4 physical T=16384/32768 uses state
+    CP5 and H8 physical T=4096/8192/16384/32768 uses state CP1; each replay uses
+    the current effective offsets. Other unqualified inputs remain serial.
+    ``off``/``0`` selects serial execution. Explicit splits accept only
+    ``1/2/3/4/5/8`` and require N1, trusted offsets, a supported head count and
+    effective length <=102400; invalid requests raise an error.
+    ``PLA_FLASHKDA_TC01_FLA_CP_ALGO`` explicitly selects ``legacy`` or ``state``.
+    Explicit splits do not select state automatically. A non-state algorithm
+    override keeps H4 AUTO serial and disables device-only AUTO CP.
     """
     if not q.is_cuda:
         raise ValueError("q must be a CUDA tensor")

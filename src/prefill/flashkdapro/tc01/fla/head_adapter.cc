@@ -57,6 +57,15 @@ hggcError_t launch_fla_cp_pretriangular_output(
     const void*, void*, int, const int32_t*, float*, float*, int*, const int32_t*,
     const int64_t*, int, int, hggcStream_t);
 #endif
+#if FLA_HEADS == 4 || FLA_HEADS == 8
+hggcError_t FLA_JOIN_HEAD(launch_fla_token_l2, FLA_HEADS)(
+    const void*, const void*, void*, void*, const float*, const uint16_t*, int64_t,
+    void*, float*, void*, void*, void*, void*, float, const int32_t*, int, int, hggcStream_t);
+hggcError_t FLA_JOIN_HEAD(launch_fla_inter_solve_prepared, FLA_HEADS)(
+    const void*, const void*, const float*, const uint16_t*, int64_t,
+    float*, void*, void*, void*, void*, void*, float, const int32_t*,
+    const int32_t*, int, int, int, int, hggcStream_t);
+#endif
 }
 
 namespace fla_runtime {
@@ -67,6 +76,13 @@ const Launchers& FLA_JOIN_HEAD(head_adapter, FLA_HEADS)() {
 #else
   constexpr Configure cp_configure = nullptr;
   constexpr CpRecurrenceOutput cp_launch = nullptr;
+#endif
+#if FLA_HEADS == 4 || FLA_HEADS == 8
+  constexpr TokenL2 token_l2 = FLA_JOIN_HEAD(launch_fla_token_l2, FLA_HEADS);
+  constexpr InterPrepared inter_prepared = FLA_JOIN_HEAD(launch_fla_inter_solve_prepared, FLA_HEADS);
+#else
+  constexpr TokenL2 token_l2 = nullptr;
+  constexpr InterPrepared inter_prepared = nullptr;
 #endif
   static const Launchers value = {
       FLA_HEADS,
@@ -80,7 +96,9 @@ const Launchers& FLA_JOIN_HEAD(head_adapter, FLA_HEADS)() {
       launch_fla_recompute_h8_bf16_d128_bt64,
       launch_fla_glm53_recurrence_h8_bf16_d128_bt64,
       launch_fla_glm53_output_h8_bf16_d128_bt64,
-      cp_launch};
+      cp_launch,
+      token_l2,
+      inter_prepared};
   return value;
 }
 }  // namespace fla_runtime
