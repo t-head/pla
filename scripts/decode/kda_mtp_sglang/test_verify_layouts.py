@@ -123,8 +123,27 @@ def run_case(batch, heads, steps):
         assert torch.equal(direct[key], contiguous[key]), f"graph {key} differs"
     for old, value in zip(before, readonly):
         assert torch.equal(old, value), "graph mutated an input or persistent state"
+    if steps == 4 and batch * heads >= 4096:
+        for name in ("w_q", "w_k", "w_v"):
+            alternate = dict(direct)
+            weight = direct[name]
+            alternate[name] = torch.empty(
+                weight.numel() + 1, dtype=weight.dtype, device=weight.device
+            )[1:].view_as(weight).copy_(weight)
+            fallback_out = fused_kda_decode_mtp_dspark(**alternate)
+            error = (fallback_out.float() - expected_out.float()).abs().max().item()
+            assert error <= 6e-3 * expected_out.float().abs().max().item(), (name, error)
+            assert torch.equal(window, expected_window), f"unaligned {name}: scratch"
+            for key in ("rawv", "rawk", "g", "beta"):
+                tensor_name = f"replayssm_{key}"
+                actual, expected = alternate[tensor_name], contiguous[tensor_name]
+                error = (actual.float() - expected.float()).abs().max().item()
+                tol = 6e-3 if key in ("rawv", "rawk") else 5e-6
+                assert error <= tol * expected.float().abs().max().item(), (name, key, error)
+        for old, value in zip(before, readonly):
+            assert torch.equal(old, value), "alignment fallback mutated an input"
     print(f"PASS B={batch} H={heads} T={steps}: exact outputs/rings/windows, "
-          "read-only inputs/state, padding/spare scratch, graph replay")
+          "read-only inputs/state, padding/spare scratch, graph replay, alignment fallback")
 
 
 def main():
@@ -132,6 +151,7 @@ def main():
     # Default policy exercises VSPLIT=2 and VSPLIT=1 respectively.
     run_case(4, 4, 4)
     run_case(32, 12, 5)
+    run_case(1024, 8, 4)
     print("RESULT: all PASS")
 
 

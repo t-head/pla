@@ -183,9 +183,13 @@ void kda_verify_dspark(torch::Tensor x_q, torch::Tensor x_k, torch::Tensor x_v,
                               h0, ic_q, ic_k, ic_v, slot_idx, scratch_idx,
                               cu_seqlens, N, T, T_LOOP, slots);
 
-  auto si = slot_idx.to(torch::kInt32).contiguous();
-  auto sc = scratch_idx.to(torch::kInt32).contiguous();
-  auto cu = cu_seqlens.to(torch::kInt32).contiguous();
+  // int32 and int64 indices go to the kernel as they are (no cast kernel).
+  auto si = slot_idx.contiguous();
+  auto sc = scratch_idx.contiguous();
+  auto cu = cu_seqlens.contiguous();
+  auto index = [](const torch::Tensor& t) {
+    return pla::kda_mtp::IndexArg{t.data_ptr(), t.scalar_type() == torch::kInt64};
+  };
 
   pla::kda_mtp::launch_verify(
       x_q.data_ptr(), x_k.data_ptr(), x_v.data_ptr(),
@@ -196,7 +200,7 @@ void kda_verify_dspark(torch::Tensor x_q, torch::Tensor x_k, torch::Tensor x_v,
       out.data_ptr(), ic_q.data_ptr(), ic_k.data_ptr(), ic_v.data_ptr(),
       ring_rawv.data_ptr(), ring_rawk.data_ptr(),
       ring_g.data_ptr<float>(), ring_beta.data_ptr<float>(),
-      si.data_ptr<int32_t>(), sc.data_ptr<int32_t>(), cu.data_ptr<int32_t>(),
+      index(si), index(sc), index(cu),
       H, N, T_LOOP, L, (float)scale, (float)lower_bound, strides,
       pla::current_stream());
   C10_CUDA_KERNEL_LAUNCH_CHECK();

@@ -45,6 +45,102 @@ from _common import Cfg, SpecState, build_commit_inputs
 from pla.decode.kda_mtp_sglang import commit_kda_replayssm_after_verify
 
 
+def run_large_case(batch, layers, grouped=False, heads=8):
+    cfg = Cfg(bs=batch, pool=2 * batch + 8, heads=heads, num_spec=15, layers=layers)
+    ci = build_commit_inputs(cfg)
+    direct = SpecState.from_commit_inputs(ci)
+    if grouped:
+        direct.replayssm_rawk = direct.replayssm_rawk[:, :, :4].contiguous()
+    slots = torch.arange(batch, 0, -1, device="cuda", dtype=torch.int64)
+    slots[-2:] = torch.tensor([0, -1], device="cuda")
+    accepted = torch.arange(batch, device="cuda", dtype=torch.int64) % 17
+    kwargs = dict(state_batch_indices=slots, accept_lens=accepted,
+                  last_correct_step_indices=accepted - 1, null_block_id=0)
+    active = (slots > 0) & (accepted > 0)
+    kwargs["last_correct_step_indices"] = torch.where(active, accepted - 1, -1)
+    initial = direct.temporal.clone()
+    initial_conv = direct.conv[0].clone()
+    expected_conv = initial_conv.clone()
+    requests = torch.arange(batch, device="cuda")[active]
+    expected_conv[:, slots[active]] = direct.intermediate_conv_window[0][
+        :, requests, accepted[active] - 1]
+    reference = copy.deepcopy(direct)
+    disabled = torch.full_like(slots, -1)
+    commit_kda_replayssm_after_verify(
+        spec_state=reference, mamba_track_indices=disabled,
+        mamba_steps_to_track=disabled, **kwargs)
+
+    def reset():
+        direct.temporal.copy_(initial)
+        direct.conv[0].copy_(initial_conv)
+
+    def check():
+        torch.cuda.synchronize()
+        error = (direct.temporal - reference.temporal).abs().max().item()
+        limit = reference.temporal.abs().max().item() * 5e-6
+        assert torch.isfinite(direct.temporal).all() and error <= limit, (error, limit)
+        assert torch.equal(direct.conv[0], reference.conv[0])
+        assert torch.equal(direct.conv[0], expected_conv), "conv indexing oracle"
+        untouched = torch.ones(cfg.slots, dtype=torch.bool, device="cuda")
+        untouched[slots[active]] = False
+        assert torch.equal(direct.temporal[:, untouched], initial[:, untouched])
+        assert torch.equal(direct.conv[0][:, untouched], initial_conv[:, untouched])
+
+    commit_kda_replayssm_after_verify(spec_state=direct, **kwargs)
+    check()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        commit_kda_replayssm_after_verify(spec_state=direct, **kwargs)
+    for _ in range(2):
+        reset()
+        graph.replay()
+        check()
+
+    for name in ("replayssm_rawk", "replayssm_g"):
+        original = getattr(direct, name)
+        unaligned = torch.empty(original.numel() + 1, device="cuda", dtype=original.dtype)[1:]
+        unaligned = unaligned.view_as(original).copy_(original)
+        setattr(direct, name, unaligned)
+        reset()
+        commit_kda_replayssm_after_verify(spec_state=direct, **kwargs)
+        check()
+        setattr(direct, name, original)
+
+    for tensors in (direct.conv, direct.intermediate_conv_window):
+        original = tensors[0]
+        tensors[0] = torch.empty(
+            original.numel() + 1, device="cuda", dtype=original.dtype
+        )[1:].view_as(original).copy_(original)
+        reset()
+        commit_kda_replayssm_after_verify(spec_state=direct, **kwargs)
+        check()
+        tensors[0] = original
+    original = direct.intermediate_conv_window[0]
+    storage = torch.full((*original.shape[:-1], original.shape[-1] * 2),
+                         7, device="cuda", dtype=original.dtype)
+    direct.intermediate_conv_window[0] = storage[..., ::2].copy_(original)
+    reset()
+    commit_kda_replayssm_after_verify(spec_state=direct, **kwargs)
+    check()
+    assert torch.equal(storage[..., ::2], original), "conv input mutated"
+    assert (storage[..., 1::2] == 7).all(), "conv spare storage mutated"
+    direct.intermediate_conv_window[0] = original
+
+    tracks = torch.where(active, torch.arange(batch, device="cuda") + batch + 1, -1)
+    reset()
+    commit_kda_replayssm_after_verify(
+        spec_state=direct, mamba_track_indices=tracks,
+        mamba_steps_to_track=kwargs["last_correct_step_indices"], **kwargs)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(direct.temporal[:, slots[active]],
+                               reference.temporal[:, slots[active]], rtol=0, atol=0)
+    torch.testing.assert_close(direct.temporal[:, tracks[active]],
+                               reference.temporal[:, slots[active]], rtol=0, atol=0)
+    assert torch.equal(direct.conv[0][:, tracks[active]], reference.conv[0][:, slots[active]])
+    print(f"PASS B={batch} H={heads} layers={layers} grouped={grouped}: accept 0..16, "
+          "slots/null, graph, tracking, alignment fallback, strided conv, conv oracle")
+
+
 def main():
     for heads, steps in ((8, 6), (12, 8)):
         ci = build_commit_inputs(Cfg(bs=4, pool=8, heads=heads, num_spec=steps - 1, layers=2))
@@ -92,6 +188,9 @@ def main():
         else:
             raise AssertionError("unaligned float4 state was not rejected")
         print(f"PASS H={heads} T={steps}: exact fold/conv, padding, tracking, graph")
+    run_large_case(512, 1)
+    run_large_case(256, 2, grouped=True)
+    run_large_case(512, 1, heads=9)
     print("RESULT: all PASS")
 
 
