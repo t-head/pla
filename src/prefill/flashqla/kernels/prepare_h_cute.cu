@@ -680,7 +680,13 @@ prepare_h_cp_cute_kernel(
     }
   }
 
-  const int iter_seq_start = seq_end - num_iters * PH_CS;
+  // Anchor the warmup window on the segment's own chunk grid, which starts at
+  // seq_start: A and the cumulative gate are built on that grid, so a segment
+  // whose length is not a multiple of PH_CS carries its partial chunk at the
+  // END. Counting back from seq_end instead both misaligns every chunk against
+  // A/g and pushes the first read below seq_start, which is negative for the
+  // first segment and silently reads the previous segment otherwise.
+  const int iter_seq_start = seq_start + (total_chunks - num_iters) * PH_CS;
 
   const int64_t K_stride_w = (int64_t)Hg * PH_DK * 2;  // bytes
   const int64_t V_stride_w = v_token_stride * 2;

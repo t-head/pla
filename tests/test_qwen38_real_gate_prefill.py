@@ -496,3 +496,70 @@ def test_tc01_lpt_empty_sequence_keeps_indexed_slots(dtype):
         assert torch.equal(pool, before)
         assert not torch.count_nonzero(result[2])
         assert result[4] is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a PPU device")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_prepare_h_partial_tail_chunk_reads_inside_segment(dtype):
+    """A segment off the chunk grid keeps its warmup inside its own tokens.
+
+    CP hands prepare_h the full segment chunk count, so a length that is not a
+    multiple of CHUNK_SIZE leaves a partial chunk at the segment tail. Counting
+    the read origin back from the segment end instead of forward from the chunk
+    grid moved that origin below the segment start: negative for the first
+    segment, and into the preceding tokens for every later one.
+    """
+    from pla.prefill.flashqla import ops
+
+    length, heads, qk_heads = 897, 16, 2
+    assert length % CHUNK_SIZE, "the regression needs a partial tail chunk"
+    pad, total = CHUNK_SIZE, 2 * length
+    offsets = (0, length, total)
+    cu = torch.tensor(offsets, device="cuda", dtype=torch.int32)
+
+    # Two segments carrying the same tokens. Every prepare_h input repeats, so
+    # the two states can only differ through a read outside the segment.
+    torch.manual_seed(20261029)
+
+    def _repeated(*shape):
+        return (torch.randn(1, length, *shape, device="cuda") * 0.1).repeat(
+            (1, 2) + (1,) * len(shape))
+
+    q = _repeated(qk_heads, D).to(dtype)
+    k = _repeated(qk_heads, D).to(dtype)
+    v = _repeated(heads, D).to(dtype)
+    gate = -_repeated(heads).abs() - 1e-3
+    beta = torch.rand(1, length, heads, device="cuda").repeat(1, 2, 1)
+
+    # Build A and the chunk-local gate cumsum exactly as production does; both
+    # live on the chunk grid anchored at each segment start.
+    g_cum, A, _, _, _ = chunk_gated_delta_rule_fwd(
+        q, k, v, gate, beta, scale=D ** -0.5, cu_seqlens=cu,
+        raw_cu_seqlens=offsets, output_final_state=False, auto_cp=False)
+
+    def _padded(tensor):
+        storage = torch.zeros(
+            (1, pad + total) + tensor.shape[2:],
+            device="cuda", dtype=tensor.dtype)
+        storage[:, pad:] = tensor
+        return storage
+
+    storages = [_padded(tensor) for tensor in (k, v, A, g_cum, beta)]
+    warmup = torch.full(((len(offsets) - 1) * heads,),
+                        (length + CHUNK_SIZE - 1) // CHUNK_SIZE,
+                        device="cuda", dtype=torch.int32)
+
+    def _prepare():
+        views = [storage[:, pad:] for storage in storages]
+        return ops.flashqla_cute.prepare_h(*views, cu, warmup, heads, qk_heads)
+
+    ht, mt = (tensor.clone() for tensor in _prepare())
+    for storage in storages:
+        storage[:, :pad] = float("nan")
+    poisoned_ht, poisoned_mt = _prepare()
+
+    # The padding sits before the logical tensors, so it must not be reachable.
+    assert torch.equal(ht, poisoned_ht) and torch.equal(mt, poisoned_mt)
+    assert torch.isfinite(ht.float()).all() and torch.isfinite(mt.float()).all()
+    first, second = ht.view(len(offsets) - 1, heads, D, D)
+    assert torch.equal(first, second)
