@@ -127,15 +127,21 @@ void kda_fold_all_layers(torch::Tensor h0, torch::Tensor rawv,
   sanity_fold_all_layers_values(h0, rawv, rawk, beta, slot_idx, accept_lens,
                                 track_idx, track_step, B, L, slots, null_block_id);
 
-  auto si = slot_idx.to(torch::kInt32).contiguous();
-  auto al = accept_lens.to(torch::kInt32).contiguous();
-  auto ti = has_track ? track_idx->to(torch::kInt32).contiguous() : si;
-  auto ts = has_track ? track_step->to(torch::kInt32).contiguous() : al;
+  // int32 and int64 indices go to the kernel as they are (no cast kernel).
+  auto index = [](const torch::Tensor& t) {
+    return pla::kda_mtp::IndexArg{t.data_ptr(), t.scalar_type() == torch::kInt64};
+  };
+  auto si = slot_idx.contiguous();
+  auto al = accept_lens.contiguous();
+  // Without tracking, track_* alias valid [B] arrays: the kernel loads them
+  // unconditionally (no branch ahead of its index loads) and ignores them.
+  auto ti = has_track ? track_idx->contiguous() : si;
+  auto ts = has_track ? track_step->contiguous() : al;
 
   pla::kda_mtp::launch_fold(
       h0.data_ptr<float>(), rawv.data_ptr(), rawk.data_ptr(),
-      gk.data_ptr<float>(), beta.data_ptr<float>(), si.data_ptr<int32_t>(),
-      al.data_ptr<int32_t>(), ti.data_ptr<int32_t>(), ts.data_ptr<int32_t>(),
+      gk.data_ptr<float>(), beta.data_ptr<float>(), index(si),
+      index(al), index(ti), index(ts),
       h0.stride(0), h0.stride(1), rawv.stride(0), rawv.stride(1),
       rawk.stride(0), rawk.stride(1), gk.stride(0), gk.stride(1),
       beta.stride(0), beta.stride(1), layers, B, (int)num_k_heads, HV, V, L,
@@ -191,8 +197,8 @@ void kda_conv_window_scatter(torch::Tensor dst, torch::Tensor src,
       }
     }
   }
-  auto di = dst_idx.to(torch::kInt32).contiguous();
-  auto sti = step_idx.to(torch::kInt32).contiguous();
+  auto di = dst_idx.contiguous();
+  auto sti = step_idx.contiguous();
   const int reqs = sti.size(0);
   if (reqs == 0) return;
   TORCH_CHECK(km1 >= 1 && km1 <= 4,
@@ -207,7 +213,8 @@ void kda_conv_window_scatter(torch::Tensor dst, torch::Tensor src,
   }
   pla::kda_mtp::launch_conv_scatter(
       dtype, km1, src.data_ptr(), dst.data_ptr(),
-      di.data_ptr<int32_t>(), sti.data_ptr<int32_t>(),
+      pla::kda_mtp::IndexArg{di.data_ptr(), di.scalar_type() == torch::kInt64},
+      pla::kda_mtp::IndexArg{sti.data_ptr(), sti.scalar_type() == torch::kInt64},
       layers, dim, reqs,
       src.stride(0), src.stride(1), src.stride(2), src.stride(3), src.stride(4),
       dst.stride(0), dst.stride(1), dst.stride(2), dst.stride(3),

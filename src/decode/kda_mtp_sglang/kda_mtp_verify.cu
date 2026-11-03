@@ -54,12 +54,22 @@
 #include <hggc_runtime.h>
 
 #include <cstdint>
+#include <utility>
 
 #include "kda_mtp_abi.h"
 
 namespace {
 
 using BF16 = __ppu_bfloat16;
+using pla::kda_mtp::IndexArg;
+
+// Branch-free: an int64 index's low word (== static_cast<int>, little endian)
+// is int32 element 2*i. A wide/narrow branch made the compiler drain every
+// outstanding scalar load before the next index load, serializing the cold
+// slot / cu_seqlens misses at CTA start.
+__device__ __forceinline__ int index_at(IndexArg idx, int i) {
+  return __ldg(static_cast<const int*>(idx.data) + (i << (idx.wide ? 1 : 0)));
+}
 
 // PPU sigmoid uses the hardware __ppu_sgmdf intrinsic; the host-side fallback
 // matches the H20 reference. Same pattern as
@@ -161,8 +171,8 @@ __global__ __launch_bounds__(THREADS) void verify_kernel(
     BF16* __restrict__ ic_k, BF16* __restrict__ ic_v,
     BF16* __restrict__ ring_rawv, BF16* __restrict__ ring_rawk,
     float* __restrict__ ring_g, float* __restrict__ ring_beta,
-    const int32_t* __restrict__ slot_idx, const int32_t* __restrict__ scratch_idx,
-    const int32_t* __restrict__ cu_seqlens, int H, int T_LOOP, int L, float scale,
+    IndexArg slot_idx, IndexArg scratch_idx,
+    IndexArg cu_seqlens, int H, int T_LOOP, int L, float scale,
     float lower_bound, VerifyStrides strides) {
   const int i_hv = blockIdx.x;
   const int i_n = blockIdx.y;
@@ -172,9 +182,10 @@ __global__ __launch_bounds__(THREADS) void verify_kernel(
   static_assert(VPASSES % VS == 0, "VS must divide VPASSES");
   const int tid = threadIdx.x;
 
-  const int bos = cu_seqlens[i_n];
-  const int n_tok = cu_seqlens[i_n + 1] - bos;
-  const int slot = slot_idx[i_n];
+  const int bos = index_at(cu_seqlens, i_n);
+  const int n_tok = index_at(cu_seqlens, i_n + 1) - bos;
+  const int slot = index_at(slot_idx, i_n);
+  const int srow = index_at(scratch_idx, i_n);  // issued with the others
   const long head_off = (long)i_hv * DIM;
 
   // CUDA-graph padding rows: zero the output, touch no cache.
@@ -186,7 +197,6 @@ __global__ __launch_bounds__(THREADS) void verify_kernel(
     return;
   }
 
-  const int srow = scratch_idx[i_n];
   extern __shared__ char smem_raw[];
   Smem& sh = *reinterpret_cast<Smem*>(smem_raw);
 
@@ -415,6 +425,340 @@ __global__ __launch_bounds__(THREADS) void verify_kernel(
   // recurrent_state is read-only for verify: nothing is written back
 }
 
+// Butterfly transpose-reduce. On entry each lane holds N partials; every level
+// keeps one half of the live values, adds in the partner lane's copy of that
+// half and hands it the other half, so after log2(W) levels value g of a lane
+// holds the W-lane group sum of index g + (N/W) * (lane % W). N values cost
+// N - N/W shuffles instead of the N * log2(W) of one butterfly per value.
+template <int N, int O>
+__device__ __forceinline__ void transpose_step(float* v, int lane) {
+  if constexpr (O >= 1) {
+    const bool upper = (lane & O) != 0;
+#pragma unroll
+    for (int i = 0; i < N / 2; ++i) {
+      const float send = upper ? v[i] : v[i + N / 2];
+      const float keep = upper ? v[i + N / 2] : v[i];
+      v[i] = keep + __shfl_xor_sync(0xffffffffu, send, O, 32);
+    }
+    transpose_step<N / 2, O / 2>(v, lane);
+  }
+}
+
+// Sums each of the N values over aligned W-lane groups and passes every sum to
+// emit(index, sum) on exactly one lane of its group, using whichever of the
+// transpose-reduce and the per-value butterfly needs fewer shuffles.
+template <int N, int W, typename Emit>
+__device__ __forceinline__ void group_sums(const float (&in)[N], int lane, Emit emit) {
+  constexpr int LOG = W >= 32 ? 5 : W >= 16 ? 4 : W >= 8 ? 3 : W >= 4 ? 2 : W >= 2 ? 1 : 0;
+  constexpr int PAD = (N + W - 1) / W * W;
+  if constexpr (PAD - PAD / W < N * LOG) {
+    float v[PAD];
+#pragma unroll
+    for (int i = 0; i < PAD; ++i) v[i] = i < N ? in[i < N ? i : 0] : 0.f;
+    transpose_step<PAD, W / 2>(v, lane);
+#pragma unroll
+    for (int g = 0; g < PAD / W; ++g) {
+      const int idx = g + (PAD / W) * (lane % W);
+      if (idx < N) emit(idx, v[g]);
+    }
+  } else {
+#pragma unroll
+    for (int i = 0; i < N; ++i) {
+      const float s = bfly_add(in[i], W);
+      if (lane % W == 0) emit(i, s);
+    }
+  }
+}
+
+// verify_steps_kernel<STEPS, VS>:
+// D(t,j) = product(d_r, r=j+1..t), Pk_t = D(t,-1)*k_t, Pq_t = D(t,-1)*q_t.
+// L[t,j] = dot(k_j*D(t,j), k_t), R[t,j] = dot(k_j*D(t,j), q_t).
+// W_t = beta_t * (Pk_t - sum(j<t, L[t,j]*W_j)).
+// U_t = beta_t * (v_t  - sum(j<t, L[t,j]*U_j)).
+// Qeff_t = Pq_t - sum(j<=t, R[t,j]*W_j).
+// bias_t = sum(j<=t, R[t,j]*U_j), out_t = H0*Qeff_t + bias_t.
+//
+// One 128-thread CTA per (head, request, value split). Everything before the
+// state projection is channel-parallel: thread c keeps q/k/decay/v of channel
+// c for every step in registers, forms its terms of the L2 norms and of the
+// L/R triangles on the pre-norm q/k (the norms scale the reduced sums), and
+// runs the elimination for its channel. Each warp reduces all of those terms
+// with one transpose-reduce (3 x 31 shuffles at STEPS=8) instead of a
+// warp-per-step schedule with two 32-lane butterflies per (t, j) pair; ACU on
+// H=4/N=1/STEPS=8 showed that schedule plus the four dependent state rounds
+// behind it running as a single-warp latency chain at 0.64% occupancy.
+//
+// VS > 1 splits the 128 value rows of the state projection over grid.z so a
+// small H*N grid reaches more CUs. Every split re-derives the channel phases
+// (cheap) but only split 0 writes the rings and conv snapshots. A split CTA
+// loads its first state rows right after the slot check, so their DRAM latency
+// overlaps the channel phases. EAGER gives VS = 1 the same early rows, at the
+// register cost the host weighs in verify_steps_eager.
+template <int STEPS>
+struct VerifySteps {
+  static constexpr int KK_OFF = 2 * STEPS;                         // [0,S) |q|^2, [S,2S) |k|^2
+  static constexpr int KQ_OFF = KK_OFF + STEPS * (STEPS - 1) / 2;  // L[t][p], p < t
+  static constexpr int SUMS = KQ_OFF + STEPS * (STEPS + 1) / 2;    // R[t][p], p <= t
+  static constexpr int BETA_OFF = SUMS;
+  static constexpr int TOTAL = BETA_OFF + STEPS;
+  __host__ __device__ static constexpr int kk(int t, int p) {
+    return KK_OFF + t * (t - 1) / 2 + p;
+  }
+  __host__ __device__ static constexpr int kq(int t, int p) {
+    return KQ_OFF + t * (t + 1) / 2 + p;
+  }
+};
+
+template <int STEPS, int VS, bool EAGER>
+__global__ __launch_bounds__(128) void verify_steps_kernel(
+    const BF16* __restrict__ x_q, const BF16* __restrict__ x_k,
+    const BF16* __restrict__ x_v, const BF16* __restrict__ g_in,
+    const BF16* __restrict__ beta_in, const float* __restrict__ w_q,
+    const float* __restrict__ w_k, const float* __restrict__ w_v,
+    const BF16* __restrict__ cs_q, const BF16* __restrict__ cs_k,
+    const BF16* __restrict__ cs_v, const float* __restrict__ a_log,
+    const float* __restrict__ dt_bias, BF16* __restrict__ out,
+    BF16* __restrict__ ic_q, BF16* __restrict__ ic_k,
+    BF16* __restrict__ ic_v, BF16* __restrict__ rawv, BF16* __restrict__ rawk,
+    float* __restrict__ ring_g, float* __restrict__ ring_beta,
+    IndexArg slot_idx, IndexArg scratch_idx, IndexArg cu, int H, int L,
+    float scale, float lower_bound, VerifyStrides strides,
+    const float* __restrict__ h0) {
+  using Layout = VerifySteps<STEPS>;
+  constexpr int WARPS = 128 / 32;
+  constexpr int ROWS = DIM / VS;  // value rows projected by this CTA
+  constexpr int GROUPS = 8;       // threads per state row
+  constexpr int VECTORS = DIM / 4 / GROUPS;
+  constexpr int PASS_ROWS = 128 / GROUPS;
+  constexpr int PASSES = ROWS / PASS_ROWS;
+  // The split grids are latency-bound and keep the first two passes of state
+  // rows in flight across the channel phases (all rows for VS>=4; holding all
+  // four passes at VS=2 cost 144-160 registers). VS=1 is occupancy-bound at
+  // large H*N (ACU at H=96/N=512/STEPS=4: 120 registers -> 8 blocks/CU vs 14
+  // for a 72-register build), so by default it keeps no state in flight and
+  // lets other CTAs hide the per-pass loads; EAGER keeps two passes anyway.
+  constexpr int EARLY = VS == 1 && !EAGER ? 0 : PASSES < 2 ? PASSES : 2;
+  constexpr int PREFETCH = PASSES < 2 ? PASSES : 2;
+  static_assert(VS == 1 || VS == 2 || VS == 4 || VS == 8, "value split");
+  static_assert(VS == 1 || !EAGER, "split CTAs always load early");
+  static_assert(PASSES >= 1 && PASSES % PREFETCH == 0, "state passes");
+  const int n = blockIdx.y, h = blockIdx.x;
+  const int row0 = VS == 1 ? 0 : static_cast<int>(blockIdx.z) * ROWS;
+  const bool writer = VS == 1 || blockIdx.z == 0;
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  const int slot = index_at(slot_idx, n), bos = index_at(cu, n);
+  const int n_tok = index_at(cu, n + 1) - bos;
+  const int srow = index_at(scratch_idx, n);  // issued with the others
+  // The per-channel weights do not depend on the indices: issue them now so
+  // they overlap the index misses instead of joining the slot-dependent loads.
+  const int channel = tid;
+  const long ch = h * DIM + channel;
+  const float4 wq = reinterpret_cast<const float4*>(w_q)[ch];
+  const float4 wk = reinterpret_cast<const float4*>(w_k)[ch];
+  const float4 wv = reinterpret_cast<const float4*>(w_v)[ch];
+  const float a_h = a_log[h];
+  const float bias = dt_bias[ch];
+  if (slot < 0) {
+    for (int i = tid; i < STEPS * ROWS; i += 128)
+      out[(long)(bos + i / ROWS) * H * DIM + h * DIM + row0 + i % ROWS] =
+          __float2bfloat16(0.f);
+    return;
+  }
+  const int kg = tid % GROUPS, rlocal = tid / GROUPS;
+  const float4* state = reinterpret_cast<const float4*>(
+      h0 + (((long)slot * H + h) * DIM + row0) * DIM);
+  float4 early[EARLY > 0 ? EARLY : 1][VECTORS];
+#pragma unroll
+  for (int p = 0; p < EARLY; ++p)
+#pragma unroll
+    for (int i = 0; i < VECTORS; ++i)
+      early[p][i] = state[(rlocal + p * PASS_ROWS) * (DIM / 4) + kg + GROUPS * i];
+
+  __shared__ float partial[WARPS][Layout::SUMS];
+  __shared__ float total[Layout::TOTAL];
+  __shared__ __align__(16) float result[2 * STEPS][DIM];
+  __shared__ float stage[STEPS][ROWS];
+  float q[STEPS], k[STEPS], d[STEPS], v[STEPS];
+  {
+    float cq[3], ck[3], cv[3];
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+      cq[j] = __bfloat162float(cs_q[slot * strides.cs_q.slot +
+          ch * strides.cs_q.channel + j * strides.cs_q.window]);
+      ck[j] = __bfloat162float(cs_k[slot * strides.cs_k.slot +
+          ch * strides.cs_k.channel + j * strides.cs_k.window]);
+      cv[j] = __bfloat162float(cs_v[slot * strides.cs_v.slot +
+          ch * strides.cs_v.channel + j * strides.cs_v.window]);
+    }
+    const float exp_a = __expf(a_h);
+#pragma unroll
+    for (int step = 0; step < STEPS; ++step) {
+      const int tok = bos + (step < n_tok ? step : n_tok - 1);
+      const float xq = __bfloat162float(x_q[tok * strides.x_q + ch]);
+      const float xk = __bfloat162float(x_k[tok * strides.x_k + ch]);
+      const float xv = __bfloat162float(x_v[tok * strides.x_v + ch]);
+      const float gate_input = __bfloat162float(g_in[tok * strides.g + ch]);
+      const float beta_input = __bfloat162float(beta_in[tok * strides.beta + h]);
+      float cq_t = xq * wq.w, ck_t = xk * wk.w, cv_t = xv * wv.w;
+      cq_t += cq[0] * wq.x; cq_t += cq[1] * wq.y; cq_t += cq[2] * wq.z;
+      ck_t += ck[0] * wk.x; ck_t += ck[1] * wk.y; ck_t += ck[2] * wk.z;
+      cv_t += cv[0] * wv.x; cv_t += cv[1] * wv.y; cv_t += cv[2] * wv.z;
+      q[step] = ppu_silu(cq_t);
+      k[step] = ppu_silu(ck_t);
+      v[step] = ppu_silu(cv_t);
+      const float g = lower_bound * ppu_sigmoid(exp_a * (gate_input + bias));
+      d[step] = __expf(g);
+      cq[0] = cq[1]; cq[1] = cq[2]; cq[2] = xq;
+      ck[0] = ck[1]; ck[1] = ck[2]; ck[2] = xk;
+      cv[0] = cv[1]; cv[1] = cv[2]; cv[2] = xv;
+      const float b = ppu_sigmoid(beta_input);
+      if (channel == 0) total[Layout::BETA_OFF + step] = b;
+      if (writer) {
+        const long ri = ((long)slot * H + h) * L * DIM + step * DIM + channel;
+        rawk[ri] = __float2bfloat16(k[step]);
+        rawv[ri] = __float2bfloat16(v[step]);
+        ring_g[ri] = g;
+#pragma unroll
+        for (int j = 0; j < 3; ++j) {
+          ic_q[srow * strides.ic_q.row + step * strides.ic_q.step +
+              ch * strides.ic_q.channel + j * strides.ic_q.window] =
+              __float2bfloat16(cq[j]);
+          ic_k[srow * strides.ic_k.row + step * strides.ic_k.step +
+              ch * strides.ic_k.channel + j * strides.ic_k.window] =
+              __float2bfloat16(ck[j]);
+          ic_v[srow * strides.ic_v.row + step * strides.ic_v.step +
+              ch * strides.ic_v.channel + j * strides.ic_v.window] =
+              __float2bfloat16(cv[j]);
+        }
+        if (channel == 0) ring_beta[((long)slot * H + h) * L + step] = b;
+      }
+    }
+  }
+  {
+    float terms[Layout::SUMS];
+#pragma unroll
+    for (int t = 0; t < STEPS; ++t) {
+      terms[t] = q[t] * q[t];
+      terms[STEPS + t] = k[t] * k[t];
+    }
+#pragma unroll
+    for (int t = 0; t < STEPS; ++t) {
+      float decay = 1.f;  // D(t, p)
+#pragma unroll
+      for (int p = t; p >= 0; --p) {
+        if (p < t) decay *= d[p + 1];
+        const float kd = k[p] * decay;
+        if (p < t) terms[Layout::kk(t, p)] = kd * k[t];
+        terms[Layout::kq(t, p)] = kd * q[t];
+      }
+    }
+    group_sums<Layout::SUMS, 32>(terms, lane,
+                                 [&](int i, float s) { partial[warp][i] = s; });
+  }
+  __syncthreads();
+  if (tid < Layout::SUMS) {
+    auto reduced = [&](int i) {
+      float s = partial[0][i];
+#pragma unroll
+      for (int w = 1; w < WARPS; ++w) s += partial[w][i];
+      return s;
+    };
+    auto inv_q = [&](int t) { return rsqrtf(reduced(t) + L2_EPS) * scale; };
+    auto inv_k = [&](int t) { return rsqrtf(reduced(STEPS + t) + L2_EPS); };
+    float val;
+    if (tid < STEPS) {
+      val = inv_q(tid);
+    } else if (tid < 2 * STEPS) {
+      val = inv_k(tid - STEPS);
+    } else {
+      // row t of the L triangle holds t entries, row t of R holds t + 1
+      const bool is_q = tid >= Layout::KQ_OFF;
+      int p = tid - (is_q ? Layout::KQ_OFF : Layout::KK_OFF);
+      int t = 0, len = is_q ? 1 : 0;
+      while (p >= len) {
+        p -= len;
+        ++t;
+        ++len;
+      }
+      val = reduced(tid) * inv_k(p) * (is_q ? inv_q(t) : inv_k(t));
+    }
+    total[tid] = val;
+  }
+  __syncthreads();
+  {
+    float update_k[STEPS], update_v[STEPS];
+    float cum = 1.f;  // D(step, -1)
+#pragma unroll
+    for (int step = 0; step < STEPS; ++step) {
+      cum *= d[step];
+      float uk = cum * k[step] * total[STEPS + step];
+      float uv = v[step];
+#pragma unroll
+      for (int prev = 0; prev < step; ++prev) {
+        const float c = total[Layout::kk(step, prev)];
+        uk = fmaf(-c, update_k[prev], uk);
+        uv = fmaf(-c, update_v[prev], uv);
+      }
+      const float b = total[Layout::BETA_OFF + step];
+      update_k[step] = b * uk;
+      update_v[step] = b * uv;
+      float pq = cum * q[step] * total[step];
+      float pv = 0.f;
+#pragma unroll
+      for (int prev = 0; prev <= step; ++prev) {
+        const float c = total[Layout::kq(step, prev)];
+        pq = fmaf(-c, update_k[prev], pq);
+        pv = fmaf(c, update_v[prev], pv);
+      }
+      result[step][channel] = pq;
+      result[STEPS + step][channel] = pv;
+    }
+  }
+  __syncthreads();
+#pragma unroll
+  for (int pass = 0; pass < PASSES; pass += PREFETCH) {
+    float4 loaded[PREFETCH][VECTORS];
+#pragma unroll
+    for (int pair = 0; pair < PREFETCH; ++pair) {
+      const int p = pass + pair;
+#pragma unroll
+      for (int i = 0; i < VECTORS; ++i)
+        loaded[pair][i] = p < EARLY
+            ? early[p < EARLY ? p : 0][i]
+            : state[(rlocal + p * PASS_ROWS) * (DIM / 4) + kg + GROUPS * i];
+    }
+    float dot[PREFETCH][STEPS] = {};
+#pragma unroll
+    for (int i = 0; i < VECTORS; ++i) {
+      const int f4 = kg + GROUPS * i;
+#pragma unroll
+      for (int p = 0; p < STEPS; ++p) {
+        const float4 a = reinterpret_cast<const float4*>(result[p])[f4];
+#pragma unroll
+        for (int pair = 0; pair < PREFETCH; ++pair) {
+          const float4 s = loaded[pair][i];
+          dot[pair][p] = fmaf(s.w, a.w, fmaf(s.z, a.z,
+              fmaf(s.y, a.y, fmaf(s.x, a.x, dot[pair][p]))));
+        }
+      }
+    }
+#pragma unroll
+    for (int pair = 0; pair < PREFETCH; ++pair) {
+      const int row = rlocal + (pass + pair) * PASS_ROWS;
+      group_sums<STEPS, GROUPS>(dot[pair], lane, [&](int step, float s) {
+        stage[step][row] = s + result[STEPS + step][row0 + row];
+      });
+    }
+  }
+  __syncthreads();
+  for (int i = tid; i < STEPS * ROWS; i += 128) {
+    const int step = i / ROWS, r = i % ROWS;
+    if (step < n_tok)
+      out[(long)(bos + step) * H * DIM + h * DIM + row0 + r] =
+          __float2bfloat16(stage[step][r]);
+  }
+}
+
 }  // namespace
 
 namespace pla {
@@ -429,8 +773,7 @@ void launch_verify_vsplit(
     const float* a_log, const float* dt_bias, const float* h0,
     void* out, void* ic_q, void* ic_k, void* ic_v,
     void* ring_rawv, void* ring_rawk, float* ring_g, float* ring_beta,
-    const int32_t* slot_idx, const int32_t* scratch_idx,
-    const int32_t* cu_seqlens,
+    IndexArg slot_idx, IndexArg scratch_idx, IndexArg cu_seqlens,
     int H, int N, int t_loop, int ring_len,
     float scale, float lower_bound, VerifyStrides strides, hggcStream_t stream) {
   const int smem = static_cast<int>(sizeof(Smem));
@@ -451,6 +794,30 @@ void launch_verify_vsplit(
       ring_g, ring_beta, slot_idx, scratch_idx, cu_seqlens,
       H, t_loop, ring_len, scale, lower_bound, strides);
 }
+
+// Cache lazy/eager resident CTA counts per thread and window for the current
+// device. Refresh on device changes; failed queries use lazy and may retry.
+template <int STEPS>
+bool verify_steps_eager_at(int64_t ctas, int device) {
+  const int64_t forced = verify_eager_override();
+  if (forced != 0) return forced > 0;
+  static thread_local int cached_device = -1;
+  static thread_local std::pair<int64_t, int64_t> caps(0, 0);
+  if (cached_device != device) {
+    int cus = 0, lazy = 0, eager = 0;
+    if (hggcDeviceGetAttribute(&cus, hggcDevAttrMultiProcessorCount, device) !=
+            hggcSuccess ||
+        hggcOccupancyMaxActiveBlocksPerMultiprocessor(
+            &lazy, verify_steps_kernel<STEPS, 1, false>, 128, 0) != hggcSuccess ||
+        hggcOccupancyMaxActiveBlocksPerMultiprocessor(
+            &eager, verify_steps_kernel<STEPS, 1, true>, 128, 0) != hggcSuccess)
+      return false;
+    caps = std::pair<int64_t, int64_t>(static_cast<int64_t>(cus) * lazy,
+                                       static_cast<int64_t>(cus) * eager);
+    cached_device = device;
+  }
+  return verify_steps_eager(ctas, caps.first, caps.second);
+}
 }  // namespace
 
 void launch_verify(
@@ -461,10 +828,53 @@ void launch_verify(
     const float* a_log, const float* dt_bias, const float* h0,
     void* out, void* ic_q, void* ic_k, void* ic_v,
     void* ring_rawv, void* ring_rawk, float* ring_g, float* ring_beta,
-    const int32_t* slot_idx, const int32_t* scratch_idx,
-    const int32_t* cu_seqlens,
+    IndexArg slot_idx, IndexArg scratch_idx, IndexArg cu_seqlens,
     int H, int N, int t_loop, int ring_len,
     float scale, float lower_bound, VerifyStrides strides, hggcStream_t stream) {
+  int device = -1;
+  if (use_verify_fast(H, N, t_loop) && current_device_is_ppu15(&device) &&
+      reinterpret_cast<uintptr_t>(w_q) % 16 == 0 &&
+      reinterpret_cast<uintptr_t>(w_k) % 16 == 0 &&
+      reinterpret_cast<uintptr_t>(w_v) % 16 == 0) {
+    const int split = verify_steps_split(H, N, t_loop);
+#define PLA_VERIFY_STEPS_KERNEL(STEPS, VS, EAGER)                              \
+  verify_steps_kernel<STEPS, VS, EAGER><<<dim3(H, N, VS), 128, 0, stream>>>(   \
+      static_cast<const BF16*>(x_q), static_cast<const BF16*>(x_k),            \
+      static_cast<const BF16*>(x_v), static_cast<const BF16*>(g_in),           \
+      static_cast<const BF16*>(beta_in), w_q, w_k, w_v,                        \
+      static_cast<const BF16*>(cs_q), static_cast<const BF16*>(cs_k),          \
+      static_cast<const BF16*>(cs_v), a_log, dt_bias,                          \
+      static_cast<BF16*>(out), static_cast<BF16*>(ic_q),                       \
+      static_cast<BF16*>(ic_k), static_cast<BF16*>(ic_v),                      \
+      static_cast<BF16*>(ring_rawv), static_cast<BF16*>(ring_rawk),            \
+      ring_g, ring_beta, slot_idx, scratch_idx, cu_seqlens,                    \
+      H, ring_len, scale, lower_bound, strides, h0)
+#define PLA_VERIFY_STEPS_LAUNCH(STEPS)                                         \
+  switch (split) {                                                             \
+    case 8: PLA_VERIFY_STEPS_KERNEL(STEPS, 8, false); break;                   \
+    case 4: PLA_VERIFY_STEPS_KERNEL(STEPS, 4, false); break;                   \
+    case 2: PLA_VERIFY_STEPS_KERNEL(STEPS, 2, false); break;                   \
+    default:                                                                   \
+      if (verify_steps_eager_at<STEPS>(static_cast<int64_t>(H) * N, device))   \
+        PLA_VERIFY_STEPS_KERNEL(STEPS, 1, true);                               \
+      else                                                                     \
+        PLA_VERIFY_STEPS_KERNEL(STEPS, 1, false);                              \
+      break;                                                                   \
+  }
+    switch (t_loop) {
+      case 1: PLA_VERIFY_STEPS_LAUNCH(1); return;
+      case 2: PLA_VERIFY_STEPS_LAUNCH(2); return;
+      case 3: PLA_VERIFY_STEPS_LAUNCH(3); return;
+      case 4: PLA_VERIFY_STEPS_LAUNCH(4); return;
+      case 5: PLA_VERIFY_STEPS_LAUNCH(5); return;
+      case 6: PLA_VERIFY_STEPS_LAUNCH(6); return;
+      case 7: PLA_VERIFY_STEPS_LAUNCH(7); return;
+      case 8: PLA_VERIFY_STEPS_LAUNCH(8); return;
+      default: break;  // wider draft windows fall through to the generic path
+    }
+#undef PLA_VERIFY_STEPS_LAUNCH
+#undef PLA_VERIFY_STEPS_KERNEL
+  }
 #define PLA_VERIFY_ARGS                                                        \
   x_q, x_k, x_v, g_in, beta_in, w_q, w_k, w_v, cs_q, cs_k, cs_v, a_log,      \
       dt_bias, h0, out, ic_q, ic_k, ic_v, ring_rawv, ring_rawk, ring_g,        \
