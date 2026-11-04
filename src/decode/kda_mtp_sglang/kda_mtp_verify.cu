@@ -832,7 +832,7 @@ void launch_verify(
     int H, int N, int t_loop, int ring_len,
     float scale, float lower_bound, VerifyStrides strides, hggcStream_t stream) {
   int device = -1;
-  if (use_verify_fast(H, N, t_loop) && current_device_is_ppu15(&device) &&
+  if (use_verify_fast(H, N, t_loop) && hggcGetDevice(&device) == hggcSuccess &&
       reinterpret_cast<uintptr_t>(w_q) % 16 == 0 &&
       reinterpret_cast<uintptr_t>(w_k) % 16 == 0 &&
       reinterpret_cast<uintptr_t>(w_v) % 16 == 0) {
