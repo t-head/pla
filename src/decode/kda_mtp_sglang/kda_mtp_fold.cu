@@ -392,7 +392,7 @@ void launch_fold(
       static_cast<int64_t>(B) * HV * layers >= stage_gate &&
       V == 128 &&
       reinterpret_cast<uintptr_t>(rawk) % 8 == 0 &&
-      reinterpret_cast<uintptr_t>(gk) % 16 == 0 && current_device_is_ppu15();
+      reinterpret_cast<uintptr_t>(gk) % 16 == 0;
   const int rows = stage_values ? fold_stage_rows() : 1;
   const int tile = stage_values ? STAGE_BV : BV;
   const int threads = stage_values ? STAGE_LANES / rows : THREADS;
@@ -446,7 +446,7 @@ void launch_conv_scatter_typed(
       src_s0 % elements == 0 && src_s1 % elements == 0 && src_s2 % elements == 0 &&
       dst_s0 % elements == 0 && dst_s1 % elements == 0 &&
       reinterpret_cast<uintptr_t>(src) % 16 == 0 &&
-      reinterpret_cast<uintptr_t>(dst) % 16 == 0 && current_device_is_ppu15();
+      reinterpret_cast<uintptr_t>(dst) % 16 == 0;
 #define PLA_CONV_SCATTER_ARGS                                                \
     static_cast<const T*>(src), static_cast<T*>(dst), dst_idx, step_idx,       \
     dim, src_s0, src_s1, src_s2, src_s3, src_s4, dst_s0, dst_s1,               \

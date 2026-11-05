@@ -34,9 +34,10 @@ Run: python3 tests/test_tc01_fla_dispatch.py
 Does not load the installed pla/torch, does not run GPU kernels, and does not replace full wheel/PPU validation.
 """
 import ast
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext, redirect_stderr, redirect_stdout
 import importlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -870,6 +871,198 @@ int main() {
                                         capture_output=True, check=True)
                 self.assertEqual(result.stdout.splitlines()[-len(names):],
                                  [f'{name}__fla_h{head}' for name in names])
+
+
+class ReferenceTests(unittest.TestCase):
+    def setUp(self):
+        try:
+            import torch
+        except ImportError:
+            self.skipTest('requires CPU torch for numerical reference regression')
+        modules = patch.dict(sys.modules)
+        modules.start()
+        self.addCleanup(modules.stop)
+        self.torch = torch
+        self.ref = load_module('_flashkda_cpu_reference',
+                               ROOT / 'scripts/prefill/flashkdapro/private/test_fwd_e2e.py')
+
+    def test_batched_matches_scalar_rounding_and_preserves_inputs(self):
+        torch = self.torch
+        with patch.dict(os.environ, {'PLA_FLASHKDA_REF_THREADS': '1'}), self.ref.reference_threads():
+            for tokens, heads in ((0, 4), (1, 6), (15, 12), (16, 24),
+                                  (17, 48), (33, 96), (65, 4)):
+                for dtype in (torch.bfloat16, torch.float32):
+                    with self.subTest(tokens=tokens, heads=heads, dtype=dtype):
+                        gen = torch.Generator().manual_seed(37)
+                        # Strided token views also exercise packed sequence slicing.
+                        inputs = [torch.randn(2 * tokens, heads, 128, dtype=torch.bfloat16,
+                                              generator=gen)[::2] for _ in range(4)]
+                        inputs += [torch.randn(2 * tokens, heads, dtype=torch.bfloat16,
+                                               generator=gen)[::2],
+                                   torch.rand(heads, generator=gen),
+                                   torch.rand(heads, 128, generator=gen)]
+                        initial = torch.randn(heads, 128, 128, dtype=dtype, generator=gen) * 0.1
+                        before = [x.clone() for x in inputs + [initial]]
+                        for lower in (-5., 0.):
+                            args = (*inputs, 128 ** -0.5, lower, initial, tokens, heads)
+                            expected = self.ref.ref_fwd(*args)
+                            actual = self.ref.ref_fwd_batched(*args)
+                            for got, want in zip(actual, expected):
+                                torch.testing.assert_close(got, want, rtol=0, atol=0)
+                        for got, want in zip(inputs + [initial], before):
+                            self.assertTrue(torch.equal(got, want))
+
+    def test_reference_threads_restore_on_success_and_exception(self):
+        torch = self.torch
+        previous = torch.get_num_threads()
+        self.addCleanup(torch.set_num_threads, previous)
+        torch.set_num_threads(2)
+        with patch.dict(os.environ, {'PLA_FLASHKDA_REF_THREADS': '1'}):
+            with self.ref.reference_threads():
+                self.assertEqual(torch.get_num_threads(), 1)
+            self.assertEqual(torch.get_num_threads(), 2)
+            with self.assertRaisesRegex(RuntimeError, 'sentinel'):
+                with self.ref.reference_threads():
+                    raise RuntimeError('sentinel')
+            self.assertEqual(torch.get_num_threads(), 2)
+        with patch.dict(os.environ, {'PLA_FLASHKDA_REF_THREADS': '0'}):
+            with self.assertRaisesRegex(ValueError, 'positive'):
+                with self.ref.reference_threads():
+                    pass
+        self.assertEqual(torch.get_num_threads(), 2)
+
+    def dispatch_check(self, initial_dtype, lengths, padding, fault=None):
+        torch = self.torch
+        heads = 4
+        previous = torch.get_num_threads()
+        stdout, stderr = io.StringIO(), io.StringIO()
+        cpu_calls = []
+        generator, tensor_cpu = torch.Generator, torch.Tensor.cpu
+
+        def cpu_copy(tensor, *args, **kwargs):
+            cpu_calls.append(tensor)
+            return tensor_cpu(tensor, *args, **kwargs)
+
+        def forward(q, k, v, g, beta, a_log, dt_bias, out, scale, lower,
+                    initial, final, offsets):
+            out.zero_()
+            bounds = offsets.tolist() if offsets is not None else [0, len(q)]
+            with self.ref.reference_threads(1):
+                for i, (start, end) in enumerate(zip(bounds, bounds[1:])):
+                    h0 = (initial[i] if initial is not None else
+                          torch.zeros(heads, 128, 128, dtype=torch.bfloat16))
+                    result, state = self.ref.ref_fwd(
+                        *(x[start:end] for x in (q, k, v, g, beta)),
+                        a_log, dt_bias, scale, lower, h0, end - start, heads)
+                    out[start:end].copy_(result)
+                    if final is not None:
+                        final[i].copy_(state)
+            if fault == 'output':
+                out[0, 0, 0] = 100
+            elif fault == 'state' and final is not None:
+                final.fill_(100)
+            elif fault == 'dtype' and final is not None:
+                final.data = final.double()
+            elif fault == 'padding':
+                out[-1].fill_(7)
+            elif fault == 'nostate' and final is None:
+                out[0, 0, 0] = 100
+
+        package = types.ModuleType('pla.prefill.flashkdapro')
+        package.flashkda_fwd = Mock(side_effect=forward)
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(sys, 'path', list(sys.path)))
+            stack.enter_context(patch.dict(sys.modules, {
+                'test_fwd_e2e': self.ref, 'pla.prefill.flashkdapro': package}))
+            acc = load_module('_flashkda_accuracy_test',
+                              ROOT / 'scripts/prefill/flashkdapro/e2e_acc_full.py')
+            stack.enter_context(patch.dict(os.environ, {'PLA_FLASHKDA_REF_THREADS': '1'}))
+            stack.enter_context(patch.object(torch, 'Generator',
+                                            side_effect=lambda **kwargs: generator()))
+            for name in ('rand', 'randn', 'tensor', 'full', 'empty'):
+                original = getattr(torch, name)
+
+                def allocate(*args, _original=original, **kwargs):
+                    if kwargs.get('device') == 'cuda':
+                        kwargs['device'] = 'cpu'
+                    return _original(*args, **kwargs)
+
+                stack.enter_context(patch.object(torch, name, side_effect=allocate))
+            stack.enter_context(patch.object(torch.cuda, 'synchronize'))
+            stack.enter_context(patch.object(torch.Tensor, 'cpu', cpu_copy))
+            original_error = acc.err_ratio
+
+            def error_ratio(*args):
+                self.assertEqual(torch.get_num_threads(), 1)
+                return original_error(*args)
+
+            stack.enter_context(patch.object(acc, 'err_ratio', side_effect=error_ratio))
+            if fault == 'reference':
+                stack.enter_context(patch.object(acc, 'ref_fwd_batched',
+                                                side_effect=RuntimeError('reference sentinel')))
+            stack.enter_context(redirect_stdout(stdout))
+            stack.enter_context(redirect_stderr(stderr))
+            final_dtypes = ((torch.bfloat16, torch.float32) if initial_dtype is None
+                            else (initial_dtype,))
+            try:
+                flags = acc.check('mock', 'mock', heads, lengths, initial_dtype,
+                                  final_dtypes, pad_tokens=padding)
+            finally:
+                self.assertEqual(torch.get_num_threads(), previous)
+            self.assertEqual(package.flashkda_fwd.call_count, len(final_dtypes) + 1)
+        self.assertEqual(len(cpu_calls), 8 + 2 * len(final_dtypes) + (initial_dtype is not None))
+        self.assertEqual(len(cpu_calls), len({id(tensor) for tensor in cpu_calls}))
+        self.assertIn('total_seconds=', stdout.getvalue())
+        self.assertNotIn('dispatch_progress', stdout.getvalue())
+        stages = re.findall(r'stage=(\w+)', stderr.getvalue())
+        self.assertEqual(stages, ['kernel_start', 'kernel_done', 'copy_start', 'copy_done',
+                                  'reference_start', 'reference_done', 'judgement_done'])
+        return flags
+
+    def test_accuracy_orchestration_preserves_state_padding_and_copy_contracts(self):
+        for lengths, padding in (([17], 0), ([0, 17, 1], 7)):
+            for dtype in (None, self.torch.bfloat16, self.torch.float32):
+                with self.subTest(lengths=lengths, padding=padding, dtype=dtype):
+                    flags = self.dispatch_check(dtype, lengths, padding)
+                    self.assertEqual(flags, [True] * (3 if dtype is None else 2))
+
+    def test_accuracy_orchestration_rejects_corrupt_results(self):
+        for fault, expected in (('output', [False, False, True]),
+                                ('state', [False, False, True]),
+                                ('dtype', [False, False, True]),
+                                ('padding', [False, False, False]),
+                                ('nostate', [True, True, False])):
+            with self.subTest(fault=fault):
+                self.assertEqual(self.dispatch_check(None, [17, 1], 7, fault), expected)
+
+    def test_accuracy_orchestration_restores_threads_after_reference_failure(self):
+        with self.assertRaisesRegex(RuntimeError, 'reference sentinel'):
+            self.dispatch_check(None, [17], 0, 'reference')
+
+    def test_dispatch_matrix_and_threshold_are_unchanged(self):
+        paths = (ROOT / 'scripts/prefill/flashkdapro/e2e_acc_full.py',
+                 ROOT / 'tests/test_kda_prefill_flashkdapro.py')
+        matrix = {}
+        for path in paths:
+            tree = ast.parse(path.read_text())
+            if path == paths[0]:
+                for node in tree.body:
+                    if isinstance(node, ast.Assign) and any(
+                            isinstance(target, ast.Name) and target.id in ('CASES', 'PADDED_CASES')
+                            for target in node.targets):
+                        exec(compile(ast.Module(body=[node], type_ignores=[]),
+                                     str(path), 'exec'), {}, matrix)
+            else:
+                function = next(node for node in tree.body
+                                if isinstance(node, ast.FunctionDef) and node.name == 'main')
+                literal_pads = next(node.iter for node in ast.walk(function)
+                                    if isinstance(node, ast.For) and isinstance(node.iter, ast.Tuple)
+                                    and len(node.iter.elts) == 2
+                                    and all(isinstance(item, ast.Tuple) and len(item.elts) == 5
+                                            for item in node.iter.elts))
+                self.assertEqual(ast.literal_eval(literal_pads), matrix['PADDED_CASES'])
+        self.assertEqual(len(matrix['CASES']) * 3 + len(matrix['PADDED_CASES']) * 2, 40)
+        self.assertEqual(self.ref.TOL, 1e-2)
 
 
 if __name__ == '__main__':

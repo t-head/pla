@@ -50,6 +50,9 @@ cublas path, so the reference bounds the kernel error from a tighter side — he
 the tolerance was tightened from 3e-2 to 1e-2 (upstream check_optimized_fwd
 uses rtol=1e-2 against its cuBLAS-exact ref).
 """
+from contextlib import contextmanager
+import os
+
 import torch
 
 CH, D = 16, 128
@@ -234,6 +237,103 @@ def ref_fwd(q, k, v, g, beta, A_log, dt_bias, scale, lower_bound, h0, T, H):
             out[t0:t0 + actual, h] = _out[:actual].float()
 
     return out, work_state.float()
+
+
+@contextmanager
+def reference_threads(threads=None):
+    """Small CPU matrices need bounded intra-op parallelism, not a thread pool per head."""
+    threads = int(os.environ.get("PLA_FLASHKDA_REF_THREADS", "1") if threads is None else threads)
+    if threads < 1:
+        raise ValueError("PLA_FLASHKDA_REF_THREADS must be positive")
+    previous = torch.get_num_threads()
+    if previous != threads:
+        torch.set_num_threads(threads)
+    try:
+        yield
+    finally:
+        if previous != threads:
+            torch.set_num_threads(previous)
+
+
+@torch.no_grad()
+def ref_fwd_batched(q, k, v, g, beta, A_log, dt_bias, scale, lower_bound, h0, T, H):
+    """CPU oracle batching independent heads; chunk carry and all rounding boundaries stay serial.
+
+    The scalar ref_fwd above remains the independent regression oracle. No
+    production kernel, state precision, or accuracy threshold is changed.
+    Scratch is bounded by one chunk across H heads, not the sequence length.
+    """
+    if q.device.type != "cpu":
+        raise ValueError("ref_fwd_batched requires CPU inputs")
+    if tuple(q.shape) != (T, H, D) or T < 0 or H < 1:
+        raise ValueError("q must match [T,H,128] with T>=0 and H>0")
+    with reference_threads():
+        return _ref_fwd_batched(q, k, v, g, beta, A_log, dt_bias,
+                                scale, lower_bound, h0, T, H)
+
+
+def _ref_fwd_batched(q, k, v, g, beta, A_log, dt_bias, scale, lower_bound, h0, T, H):
+    q, k, v, g, beta = [x.to(torch.bfloat16) for x in (q, k, v, g, beta)]
+    A_log, dt_bias = A_log.float(), dt_bias.float()
+    q, k = _l2_normalize_kernel_match(q), _l2_normalize_kernel_match(k)
+    g_f = g.float() + dt_bias.unsqueeze(0)
+    a_log_exp = _fp32_ex2_ftz(A_log * LOG2E).unsqueeze(0).unsqueeze(-1)
+    g_gate = (lower_bound * LOG2E) * _sigmoid_tanh_f32(a_log_exp * g_f)
+    scale_bf16 = torch.tensor(scale, dtype=torch.bfloat16)
+    out = torch.zeros(T, H, D, dtype=torch.float32)
+    state = h0.to(torch.bfloat16).clone()
+    identity = torch.eye(CH, dtype=torch.float16).unsqueeze(0)
+    g_chunk = torch.zeros(H, CH, D, dtype=torch.float32)
+    q_chunk, k_chunk, v_chunk = [torch.zeros(H, CH, D, dtype=torch.bfloat16) for _ in range(3)]
+    beta_chunk = torch.zeros(H, CH, dtype=torch.bfloat16)
+
+    def mm(a, b):
+        # Keep the original operand dtype: promoting CPU BF16 products to
+        # FP32 can change tie rounding even when every storage cast is kept.
+        return torch.bmm(a, b)
+
+    def mm16(a, b):
+        return mm(a.to(torch.float16), b.to(torch.float16)).to(torch.float16)
+
+    for t0 in range(0, T, CH):
+        actual = min(CH, T - t0)
+        for scratch, source in ((g_chunk, g_gate), (q_chunk, q),
+                                (k_chunk, k), (v_chunk, v), (beta_chunk, beta)):
+            if actual < CH:
+                scratch[:, actual:].zero_()
+            scratch[:, :actual].copy_(source[t0:t0 + actual].transpose(0, 1))
+        g_cumsum = g_chunk.cumsum(dim=1)
+        g_total = g_cumsum[:, -1:]
+        decay = _fp32_ex2_ftz(g_cumsum).to(torch.bfloat16)
+        g_total_exp = _fp32_ex2_ftz(g_total)
+        k_decayed = k_chunk * decay
+        q_decayed = q_chunk * decay * scale_bf16
+        k_inv = k_chunk * _fp32_ex2_ftz(-g_cumsum).to(torch.bfloat16)
+        k_restored = k_inv * g_total_exp.to(torch.bfloat16)
+        L = mm(k_decayed.float(), k_inv.float().transpose(1, 2)).to(torch.float16)
+        Mqk = mm(q_decayed, k_inv.transpose(1, 2))
+        beta_activated = _sigmoid_tanh_f32(beta_chunk.float())
+        beta_bf16 = beta_activated.to(torch.bfloat16).unsqueeze(-1)
+        beta_fp16 = beta_activated.to(torch.float16).unsqueeze(-1)
+        L = torch.tril(L, diagonal=-1) * beta_fp16
+        Mqk = torch.tril(Mqk)
+        INV = identity - L
+        L2 = mm16(L, L)
+        INV = INV + mm16(INV, L2)
+        L4 = mm16(L2, L2)
+        INV = INV + mm16(INV, L4)
+        L8 = mm16(L4, L4)
+        INV = (INV + mm16(INV, L8)).to(torch.bfloat16)
+        state_t = state.transpose(1, 2)
+        v_minus = v_chunk - mm(k_decayed, state_t)
+        U = mm(INV, v_minus * beta_bf16)
+        output = mm(q_decayed, state_t) + mm(Mqk, U)
+        delta_s = mm(k_restored.float().transpose(1, 2), U.float())
+        g_total_exp = g_total_exp.transpose(1, 2)
+        state = _fp32_fma(delta_s, state.float().transpose(1, 2),
+                          g_total_exp).to(torch.bfloat16).transpose(1, 2)
+        out[t0:t0 + actual] = output[:, :actual].transpose(0, 1).float()
+    return out, state.float()
 
 
 # ---------------------------------------------------------------------------
