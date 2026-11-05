@@ -230,7 +230,7 @@ class PrefillInstrumentTests(unittest.TestCase):
                 source = (ROOT / path).read_text()
                 after = source.split("const pla::instrument::PrefillRange profile_range(", 1)[1]
                 self.assertIn(launch, after)
-                self.assertNotIn("push_nvtx_and_print", after)
+                self.assertNotIn("push_hgtx_and_print", after)
         for path in ("src/prefill/flashqla/host/torch_extension_cute.cc",
                      "src/prefill/flashkdapro/host/torch_extension_cute.cc",
                      "src/prefill/flashkdapro/tc01/fla/runtime_binding.cc"):

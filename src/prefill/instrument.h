@@ -28,11 +28,8 @@ public:
                  const std::string& dtype, bool is_kda,
                  const at::Tensor* cu = nullptr, float lower_bound = -5.0f) {
         if (!perf_instrument() && !show_params()) return;
-        // generate_nvtx_tag skips device offsets if the current stream is
-        // capturing or its capture status is unknown. Never use a side-stream
-        // D2H workaround or invent offsets from a padded physical token count.
-        tag_ = generate_nvtx_tag(B, T, K, V, H, HV, dtype, is_kda,
-                                 cu, lower_bound, true);
+        tag_ = generate_ut_tag(B, T, K, V, H, HV, dtype, is_kda,
+                               cu, lower_bound, true);
         if (show_params()) std::cout << tag_ << std::endl;
         if (perf_instrument()) range_.emplace(tag_.c_str());
     }
