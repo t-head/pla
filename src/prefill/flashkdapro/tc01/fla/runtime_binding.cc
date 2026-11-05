@@ -34,6 +34,7 @@
 #include "runtime.h"
 #include "../../../../bypass_exec.h"
 #include "../../../../op_forge_case.h"
+#include "../../../instrument.h"
 #include <pybind11/stl.h>
 
 namespace py = pybind11;
@@ -75,6 +76,7 @@ void forward(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor g, at::Tensor 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   (void)pla::bypass::enabled();
   (void)pla::instrument::show_params();
+  (void)pla::instrument::perf_instrument();
   module.attr("runtime_abi") = fla_runtime::kRuntimeAbi;
   module.attr("kernel_abi") = fla_runtime::kKernelAbi;
   module.attr("cp_abi") = fla_runtime::kCpAbi;

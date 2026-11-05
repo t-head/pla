@@ -97,6 +97,10 @@ def cases():
                            (f"scripts/prefill/flashkdapro/private/{script}",),
                            timeout, "exit", True))
     result.extend([
+        Case("prefill-instrument-contract", "prefill",
+             ("tests/test_prefill_instrument.py",), 120),
+        Case("prefill-instrument-graph-capture", "prefill",
+             ("tests/test_prefill_instrument_graph_capture.py",), 1200),
         Case("flashkda-bt64-contract", "prefill",
              ("scripts/prefill/flashkdapro/private/test_bt64_contract.py",), 600),
         Case("flashkda-fla-dispatch-contract", "prefill",
