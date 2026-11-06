@@ -70,16 +70,15 @@ static inline void init_env_variables() {
     g_env_initialized.store(true, std::memory_order_release);
 }
 
-// Helper to push NVTX and/or print tag
 // Only call this when g_ppu_lib_perf_instrument or g_ppu_lib_show_params is set
-static inline void push_nvtx_and_print(
+static inline void push_hgtx_and_print(
     const std::string& tag,
-    bool use_nvtx
+    bool use_hgtx
 ) {
     if (g_ppu_lib_show_params) {
         std::cout << tag << std::endl;
     }
-    if (use_nvtx && g_ppu_lib_perf_instrument) {
+    if (use_hgtx && g_ppu_lib_perf_instrument) {
         PROFILE_SCOPE(tag.c_str());
     }
 }

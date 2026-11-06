@@ -53,6 +53,7 @@
 #include "../../sanity_check.h"
 #include "../../../bypass_exec.h"
 #include "../../../op_forge_case.h"
+#include "../../instrument.h"
 #include "sanity_checks.h"
 
 // ---- forward decls from kernels/*.cu ----
@@ -186,12 +187,6 @@ LogicalDeviceInfo logical_device_info(torch::Tensor const& tensor) {
         configured[device],
         [&]() { cached_info[device] = query_device_info(); });
     return cached_info[device];
-}
-
-int g_ppu_lib_show_params = 0;
-
-void init_show_params() {
-    g_ppu_lib_show_params = pla::instrument::show_params();
 }
 
 int dtype_tag(torch::Tensor const& x) {
@@ -1069,11 +1064,9 @@ std::vector<torch::Tensor> fused_fwd(
             fallback_mask.data_ptr<int8_t>());
     }
 
-    if (g_ppu_lib_show_params) {
-        std::cout << generate_nvtx_tag(
-            raw_batch, T, DK, DV, (int)Hg, (int)H, get_dtype_string(q),
-            false, &raw_cu_seqlens, -5.0f, true) << std::endl;
-    }
+    const pla::instrument::PrefillRange profile_range(
+        raw_batch, T, DK, DV, (int)Hg, (int)H, get_dtype_string(q),
+        false, &raw_cu_seqlens);
 
     auto opt_h = torch::TensorOptions().dtype(q.dtype()).device(q.device());
     // The compute kernels only visit the prefix covered by cu_seqlens. Allocate
@@ -1185,9 +1178,7 @@ std::vector<torch::Tensor> fused_fwd(
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     (void)pla::bypass::enabled();
     (void)pla::instrument::show_params();
-
-
-    init_show_params();
+    (void)pla::instrument::perf_instrument();
 
     m.def("chunk_local_cumsum", &chunk_local_cumsum,
           "FlashQLA CuTe chunk-local cumsum of gate",

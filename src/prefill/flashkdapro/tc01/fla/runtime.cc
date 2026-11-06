@@ -36,6 +36,7 @@
 #include "../../../sanity_check.h"
 #include "../../../../bypass_exec.h"
 #include "../../../../op_forge_case.h"
+#include "../../../instrument.h"
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDACachingAllocator.h>
@@ -376,6 +377,9 @@ void forward(Arguments a) {
       sanity.check(!sp::overlaps(a.initial, a.final) || sp::same_view(a.initial, a.final),
                    "initial/final state may alias only as the exact same tensor view");
   }
+  const pla::instrument::PrefillRange profile_range(
+      s.n, s.t, 128, 128, s.h, s.h, get_dtype_string(a.q), true,
+      a.cu.defined() ? &a.cu : nullptr, static_cast<float>(a.lower_bound));
   const auto stream = c10::cuda::getCurrentCUDAStream(a.q.get_device());
   hggcStreamCaptureStatus status{};
   cuda_check(hggcStreamIsCapturing(reinterpret_cast<hggcStream_t>(stream.stream()), &status), "capture status query failed");

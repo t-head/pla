@@ -75,15 +75,10 @@
 #include "op_forge_case.h"
 #include "../../sanity_check.h"
 #include "../../../bypass_exec.h"
+#include "../../instrument.h"
 #include "sanity_checks.h"
 
 namespace {
-
-int g_ppu_lib_show_params = 0;
-
-void init_show_params() {
-    g_ppu_lib_show_params = pla::instrument::show_params();
-}
 
 namespace sp = pla::sanity::prefill;
 
@@ -1347,12 +1342,9 @@ void flashkda_fwd(
         N = 1; total_tiles = (T_total + CHUNK - 1) / CHUNK;
     }
 
-    if (g_ppu_lib_show_params) {
-        const torch::Tensor* dump_cu_seqlens = is_varlen ? &cu_t : nullptr;
-        std::cout << generate_nvtx_tag(
-            N, T_total, Dd, Dd, H, H, get_dtype_string(q), true,
-            dump_cu_seqlens, static_cast<float>(lower_bound), true) << std::endl;
-    }
+    const pla::instrument::PrefillRange profile_range(
+        N, T_total, Dd, Dd, H, H, get_dtype_string(q), true,
+        is_varlen ? &cu_t : nullptr, static_cast<float>(lower_bound));
 
     TORCH_CHECK(out.is_cuda() && out.dtype() == torch::kBFloat16,
                 "out must be bf16 CUDA");
@@ -1908,9 +1900,7 @@ py::dict flashkda_cp_plan(int64_t T_total, int64_t H,
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     (void)pla::bypass::enabled();
     (void)pla::instrument::show_params();
-
-
-    init_show_params();
+    (void)pla::instrument::perf_instrument();
 
     m.def("flashkda_prepare", &flashkda_prepare,
           "FlashKDA Kernel1 prepare (returns 6 workspace tensors)",

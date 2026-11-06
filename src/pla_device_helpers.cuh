@@ -38,8 +38,6 @@
 // it with the PPU-native tree loses its execution-space qualifiers (the visible
 // symptom is "hggc_fp16.h: typedef redefinition ('struct ::__half_raw' vs
 // 'struct ::__half_raw')" followed by __cvta_generic_to_shared going missing).
-// common.cuh keeps the host-only half: the NVTX/HGTX wrapper, the environment
-// flags and op_forge_case.h (which includes <ATen/ATen.h>).
 //
 // TypeConverter is specialised on the native scalar types rather than
 // at::Half / at::BFloat16; the pairs are bit-compatible, and the callers only

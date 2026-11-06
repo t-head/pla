@@ -335,10 +335,10 @@ torch::Tensor fused_sigmoid_gating_delta_rule_forward_k_last(
     if (g_ppu_lib_perf_instrument || g_ppu_lib_show_params) {
         const torch::Tensor* dump_cu_seqlens =
             cu_seqlens.has_value() ? &cu_seqlens.value() : nullptr;
-        std::string nvtx_tag = generate_nvtx_tag(
+        std::string ut_tag = generate_ut_tag(
             B, T_max, K, V, H, HV, get_dtype_string(q), is_kda,
             dump_cu_seqlens, lower_bound.value_or(-5.0f));
-        push_nvtx_and_print(nvtx_tag, true);
+        push_hgtx_and_print(ut_tag, true);
     }
 
     float scale_val = scale.has_value() ? static_cast<float>(scale.value()) : (1.0f / sqrtf((float)K));

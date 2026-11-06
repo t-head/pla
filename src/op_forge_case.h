@@ -146,7 +146,7 @@ static inline std::string op_forge_offsets_string(
 // op_forge_stream_is_capturing) and are left out: the record then carries only
 // the shapes, which is exactly right for the captured decode step and merely
 // incomplete for anything else.
-static inline std::string generate_nvtx_tag(
+static inline std::string generate_ut_tag(
     int B, int T, int K, int V, int H, int HV,
     const std::string& dtype_str,
     bool is_kda = false,
@@ -310,7 +310,7 @@ inline void dump_case(int B, int T, int K, int V, int H, int HV,
     try {
         // Passing CPU metadata avoids additional GPU copies. Capture emits a
         // shapes-only record, explicitly marked above as incomplete.
-        auto tag = generate_nvtx_tag(B, T, K, V, H, HV, dtype, is_kda,
+        auto tag = generate_ut_tag(B, T, K, V, H, HV, dtype, is_kda,
             host.defined() ? &host : nullptr, lower_bound,
             force_prefill && !unavailable);
         if (force_prefill && unavailable) {

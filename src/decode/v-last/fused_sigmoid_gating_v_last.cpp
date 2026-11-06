@@ -175,14 +175,13 @@ at::Tensor fused_sigmoid_gating_delta_rule_forward(
                          cu_seqlens, B, T, H, HV, K, V, scale, softplus_beta,
                          softplus_threshold, use_initial_state, is_varlen);
     const c10::cuda::CUDAGuard device_guard(q.device());
-    // Generate and push NVTX tag / print only when enabled
     if (g_ppu_lib_perf_instrument || g_ppu_lib_show_params) {
         const at::Tensor* dump_cu_seqlens =
             is_varlen && cu_seqlens.defined() ? &cu_seqlens : nullptr;
-        std::string nvtx_tag = generate_nvtx_tag(
+        std::string ut_tag = generate_ut_tag(
             B, T, K, V, H, HV, get_dtype_string(q), false,
             dump_cu_seqlens, -5.0f, is_varlen);
-        push_nvtx_and_print(nvtx_tag, true);
+        push_hgtx_and_print(ut_tag, true);
     }
 
     if (h0_source.defined()) {

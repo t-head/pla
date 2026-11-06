@@ -80,7 +80,7 @@ CONFIGS = (
     ("off", {"PLA_SANITY_CHECK": "0", "PPU_LIB_PERF_INSTRUMENT": "0", "PPU_LIB_SHOW_PARAMS": "0"},
      "control: capture works with the dump disabled"),
     ("perf", {"PLA_SANITY_CHECK": "0", "PPU_LIB_PERF_INSTRUMENT": "1", "PPU_LIB_SHOW_PARAMS": "0"},
-     "the reported failure: NVTX tagging during capture"),
+     "the reported failure: HGTX tagging during capture"),
     ("show", {"PLA_SANITY_CHECK": "0", "PPU_LIB_PERF_INSTRUMENT": "0", "PPU_LIB_SHOW_PARAMS": "1"},
      "same D2H read reached through the params dump"),
     ("sanity", {"PLA_SANITY_CHECK": "1", "PPU_LIB_PERF_INSTRUMENT": "0",
@@ -410,7 +410,7 @@ namespace cuda { struct CUDAGuard { explicit CUDAGuard(int) {} }; }
 int main() {
     const at::Tensor offsets{0, 2, 4};
     const auto emit = [&]() {
-        return generate_nvtx_tag(2, 2, 128, 128, 4, 8, "bf16", false, &offsets);
+        return generate_ut_tag(2, 2, 128, 128, 4, 8, "bf16", false, &offsets);
     };
     assert(emit().find("cu_seqlens_q:[0,2,4]") != std::string::npos);
     assert(host_copies == 1);
@@ -428,12 +428,12 @@ int main() {
 
     probe_result = cudaSuccess;
     const at::Tensor empty_request{0, 2, 2};
-    auto tag = generate_nvtx_tag(2, 2, 128, 128, 4, 8, "bf16", false, &empty_request);
+    auto tag = generate_ut_tag(2, 2, 128, 128, 4, 8, "bf16", false, &empty_request);
     assert(tag.find("cu_seqlens_q:[0,2,2]") != std::string::npos);
     const at::Tensor backwards{0, 2, 1};
     bool rejected = false;
     try {
-        generate_nvtx_tag(2, 2, 128, 128, 4, 8, "bf16", false, &backwards);
+        generate_ut_tag(2, 2, 128, 128, 4, 8, "bf16", false, &backwards);
     } catch (const std::runtime_error&) { rejected = true; }
     assert(rejected);
 }
