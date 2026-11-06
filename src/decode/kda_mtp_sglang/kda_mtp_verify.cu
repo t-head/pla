@@ -44,7 +44,8 @@
 //
 // Scope (fixed K3/dspark contract): head_dim 128 for q/k/v,
 // num_q_heads == num_k_heads == num_v_heads, conv width 4, exactly
-// 1 + num_spec dense tokens per request, CACHE_RING, no fused output norm.
+// 1 + num_spec dense tokens per request, CACHE_RING, optional fused gated
+// output RMSNorm (a compile-time output mode, so the plain build is untouched).
 //
 // Arithmetic follows the DSL/H20, including the two places it differs from the
 // commit-side fold:
@@ -137,6 +138,58 @@ __device__ __forceinline__ float bfly_add(float x, int width) {
   return x;
 }
 
+using pla::kda_mtp::OnormArgs;
+
+// Output epilogue of the verify kernels. kPlain stores bf16 o. kNorm applies
+// the gated output RMSNorm in the CTA; it needs all 128 value rows of a head,
+// so only the unsplit (VS == 1) stepwise kernel uses it. kStage stores fp32 o
+// to onorm.staging for onorm_kernel: split stepwise launches and the generic
+// kernel, where an in-CTA norm on the serial token loop cost 13% over the
+// plain kernel against 4% for the epilogue (H=12, N=32, 10 steps, ZW-M890P).
+//
+// Only the norm modes take an OnormArgs kernel parameter (a trailing pack that
+// is empty for kPlain), and the kPlain stores keep their original expressions:
+// a larger parameter block or a reordered store changes the plain kernels'
+// machine code.
+enum class Out { kPlain, kNorm, kStage };
+
+template <Out MODE, typename... Onorm>
+__device__ __forceinline__ OnormArgs onorm_of(const Onorm&... onorm) {
+  static_assert(sizeof...(Onorm) == (MODE == Out::kPlain ? 0 : 1),
+                "only the norm modes take OnormArgs");
+  if constexpr (sizeof...(Onorm) == 0) return OnormArgs{};
+  else return (onorm, ...);
+}
+
+__device__ __forceinline__ float onorm_value(const OnormArgs& onorm, long tok,
+                                             long channel, int v, float o,
+                                             float rms) {
+  const float gate = __bfloat162float(
+      static_cast<const BF16*>(onorm.gate)[tok * onorm.gate_stride + channel]);
+  return o * rms * onorm.weight[v] * ppu_sigmoid(gate);
+}
+
+// One warp per (token, head) row of the fp32 output staged by a split launch.
+constexpr int ONORM_ROWS_PER_CTA = 8;
+__global__ __launch_bounds__(32 * ONORM_ROWS_PER_CTA) void onorm_kernel(
+    BF16* __restrict__ out, OnormArgs onorm, int rows, int H) {
+  const int row = blockIdx.x * ONORM_ROWS_PER_CTA + (threadIdx.x >> 5);
+  if (row >= rows) return;
+  const int lane = threadIdx.x & 31;
+  const float4 o = reinterpret_cast<const float4*>(onorm.staging)[
+      (long)row * (DIM / 4) + lane];
+  const float rms = rsqrtf(
+      bfly_add(o.x * o.x + o.y * o.y + o.z * o.z + o.w * o.w, 32) *
+          (1.0f / DIM) + onorm.eps);
+  const long tok = row / H;
+  const long channel = (long)(row % H) * DIM + lane * 4;
+  BF16* dst = out + (long)row * DIM + lane * 4;
+  dst[0] = __float2bfloat16(onorm_value(onorm, tok, channel + 0, lane * 4 + 0, o.x, rms));
+  dst[1] = __float2bfloat16(onorm_value(onorm, tok, channel + 1, lane * 4 + 1, o.y, rms));
+  dst[2] = __float2bfloat16(onorm_value(onorm, tok, channel + 2, lane * 4 + 2, o.z, rms));
+  dst[3] = __float2bfloat16(onorm_value(onorm, tok, channel + 3, lane * 4 + 3, o.w, rms));
+}
+
 struct Smem {
   float q[DIM];
   float k[DIM];
@@ -158,7 +211,7 @@ using pla::kda_mtp::ConvStrides;
 using pla::kda_mtp::WindowStrides;
 using pla::kda_mtp::VerifyStrides;
 
-template <int VS>
+template <int VS, Out MODE, typename... Onorm>
 __global__ __launch_bounds__(THREADS) void verify_kernel(
     const BF16* __restrict__ x_q, const BF16* __restrict__ x_k,
     const BF16* __restrict__ x_v, const BF16* __restrict__ g_in,
@@ -173,7 +226,9 @@ __global__ __launch_bounds__(THREADS) void verify_kernel(
     float* __restrict__ ring_g, float* __restrict__ ring_beta,
     IndexArg slot_idx, IndexArg scratch_idx,
     IndexArg cu_seqlens, int H, int T_LOOP, int L, float scale,
-    float lower_bound, VerifyStrides strides) {
+    float lower_bound, VerifyStrides strides, Onorm... onorm_arg) {
+  static_assert(MODE != Out::kNorm, "the generic kernel stages a normed output");
+  [[maybe_unused]] const OnormArgs onorm = onorm_of<MODE>(onorm_arg...);
   const int i_hv = blockIdx.x;
   const int i_n = blockIdx.y;
   const int i_vs = blockIdx.z;              // v-split index (0..VS-1)
@@ -192,8 +247,12 @@ __global__ __launch_bounds__(THREADS) void verify_kernel(
   if (slot < 0) {
     if (ring_writer)
       for (int t = 0; t < T_LOOP; ++t)
-        for (int j = tid; j < DIM; j += THREADS)
-          out[(long)(bos + t) * H * DIM + head_off + j] = __float2bfloat16(0.f);
+        for (int j = tid; j < DIM; j += THREADS) {
+          if constexpr (MODE == Out::kStage)
+            onorm.staging[(long)(bos + t) * H * DIM + head_off + j] = 0.f;
+          else
+            out[(long)(bos + t) * H * DIM + head_off + j] = __float2bfloat16(0.f);
+        }
     return;
   }
 
@@ -417,8 +476,12 @@ __global__ __launch_bounds__(THREADS) void verify_kernel(
         }
       }
       shq = bfly_add(shq, KGRPS) * qfold;   // qfold = nq (VS>=2) or 1
-      if (k_grp == 0 && t < n_tok)
-        out[(long)(bos + t) * H * DIM + head_off + v] = __float2bfloat16(shq);
+      if (k_grp == 0 && t < n_tok) {
+        if constexpr (MODE == Out::kStage)
+          onorm.staging[(long)(bos + t) * H * DIM + head_off + v] = shq;
+        else
+          out[(long)(bos + t) * H * DIM + head_off + v] = __float2bfloat16(shq);
+      }
     }
     __syncthreads();
   }
@@ -509,7 +572,7 @@ struct VerifySteps {
   }
 };
 
-template <int STEPS, int VS, bool EAGER>
+template <int STEPS, int VS, bool EAGER, Out MODE, typename... Onorm>
 __global__ __launch_bounds__(128) void verify_steps_kernel(
     const BF16* __restrict__ x_q, const BF16* __restrict__ x_k,
     const BF16* __restrict__ x_v, const BF16* __restrict__ g_in,
@@ -523,7 +586,8 @@ __global__ __launch_bounds__(128) void verify_steps_kernel(
     float* __restrict__ ring_g, float* __restrict__ ring_beta,
     IndexArg slot_idx, IndexArg scratch_idx, IndexArg cu, int H, int L,
     float scale, float lower_bound, VerifyStrides strides,
-    const float* __restrict__ h0) {
+    const float* __restrict__ h0, Onorm... onorm_arg) {
+  [[maybe_unused]] const OnormArgs onorm = onorm_of<MODE>(onorm_arg...);
   using Layout = VerifySteps<STEPS>;
   constexpr int WARPS = 128 / 32;
   constexpr int ROWS = DIM / VS;  // value rows projected by this CTA
@@ -542,6 +606,8 @@ __global__ __launch_bounds__(128) void verify_steps_kernel(
   static_assert(VS == 1 || VS == 2 || VS == 4 || VS == 8, "value split");
   static_assert(VS == 1 || !EAGER, "split CTAs always load early");
   static_assert(PASSES >= 1 && PASSES % PREFETCH == 0, "state passes");
+  static_assert(MODE != Out::kNorm || VS == 1,
+                "the in-CTA norm needs every value row of the head");
   const int n = blockIdx.y, h = blockIdx.x;
   const int row0 = VS == 1 ? 0 : static_cast<int>(blockIdx.z) * ROWS;
   const bool writer = VS == 1 || blockIdx.z == 0;
@@ -559,9 +625,14 @@ __global__ __launch_bounds__(128) void verify_steps_kernel(
   const float a_h = a_log[h];
   const float bias = dt_bias[ch];
   if (slot < 0) {
-    for (int i = tid; i < STEPS * ROWS; i += 128)
-      out[(long)(bos + i / ROWS) * H * DIM + h * DIM + row0 + i % ROWS] =
-          __float2bfloat16(0.f);
+    for (int i = tid; i < STEPS * ROWS; i += 128) {
+      if constexpr (MODE == Out::kStage)
+        onorm.staging[(long)(bos + i / ROWS) * H * DIM + h * DIM + row0 + i % ROWS] =
+            0.f;
+      else
+        out[(long)(bos + i / ROWS) * H * DIM + h * DIM + row0 + i % ROWS] =
+            __float2bfloat16(0.f);
+    }
     return;
   }
   const int kg = tid % GROUPS, rlocal = tid / GROUPS;
@@ -750,12 +821,45 @@ __global__ __launch_bounds__(128) void verify_steps_kernel(
       });
     }
   }
+  if constexpr (MODE == Out::kNorm) {
+    // Thread tid owns value row tid of every step; issue its gate and weight
+    // loads before the barrier so they overlap it.
+    float gate[STEPS];
+#pragma unroll
+    for (int step = 0; step < STEPS; ++step) {
+      const int tok = bos + (step < n_tok ? step : n_tok - 1);
+      gate[step] = __bfloat162float(static_cast<const BF16*>(onorm.gate)[
+          tok * onorm.gate_stride + ch]);
+    }
+    const float weight = onorm.weight[channel];
+    __syncthreads();
+#pragma unroll
+    for (int step = 0; step < STEPS; ++step) {
+      // Every warp reduces the whole row itself rather than publishing one sum.
+      float sum = 0.f;
+#pragma unroll
+      for (int m = 0; m < DIM / 32; ++m) {
+        const float o = stage[step][lane + m * 32];
+        sum += o * o;
+      }
+      const float rms = rsqrtf(bfly_add(sum, 32) * (1.0f / DIM) + onorm.eps);
+      if (step < n_tok)
+        out[(long)(bos + step) * H * DIM + ch] = __float2bfloat16(
+            stage[step][channel] * rms * weight * ppu_sigmoid(gate[step]));
+    }
+    return;
+  }
   __syncthreads();
   for (int i = tid; i < STEPS * ROWS; i += 128) {
     const int step = i / ROWS, r = i % ROWS;
-    if (step < n_tok)
-      out[(long)(bos + step) * H * DIM + h * DIM + row0 + r] =
-          __float2bfloat16(stage[step][r]);
+    if (step < n_tok) {
+      if constexpr (MODE == Out::kStage)
+        onorm.staging[(long)(bos + step) * H * DIM + h * DIM + row0 + r] =
+            stage[step][r];
+      else
+        out[(long)(bos + step) * H * DIM + h * DIM + row0 + r] =
+            __float2bfloat16(stage[step][r]);
+    }
   }
 }
 
@@ -764,7 +868,7 @@ __global__ __launch_bounds__(128) void verify_steps_kernel(
 namespace pla {
 namespace kda_mtp {
 namespace {
-template <int VS>
+template <int VS, Out MODE>
 void launch_verify_vsplit(
     const void* x_q, const void* x_k, const void* x_v,
     const void* g_in, const void* beta_in,
@@ -775,24 +879,54 @@ void launch_verify_vsplit(
     void* ring_rawv, void* ring_rawk, float* ring_g, float* ring_beta,
     IndexArg slot_idx, IndexArg scratch_idx, IndexArg cu_seqlens,
     int H, int N, int t_loop, int ring_len,
-    float scale, float lower_bound, VerifyStrides strides, hggcStream_t stream) {
+    float scale, float lower_bound, VerifyStrides strides,
+    const OnormArgs& onorm, hggcStream_t stream) {
   const int smem = static_cast<int>(sizeof(Smem));
-  if (smem > 48 * 1024) {
-    hggcFuncSetAttribute(verify_kernel<VS>,
-                         hggcFuncAttributeMaxDynamicSharedMemorySize, smem);
-  }
   dim3 grid(H, N, VS);
-  verify_kernel<VS><<<grid, THREADS, smem, stream>>>(
-      static_cast<const BF16*>(x_q), static_cast<const BF16*>(x_k),
-      static_cast<const BF16*>(x_v), static_cast<const BF16*>(g_in),
-      static_cast<const BF16*>(beta_in), w_q, w_k, w_v,
-      static_cast<const BF16*>(cs_q), static_cast<const BF16*>(cs_k),
-      static_cast<const BF16*>(cs_v), a_log, dt_bias, h0,
-      static_cast<BF16*>(out), static_cast<BF16*>(ic_q),
-      static_cast<BF16*>(ic_k), static_cast<BF16*>(ic_v),
-      static_cast<BF16*>(ring_rawv), static_cast<BF16*>(ring_rawk),
-      ring_g, ring_beta, slot_idx, scratch_idx, cu_seqlens,
-      H, t_loop, ring_len, scale, lower_bound, strides);
+#define PLA_VERIFY_GENERIC_ARGS                                                \
+      static_cast<const BF16*>(x_q), static_cast<const BF16*>(x_k),            \
+      static_cast<const BF16*>(x_v), static_cast<const BF16*>(g_in),           \
+      static_cast<const BF16*>(beta_in), w_q, w_k, w_v,                        \
+      static_cast<const BF16*>(cs_q), static_cast<const BF16*>(cs_k),          \
+      static_cast<const BF16*>(cs_v), a_log, dt_bias, h0,                      \
+      static_cast<BF16*>(out), static_cast<BF16*>(ic_q),                       \
+      static_cast<BF16*>(ic_k), static_cast<BF16*>(ic_v),                      \
+      static_cast<BF16*>(ring_rawv), static_cast<BF16*>(ring_rawk),            \
+      ring_g, ring_beta, slot_idx, scratch_idx, cu_seqlens,                    \
+      H, t_loop, ring_len, scale, lower_bound, strides
+  if constexpr (MODE == Out::kPlain) {
+    if (smem > 48 * 1024) {
+      hggcFuncSetAttribute(verify_kernel<VS, MODE>,
+                           hggcFuncAttributeMaxDynamicSharedMemorySize, smem);
+    }
+    verify_kernel<VS, MODE><<<grid, THREADS, smem, stream>>>(PLA_VERIFY_GENERIC_ARGS);
+  } else {
+    if (smem > 48 * 1024) {
+      hggcFuncSetAttribute(verify_kernel<VS, MODE, OnormArgs>,
+                           hggcFuncAttributeMaxDynamicSharedMemorySize, smem);
+    }
+    verify_kernel<VS, MODE, OnormArgs><<<grid, THREADS, smem, stream>>>(
+        PLA_VERIFY_GENERIC_ARGS, onorm);
+  }
+#undef PLA_VERIFY_GENERIC_ARGS
+}
+
+// The plain output keeps its original instantiation; a normed output is staged
+// in fp32 for onorm_kernel.
+template <int VS, typename... Args>
+void launch_verify_generic(const OnormArgs& onorm, hggcStream_t stream,
+                           Args... args) {
+  if (onorm.gate == nullptr)
+    launch_verify_vsplit<VS, Out::kPlain>(args..., onorm, stream);
+  else
+    launch_verify_vsplit<VS, Out::kStage>(args..., onorm, stream);
+}
+
+void launch_onorm(void* out, const OnormArgs& onorm, int rows, int H,
+                  hggcStream_t stream) {
+  onorm_kernel<<<(rows + ONORM_ROWS_PER_CTA - 1) / ONORM_ROWS_PER_CTA,
+                 32 * ONORM_ROWS_PER_CTA, 0, stream>>>(
+      static_cast<BF16*>(out), onorm, rows, H);
 }
 
 // Cache lazy/eager resident CTA counts per thread and window for the current
@@ -808,9 +942,11 @@ bool verify_steps_eager_at(int64_t ctas, int device) {
     if (hggcDeviceGetAttribute(&cus, hggcDevAttrMultiProcessorCount, device) !=
             hggcSuccess ||
         hggcOccupancyMaxActiveBlocksPerMultiprocessor(
-            &lazy, verify_steps_kernel<STEPS, 1, false>, 128, 0) != hggcSuccess ||
+            &lazy, verify_steps_kernel<STEPS, 1, false, Out::kPlain>, 128, 0) !=
+            hggcSuccess ||
         hggcOccupancyMaxActiveBlocksPerMultiprocessor(
-            &eager, verify_steps_kernel<STEPS, 1, true>, 128, 0) != hggcSuccess)
+            &eager, verify_steps_kernel<STEPS, 1, true, Out::kPlain>, 128, 0) !=
+            hggcSuccess)
       return false;
     caps = std::pair<int64_t, int64_t>(static_cast<int64_t>(cus) * lazy,
                                        static_cast<int64_t>(cus) * eager);
@@ -830,15 +966,18 @@ void launch_verify(
     void* ring_rawv, void* ring_rawk, float* ring_g, float* ring_beta,
     IndexArg slot_idx, IndexArg scratch_idx, IndexArg cu_seqlens,
     int H, int N, int t_loop, int ring_len,
-    float scale, float lower_bound, VerifyStrides strides, hggcStream_t stream) {
+    float scale, float lower_bound, VerifyStrides strides,
+    const OnormArgs& onorm, hggcStream_t stream) {
+  const bool norm = onorm.gate != nullptr;
+  const int rows = N * t_loop * H;
   int device = -1;
   if (use_verify_fast(H, N, t_loop) && hggcGetDevice(&device) == hggcSuccess &&
       reinterpret_cast<uintptr_t>(w_q) % 16 == 0 &&
       reinterpret_cast<uintptr_t>(w_k) % 16 == 0 &&
       reinterpret_cast<uintptr_t>(w_v) % 16 == 0) {
-    const int split = verify_steps_split(H, N, t_loop);
-#define PLA_VERIFY_STEPS_KERNEL(STEPS, VS, EAGER)                              \
-  verify_steps_kernel<STEPS, VS, EAGER><<<dim3(H, N, VS), 128, 0, stream>>>(   \
+    const int split = norm ? verify_steps_split_norm(H, N, t_loop)
+                           : verify_steps_split(H, N, t_loop);
+#define PLA_VERIFY_STEPS_ARGS                                                  \
       static_cast<const BF16*>(x_q), static_cast<const BF16*>(x_k),            \
       static_cast<const BF16*>(x_v), static_cast<const BF16*>(g_in),           \
       static_cast<const BF16*>(beta_in), w_q, w_k, w_v,                        \
@@ -848,49 +987,65 @@ void launch_verify(
       static_cast<BF16*>(ic_k), static_cast<BF16*>(ic_v),                      \
       static_cast<BF16*>(ring_rawv), static_cast<BF16*>(ring_rawk),            \
       ring_g, ring_beta, slot_idx, scratch_idx, cu_seqlens,                    \
-      H, ring_len, scale, lower_bound, strides, h0)
+      H, ring_len, scale, lower_bound, strides, h0
+#define PLA_VERIFY_STEPS_MODES(STEPS, VS, EAGER, NORM_MODE)                    \
+  {                                                                            \
+    if (norm)                                                                  \
+      verify_steps_kernel<STEPS, VS, EAGER, NORM_MODE, OnormArgs>              \
+          <<<dim3(H, N, VS), 128, 0, stream>>>(PLA_VERIFY_STEPS_ARGS, onorm);  \
+    else                                                                       \
+      verify_steps_kernel<STEPS, VS, EAGER, Out::kPlain>                       \
+          <<<dim3(H, N, VS), 128, 0, stream>>>(PLA_VERIFY_STEPS_ARGS);         \
+  }
 #define PLA_VERIFY_STEPS_LAUNCH(STEPS)                                         \
   switch (split) {                                                             \
-    case 8: PLA_VERIFY_STEPS_KERNEL(STEPS, 8, false); break;                   \
-    case 4: PLA_VERIFY_STEPS_KERNEL(STEPS, 4, false); break;                   \
-    case 2: PLA_VERIFY_STEPS_KERNEL(STEPS, 2, false); break;                   \
+    case 8: PLA_VERIFY_STEPS_MODES(STEPS, 8, false, Out::kStage) break;        \
+    case 4: PLA_VERIFY_STEPS_MODES(STEPS, 4, false, Out::kStage) break;        \
+    case 2: PLA_VERIFY_STEPS_MODES(STEPS, 2, false, Out::kStage) break;        \
     default:                                                                   \
       if (verify_steps_eager_at<STEPS>(static_cast<int64_t>(H) * N, device))   \
-        PLA_VERIFY_STEPS_KERNEL(STEPS, 1, true);                               \
+        PLA_VERIFY_STEPS_MODES(STEPS, 1, true, Out::kNorm)                     \
       else                                                                     \
-        PLA_VERIFY_STEPS_KERNEL(STEPS, 1, false);                              \
+        PLA_VERIFY_STEPS_MODES(STEPS, 1, false, Out::kNorm)                    \
       break;                                                                   \
   }
+    bool launched = true;
     switch (t_loop) {
-      case 1: PLA_VERIFY_STEPS_LAUNCH(1); return;
-      case 2: PLA_VERIFY_STEPS_LAUNCH(2); return;
-      case 3: PLA_VERIFY_STEPS_LAUNCH(3); return;
-      case 4: PLA_VERIFY_STEPS_LAUNCH(4); return;
-      case 5: PLA_VERIFY_STEPS_LAUNCH(5); return;
-      case 6: PLA_VERIFY_STEPS_LAUNCH(6); return;
-      case 7: PLA_VERIFY_STEPS_LAUNCH(7); return;
-      case 8: PLA_VERIFY_STEPS_LAUNCH(8); return;
-      default: break;  // wider draft windows fall through to the generic path
+      case 1: PLA_VERIFY_STEPS_LAUNCH(1); break;
+      case 2: PLA_VERIFY_STEPS_LAUNCH(2); break;
+      case 3: PLA_VERIFY_STEPS_LAUNCH(3); break;
+      case 4: PLA_VERIFY_STEPS_LAUNCH(4); break;
+      case 5: PLA_VERIFY_STEPS_LAUNCH(5); break;
+      case 6: PLA_VERIFY_STEPS_LAUNCH(6); break;
+      case 7: PLA_VERIFY_STEPS_LAUNCH(7); break;
+      case 8: PLA_VERIFY_STEPS_LAUNCH(8); break;
+      default: launched = false; break;  // wider windows use the generic path
     }
 #undef PLA_VERIFY_STEPS_LAUNCH
-#undef PLA_VERIFY_STEPS_KERNEL
+#undef PLA_VERIFY_STEPS_MODES
+#undef PLA_VERIFY_STEPS_ARGS
+    if (launched) {
+      if (norm && split > 1) launch_onorm(out, onorm, rows, H, stream);
+      return;
+    }
   }
 #define PLA_VERIFY_ARGS                                                        \
-  x_q, x_k, x_v, g_in, beta_in, w_q, w_k, w_v, cs_q, cs_k, cs_v, a_log,      \
-      dt_bias, h0, out, ic_q, ic_k, ic_v, ring_rawv, ring_rawk, ring_g,        \
-      ring_beta, slot_idx, scratch_idx, cu_seqlens, H, N, t_loop, ring_len,    \
-      scale, lower_bound, strides, stream
+  onorm, stream, x_q, x_k, x_v, g_in, beta_in, w_q, w_k, w_v, cs_q, cs_k,    \
+      cs_v, a_log, dt_bias, h0, out, ic_q, ic_k, ic_v, ring_rawv, ring_rawk,   \
+      ring_g, ring_beta, slot_idx, scratch_idx, cu_seqlens, H, N, t_loop,      \
+      ring_len, scale, lower_bound, strides
   int vsplit = VSPLIT_FORCE;
   if (vsplit == 0) {
     vsplit = (CAN_SPLIT2 && static_cast<long>(H) * N < KDA_V_VSPLIT_GATE) ? 2 : 1;
   }
-  if (vsplit == 2) {
-    if constexpr (CAN_SPLIT2) launch_verify_vsplit<2>(PLA_VERIFY_ARGS);
-    else launch_verify_vsplit<1>(PLA_VERIFY_ARGS);
+  const bool split2 = CAN_SPLIT2 && vsplit == 2;
+  if (split2) {
+    if constexpr (CAN_SPLIT2) launch_verify_generic<2>(PLA_VERIFY_ARGS);
   } else {
-    launch_verify_vsplit<1>(PLA_VERIFY_ARGS);
+    launch_verify_generic<1>(PLA_VERIFY_ARGS);
   }
 #undef PLA_VERIFY_ARGS
+  if (norm) launch_onorm(out, onorm, rows, H, stream);
 }
 
 }  // namespace kda_mtp
