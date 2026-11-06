@@ -6,6 +6,11 @@
 # The original source code was licensed under the MIT license and included
 # the following copyright notice:
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
+#
+# Synced with sglang-for-sail python/sglang/kernels/ops/attention/fla/kda.py
+# (v0.5.18). Only the chunk_kda forward path is kept; fused_recurrent_kda,
+# rms_norm_gated and chunk_kda_scaled_dot_kkt_* are not reachable from
+# chunk_kda and are omitted to avoid vendoring their dependencies.
 
 from typing import Optional
 
@@ -20,19 +25,256 @@ from .index import (
     prepare_chunk_indices,
 )
 from .l2norm import l2norm_fwd
-from .op import exp, log
+from .op import exp, exp2, log
 from .utils import (
+    autotune_cache_kwargs,
     check_shared_mem,
+    is_nvidia,
     is_tf32_supported,
 )
 
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 
+# Convert natural-log gates to log2 space before the exp2-based chunk kernels.
+# log2(e) rounded to fp32, matching flash-linear-attention.
+RCP_LN2 = 1.4426950216293335
+
 
 def cdiv(a: int, b: int) -> int:
     """Ceiling division."""
     return -(a // -b)
+
+
+@triton.jit(do_not_specialize=["T"])
+def _recompute_w_u_fwd_kernel(
+    k,
+    kg,
+    v,
+    beta,
+    w,
+    u,
+    A,
+    gk,
+    cu_seqlens,
+    chunk_indices,
+    T,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    STORE_KG: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+    DOT_PRECISION: tl.constexpr,
+):
+    i_t, i_bh = tl.program_id(0), tl.program_id(1)
+    i_b, i_h = i_bh // H, i_bh % H
+    if IS_VARLEN:
+        i_n, i_t = (
+            tl.load(chunk_indices + i_t * 2).to(tl.int32),
+            tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32),
+        )
+        bos, eos = (
+            tl.load(cu_seqlens + i_n).to(tl.int32),
+            tl.load(cu_seqlens + i_n + 1).to(tl.int32),
+        )
+        T = eos - bos
+    else:
+        bos, eos = i_b * T, i_b * T + T
+    p_b = tl.make_block_ptr(beta + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
+    b_b = tl.load(p_b, boundary_check=(0,))
+
+    p_A = tl.make_block_ptr(
+        A + (bos * H + i_h) * BT, (T, BT), (H * BT, 1), (i_t * BT, 0), (BT, BT), (1, 0)
+    )
+    b_A = tl.load(p_A, boundary_check=(0, 1))
+
+    for i_v in range(tl.cdiv(V, BV)):
+        p_v = tl.make_block_ptr(
+            v + (bos * H + i_h) * V,
+            (T, V),
+            (H * V, 1),
+            (i_t * BT, i_v * BV),
+            (BT, BV),
+            (1, 0),
+        )
+        p_u = tl.make_block_ptr(
+            u + (bos * H + i_h) * V,
+            (T, V),
+            (H * V, 1),
+            (i_t * BT, i_v * BV),
+            (BT, BV),
+            (1, 0),
+        )
+        b_v = tl.load(p_v, boundary_check=(0, 1))
+        b_vb = (b_v * b_b[:, None]).to(b_v.dtype)
+        b_u = tl.dot(b_A, b_vb, input_precision=DOT_PRECISION)
+        tl.store(p_u, b_u.to(p_u.dtype.element_ty), boundary_check=(0, 1))
+
+    for i_k in range(tl.cdiv(K, BK)):
+        p_w = tl.make_block_ptr(
+            w + (bos * H + i_h) * K,
+            (T, K),
+            (H * K, 1),
+            (i_t * BT, i_k * BK),
+            (BT, BK),
+            (1, 0),
+        )
+        p_k = tl.make_block_ptr(
+            k + (bos * H + i_h) * K,
+            (T, K),
+            (H * K, 1),
+            (i_t * BT, i_k * BK),
+            (BT, BK),
+            (1, 0),
+        )
+        b_k = tl.load(p_k, boundary_check=(0, 1))
+        b_kb = b_k * b_b[:, None]
+
+        p_gk = tl.make_block_ptr(
+            gk + (bos * H + i_h) * K,
+            (T, K),
+            (H * K, 1),
+            (i_t * BT, i_k * BK),
+            (BT, BK),
+            (1, 0),
+        )
+        b_gk = tl.load(p_gk, boundary_check=(0, 1))
+        b_kb *= exp2(b_gk)
+        if STORE_KG:
+            last_idx = min(i_t * BT + BT, T) - 1
+
+            o_k = i_k * BK + tl.arange(0, BK)
+            m_k = o_k < K
+            b_gn = tl.load(
+                gk + ((bos + last_idx) * H + i_h) * K + o_k, mask=m_k, other=0.0
+            )
+            b_kg = b_k * exp2(b_gn - b_gk)
+
+            p_kg = tl.make_block_ptr(
+                kg + (bos * H + i_h) * K,
+                (T, K),
+                (H * K, 1),
+                (i_t * BT, i_k * BK),
+                (BT, BK),
+                (1, 0),
+            )
+            tl.store(p_kg, b_kg.to(p_kg.dtype.element_ty), boundary_check=(0, 1))
+
+        b_w = tl.dot(b_A, b_kb.to(b_k.dtype))
+        tl.store(p_w, b_w.to(p_w.dtype.element_ty), boundary_check=(0, 1))
+
+
+_RECOMPUTE_W_U_CONFIGS = [
+    triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
+    for BK in [64, 128]
+    for BV in [64, 128]
+    for num_warps in [2, 4, 8]
+    for num_stages in [2, 3, 4]
+]
+
+recompute_w_u_fwd_kernel = triton.autotune(
+    configs=_RECOMPUTE_W_U_CONFIGS,
+    key=["H", "K", "V", "BT", "IS_VARLEN"],
+    **autotune_cache_kwargs,
+)(_recompute_w_u_fwd_kernel)
+
+_K3_RECOMPUTE_W_U_CONFIGS = {
+    (9, 0): {"BK": 128, "BV": 128, "num_warps": 8, "num_stages": 2},
+    (10, 3): {"BK": 64, "BV": 128, "num_warps": 8, "num_stages": 2},
+}
+
+
+@torch.inference_mode()
+def precompile_k3_recompute_w_u_kernel(
+    *, num_heads: int, dtype: torch.dtype, device: torch.device
+) -> bool:
+    device = torch.device(device)
+    if (
+        not is_nvidia
+        or device.type != "cuda"
+        or torch.cuda.get_device_capability(device) not in _K3_RECOMPUTE_W_U_CONFIGS
+    ):
+        return False
+
+    shape = (1, 1, num_heads, 128)
+    k = torch.zeros(shape, dtype=dtype, device=device)
+    v = torch.zeros_like(k)
+    beta = torch.zeros((1, 1, num_heads), dtype=dtype, device=device)
+    A = torch.zeros((1, 1, num_heads, 64), dtype=dtype, device=device)
+    gk = torch.zeros(shape, dtype=torch.float32, device=device)
+    cu_seqlens = torch.tensor([0, 1], dtype=torch.int64, device=device)
+    recompute_w_u_fwd(k, v, beta, A, gk=gk, cu_seqlens=cu_seqlens)
+    return True
+
+
+def _get_k3_recompute_w_u_config(
+    k: torch.Tensor,
+    gk: torch.Tensor | None,
+    cu_seqlens: torch.LongTensor | None,
+    K: int,
+    V: int,
+    BT: int,
+) -> dict | None:
+    if (
+        not is_nvidia
+        or gk is None
+        or cu_seqlens is None
+        or (K, V, BT) != (128, 128, 64)
+    ):
+        return None
+    return _K3_RECOMPUTE_W_U_CONFIGS.get(torch.cuda.get_device_capability(k.device))
+
+
+def recompute_w_u_fwd(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    A: torch.Tensor,
+    gk: torch.Tensor | None = None,
+    cu_seqlens: torch.LongTensor | None = None,
+    chunk_indices: torch.LongTensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    B, T, H, K, V = *k.shape, v.shape[-1]
+    BT = A.shape[-1]
+
+    if chunk_indices is None and cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
+    NT = cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
+
+    w = torch.empty_like(k)
+    u = torch.empty_like(v)
+    kg = torch.empty_like(k) if gk is not None else None
+    static_config = _get_k3_recompute_w_u_config(k, gk, cu_seqlens, K, V, BT)
+    kernel = (
+        _recompute_w_u_fwd_kernel
+        if static_config is not None
+        else recompute_w_u_fwd_kernel
+    )
+    kernel[(NT, B * H)](
+        k=k,
+        kg=kg,
+        v=v,
+        beta=beta,
+        w=w,
+        u=u,
+        A=A,
+        gk=gk,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        T=T,
+        H=H,
+        K=K,
+        V=V,
+        BT=BT,
+        STORE_KG=kg is not None,
+        IS_VARLEN=cu_seqlens is not None,
+        DOT_PRECISION="tf32" if is_tf32_supported else "ieee",
+        **(static_config or {}),
+    )
+    return w, u, kg
 
 
 @triton.autotune(
@@ -119,7 +361,7 @@ def chunk_gla_fwd_kernel_o(
         # [BT, BK]
         b_g = tl.load(p_g, boundary_check=(0, 1))
         # [BT, BK]
-        b_qg = (b_q * exp(b_g)).to(b_q.dtype)
+        b_qg = (b_q * exp2(b_g)).to(b_q.dtype)
         # [BK, BV]
         b_h = tl.load(p_h, boundary_check=(0, 1))
         # works but dkw, owing to divine benevolence
@@ -368,206 +610,6 @@ def kda_gate_chunk_cumsum(
     return g
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for BK in [64, 128]
-        for BV in [64, 128]
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
-    key=["H", "K", "V", "BT", "IS_VARLEN"],
-)
-@triton.jit(do_not_specialize=["T"])
-def recompute_w_u_fwd_kernel(
-    q,
-    k,
-    qg,
-    kg,
-    v,
-    beta,
-    w,
-    u,
-    A,
-    gk,
-    cu_seqlens,
-    chunk_indices,
-    T,
-    H: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BT: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
-    STORE_QG: tl.constexpr,
-    STORE_KG: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-    DOT_PRECISION: tl.constexpr,
-):
-    i_t, i_bh = tl.program_id(0), tl.program_id(1)
-    i_b, i_h = i_bh // H, i_bh % H
-    if IS_VARLEN:
-        i_n, i_t = (
-            tl.load(chunk_indices + i_t * 2).to(tl.int32),
-            tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32),
-        )
-        bos, eos = (
-            tl.load(cu_seqlens + i_n).to(tl.int32),
-            tl.load(cu_seqlens + i_n + 1).to(tl.int32),
-        )
-        T = eos - bos
-    else:
-        bos, eos = i_b * T, i_b * T + T
-    p_b = tl.make_block_ptr(beta + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
-    b_b = tl.load(p_b, boundary_check=(0,))
-
-    p_A = tl.make_block_ptr(
-        A + (bos * H + i_h) * BT, (T, BT), (H * BT, 1), (i_t * BT, 0), (BT, BT), (1, 0)
-    )
-    b_A = tl.load(p_A, boundary_check=(0, 1))
-
-    for i_v in range(tl.cdiv(V, BV)):
-        p_v = tl.make_block_ptr(
-            v + (bos * H + i_h) * V,
-            (T, V),
-            (H * V, 1),
-            (i_t * BT, i_v * BV),
-            (BT, BV),
-            (1, 0),
-        )
-        p_u = tl.make_block_ptr(
-            u + (bos * H + i_h) * V,
-            (T, V),
-            (H * V, 1),
-            (i_t * BT, i_v * BV),
-            (BT, BV),
-            (1, 0),
-        )
-        b_v = tl.load(p_v, boundary_check=(0, 1))
-        b_vb = (b_v * b_b[:, None]).to(b_v.dtype)
-        b_u = tl.dot(b_A, b_vb, input_precision=DOT_PRECISION)
-        tl.store(p_u, b_u.to(p_u.dtype.element_ty), boundary_check=(0, 1))
-
-    for i_k in range(tl.cdiv(K, BK)):
-        p_w = tl.make_block_ptr(
-            w + (bos * H + i_h) * K,
-            (T, K),
-            (H * K, 1),
-            (i_t * BT, i_k * BK),
-            (BT, BK),
-            (1, 0),
-        )
-        p_k = tl.make_block_ptr(
-            k + (bos * H + i_h) * K,
-            (T, K),
-            (H * K, 1),
-            (i_t * BT, i_k * BK),
-            (BT, BK),
-            (1, 0),
-        )
-        b_k = tl.load(p_k, boundary_check=(0, 1))
-        b_kb = b_k * b_b[:, None]
-
-        p_gk = tl.make_block_ptr(
-            gk + (bos * H + i_h) * K,
-            (T, K),
-            (H * K, 1),
-            (i_t * BT, i_k * BK),
-            (BT, BK),
-            (1, 0),
-        )
-        b_gk = tl.load(p_gk, boundary_check=(0, 1))
-        b_kb *= exp(b_gk)
-        if STORE_QG:
-            p_q = tl.make_block_ptr(
-                q + (bos * H + i_h) * K,
-                (T, K),
-                (H * K, 1),
-                (i_t * BT, i_k * BK),
-                (BT, BK),
-                (1, 0),
-            )
-            p_qg = tl.make_block_ptr(
-                qg + (bos * H + i_h) * K,
-                (T, K),
-                (H * K, 1),
-                (i_t * BT, i_k * BK),
-                (BT, BK),
-                (1, 0),
-            )
-            b_q = tl.load(p_q, boundary_check=(0, 1))
-            b_qg = b_q * exp(b_gk)
-            tl.store(p_qg, b_qg.to(p_qg.dtype.element_ty), boundary_check=(0, 1))
-        if STORE_KG:
-            last_idx = min(i_t * BT + BT, T) - 1
-
-            o_k = i_k * BK + tl.arange(0, BK)
-            m_k = o_k < K
-            b_gn = tl.load(
-                gk + ((bos + last_idx) * H + i_h) * K + o_k, mask=m_k, other=0.0
-            )
-            b_kg = b_k * exp(b_gn - b_gk)
-
-            p_kg = tl.make_block_ptr(
-                kg + (bos * H + i_h) * K,
-                (T, K),
-                (H * K, 1),
-                (i_t * BT, i_k * BK),
-                (BT, BK),
-                (1, 0),
-            )
-            tl.store(p_kg, b_kg.to(p_kg.dtype.element_ty), boundary_check=(0, 1))
-
-        b_w = tl.dot(b_A, b_kb.to(b_k.dtype))
-        tl.store(p_w, b_w.to(p_w.dtype.element_ty), boundary_check=(0, 1))
-
-
-def recompute_w_u_fwd(
-    k: torch.Tensor,
-    v: torch.Tensor,
-    beta: torch.Tensor,
-    A: torch.Tensor,
-    q: Optional[torch.Tensor] = None,
-    gk: Optional[torch.Tensor] = None,
-    cu_seqlens: Optional[torch.LongTensor] = None,
-    chunk_indices: Optional[torch.LongTensor] = None,
-):
-    B, T, H, K, V = *k.shape, v.shape[-1]
-    BT = A.shape[-1]
-
-    if chunk_indices is None and cu_seqlens is not None:
-        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
-    NT = cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-
-    w = torch.empty_like(k)
-    u = torch.empty_like(v)
-    kg = torch.empty_like(k) if gk is not None else None
-    recompute_w_u_fwd_kernel[(NT, B * H)](
-        q=q,
-        k=k,
-        qg=None,
-        kg=kg,
-        v=v,
-        beta=beta,
-        w=w,
-        u=u,
-        A=A,
-        gk=gk,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        T=T,
-        H=H,
-        K=K,
-        V=V,
-        BT=BT,
-        STORE_QG=False,
-        STORE_KG=kg is not None,
-        IS_VARLEN=cu_seqlens is not None,
-        DOT_PRECISION="tf32" if is_tf32_supported else "ieee",
-    )
-    return w, u, None, kg
-
-
 def chunk_kda_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -599,6 +641,7 @@ def chunk_kda_fwd(
             g,
             A_log=A_log,
             chunk_size=chunk_size,
+            scale=RCP_LN2,
             dt_bias=dt_bias,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
@@ -609,6 +652,7 @@ def chunk_kda_fwd(
         g = chunk_local_cumsum(
             g,
             chunk_size=chunk_size,
+            scale=RCP_LN2,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
         )
@@ -653,6 +697,7 @@ def chunk_kda_fwd(
         initial_state_indices=initial_state_indices,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
+        use_exp2=True,
     )
     del w, u, kg
 
@@ -671,6 +716,9 @@ def chunk_kda_fwd(
     del Aqk, v_new
 
     if output_intermediate_states:
+        # h holds the recurrent state at every chunk-size boundary
+        # ([1, NT, H, V, K] packed across cu_seqlens) — the mamba radix
+        # track path snapshots per-chunk states from it during extend.
         return o, h
     del h
     return o

@@ -50,6 +50,8 @@ def cases():
     result.extend([
         Case("gdn-noncontiguous-stride", "decode",
              ("scripts/decode/test_gdn_noncontiguous_stride.py",), 900),
+        Case("packed-decode-grid", "decode",
+             ("scripts/decode/test_packed_decode_grid.py",), 900),
         Case("kda-mega-fusion", "decode", ("tests/test_kda_decode_mega.py",
              "--dtype=bf16", f"--caselist={kimi}", "--max-batches=4"), 3600, "markers"),
         Case("kda-mtp-sglang", "decode", ("tests/test_kda_mtp_sglang.py",

@@ -3,15 +3,24 @@
 # Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD. All rights reserved.
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
+import os
+
 import triton
 import triton.language as tl
+import triton.language.extra.libdevice as tldevice
 
 from .utils import is_gather_supported
 
-exp = tl.exp
-exp2 = tl.math.exp2
-log = tl.log
-log2 = tl.log2
+if os.environ.get("FLA_USE_FAST_OPS", "0") == "1":
+    exp = tldevice.fast_expf
+    exp2 = tldevice.exp2
+    log = tldevice.fast_logf
+    log2 = tldevice.fast_log2f
+else:
+    exp = tl.exp
+    exp2 = tl.math.exp2
+    log = tl.log
+    log2 = tl.log2
 
 
 @triton.jit
