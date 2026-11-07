@@ -146,6 +146,30 @@ class PPUBuildExtensionTests(unittest.TestCase):
         self.assertNotIn("nvcc", ninja)
         self.assertNotIn("CUDA_HOME", ninja)
 
+    def test_header_dependency_is_emitted_for_kkt_consumers(self):
+        header = self.root / "kkt_solve_cute_impl.cuh"
+        header.write_text("#pragma once\n")
+        sources = [self.root / f"kkt_solve_cute_tc{arch}.cu" for arch in ("01", "02")]
+        for source in sources:
+            source.write_text('#include "kkt_solve_cute_impl.cuh"\n')
+        extension = FakeExtension("pla.prefill.flashqla._C", list(map(str, sources)))
+        extension.depends = [str(header)]
+        output = self.root / "objects"
+        expected = [self.command._object_path(output, source) for source in sources]
+
+        def fake_ninja(_):
+            for path in expected:
+                path.touch()
+
+        self.command._run_ninja = fake_ninja
+        self.command.compile_sources(extension.sources, output, extension,
+                                     depends=extension.depends)
+        edges = [line for line in (output / "build.ninja").read_text().splitlines()
+                 if line.startswith("build ")]
+        self.assertEqual(len(edges), 2)
+        for edge in edges:
+            self.assertTrue(edge.endswith(" | " + str(header.resolve())))
+
     def test_configure_toolchain_uses_only_native_ppu_sdk_paths(self):
         sdk = self.root / "ppu-sdk"
         (sdk / "bin").mkdir(parents=True)

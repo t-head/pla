@@ -137,9 +137,11 @@ def test_qwen38_real_gate_raw_indexed_state_prefill():
 @pytest.mark.parametrize("fresh_prefix", [False, True])
 @pytest.mark.parametrize("auto_cp", [False, True])
 @pytest.mark.parametrize("heads", [6, 12])
+@pytest.mark.parametrize("storage_offset", [0, 1, 2, 3, 4])
+@pytest.mark.parametrize("capture", [False, True])
 def test_gva_history(
     dtype, state_dtype, indexed, output_final_state, fresh_prefix, auto_cp, heads,
-    monkeypatch,
+    monkeypatch, storage_offset, capture,
 ):
     from pla.prefill.flashqla import ops
 
@@ -176,15 +178,24 @@ def test_gva_history(
         expected_state = base_pool[3].float() * decay[-1, :, None, None]
         expected_output = (
             decay[None, :, :, None] * base_pool[3].float().mean(-1)[None, None])
-    state = (base_pool.clone() if indexed else
-             base_pool[3:4].transpose(-1, -2).contiguous())
-    with patch.object(ops, "calc_cp_seqs", wraps=ops.calc_cp_seqs) as planner:
-        result = chunk_gated_delta_rule_fwd(
+    state_before = (base_pool.clone() if indexed else
+                    base_pool[3:4].transpose(-1, -2).contiguous())
+    storage = torch.full((storage_offset + state_before.numel() + 4,), -123.0,
+                         device="cuda", dtype=state_dtype)
+    state = storage[storage_offset:storage_offset + state_before.numel()].view_as(state_before)
+    state.copy_(state_before)
+    assert state.is_contiguous() and state.storage_offset() == storage_offset
+
+    def run():
+        return chunk_gated_delta_rule_fwd(
             q, k, v, gate, beta, initial_state=state,
             initial_state_indices=indices if indexed else None,
             cu_seqlens=cu, raw_cu_seqlens=(0, total), normalize_qk=True,
             output_final_state=output_final_state, auto_cp=auto_cp,
         )
+
+    with patch.object(ops, "calc_cp_seqs", wraps=ops.calc_cp_seqs) as planner:
+        result = run()
         if auto_cp:
             assert planner.call_count == 1
             props = torch.cuda.get_device_properties(q.device)
@@ -193,6 +204,23 @@ def test_gva_history(
                 assert plan[0] and plan[1].numel() == (13 if heads == 6 else 7)
         else:
             planner.assert_not_called()
+    if capture:
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            state.copy_(state_before)
+            run()
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            state.copy_(state_before)
+            result = run()
+        torch.cuda.current_stream().wait_stream(stream)
+        for _ in range(3):
+            graph.replay()
+        torch.cuda.synchronize()
+    assert bool((storage[:storage_offset] == -123).all())
+    assert bool((storage[storage_offset + state.numel():] == -123).all())
     torch.testing.assert_close(result[2].float(), expected_output, rtol=0.05, atol=0.0)
     if indexed:
         actual_state = state[3].float()

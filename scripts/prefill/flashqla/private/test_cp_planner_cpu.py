@@ -64,16 +64,28 @@ def _install_torch_stub_if_needed():
             self.is_cuda = False
 
         def numel(self):
-            return len(self)
+            return sum(len(row) for row in self) if self and isinstance(self[0], list) else len(self)
+
+        def view(self, rows, columns):
+            if rows * columns != self.numel():
+                raise ValueError("incompatible view shape")
+            values = self.tolist()
+            if values and isinstance(values[0], list):
+                values = [value for row in values for value in row]
+            return _FakeTensor(
+                [values[i * columns:(i + 1) * columns] for i in range(rows)],
+                dtype=self.dtype)
 
         def tolist(self):
-            return list(self)
+            return [list(row) if isinstance(row, list) else row for row in self]
 
     torch_stub = types.ModuleType("torch")
     torch_stub.Tensor = _FakeTensor
     torch_stub.int8 = "int8"
     torch_stub.int32 = "int32"
     torch_stub.tensor = _FakeTensor
+    torch_stub.ones = lambda shape, dtype=None, device=None: _FakeTensor(
+        [[1] * shape[1] for _ in range(shape[0])], dtype=dtype, device=device)
     torch_stub.cuda = types.SimpleNamespace(current_device=lambda: 0)
     sys.modules["torch"] = torch_stub
 
@@ -700,11 +712,16 @@ class Tc02RealGatePlannerTest(unittest.TestCase):
         self.assertEqual(plan[2].tolist(), [0, 12])
         self.assertEqual(plan[3].tolist(), [0] * 12)
         self.assertEqual(plan[4].tolist(), [0] * 11 + [1])
-        chunks = (plan[1][1:] - plan[1][:-1]) // 32
-        self.assertEqual(chunks.sum().item(), 256)
-        self.assertLessEqual(chunks.max().item() - chunks.min().item(), 1)
+        offsets = plan[1].tolist()
+        chunks = [(end - start) // 32 for start, end in zip(offsets, offsets[1:])]
+        self.assertEqual(sum(chunks), 256)
+        self.assertLessEqual(max(chunks) - min(chunks), 1)
         warmup, fallback = plan.warmup_metadata
-        self.assertEqual(warmup.tolist(), [[n] * 6 for n in chunks.tolist()])
+        self.assertEqual(warmup.numel(), 12 * 6)
+        self.assertEqual(fallback.numel(), 12 * 6)
+        self.assertEqual(warmup.dtype, cp.torch.int32)
+        self.assertEqual(fallback.dtype, cp.torch.int8)
+        self.assertEqual(warmup.tolist(), [[n] * 6 for n in chunks])
         self.assertEqual(fallback.tolist(), [[1] * 6] * 12)
 
     def test_tc02_h12_target_does_not_expand_neighbors(self):

@@ -508,6 +508,7 @@ if "pla.prefill.flashqla" in NAMESPACES:
         Extension(
             name="pla.prefill.flashqla._C",
             sources=prefill_sources,
+            depends=[os.path.join(prefill_dir, "kernels", "kkt_solve_cute_impl.cuh")],
             include_dirs=[
                 os.path.join(prefill_dir, "kernels"),  # flashqla_cute_traits.cuh
                 os.path.join(here, "src"),

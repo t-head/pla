@@ -37,13 +37,16 @@ Checks against the checked-in template combinations, compatible with full/defaul
 import ast
 import csv
 import importlib.util
+import json
 import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 GEN_DIR = ROOT / "src/decode/k-last/generated"
@@ -135,7 +138,69 @@ class TunedTableTest(unittest.TestCase):
             self.assertEqual(rows[1]["BV"], "128")
             self.assertEqual([r["state_dtype"] for r in rows[2:]], ["fp32", "bf16"])
 
-    def test_flashnext_890p_lut_coverage_and_generated_header(self):
+    def test_legacy_partial_upsert_preserves_all_modes_and_buckets(self):
+        spec = importlib.util.spec_from_file_location(
+            "decode_tuner", ROOT / "scripts/decode/auto_tune.py")
+        tuner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(tuner)
+        for mode in ("chain", "tree"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "tuned.csv"
+                legacy = [dict(self.row(mode="", bv=bv), B=batch)
+                          for batch, bv in ((1, 32), (64, 64), (512, 128))]
+                explicit = dict(self.row(mode=mode, bv=16), B=64)
+                untouched = [self.row(kernel="k_last_packed", mode=""),
+                             dict(self.row(kernel="k_last_packed", mode=""), state_dtype="bf16"),
+                             dict(legacy[0], device_name="ZW-M890L")]
+                fields = list(explicit)
+                with path.open("w", newline="") as stream:
+                    writer = csv.DictWriter(stream, fieldnames=fields)
+                    writer.writeheader()
+                    writer.writerows([explicit, *legacy, *untouched])
+                update = dict(self.row(mode=mode, bv=128), B=1)
+                tuner.merge_tuned_rows(path, fields, [update], "ZW-M890P")
+                first = path.read_bytes()
+                tuner.merge_tuned_rows(path, fields, [update], "ZW-M890P")
+                self.assertEqual(first, path.read_bytes())
+                with path.open() as stream:
+                    rows = list(csv.DictReader(stream))
+                self.assertEqual(len(rows), 9)
+                by_key = {(r["mode"], int(r["B"])): int(r["BV"]) for r in rows
+                          if r["kernel"] == "k_last_mtp" and r["device_name"] == "ZW-M890P"}
+                other = "chain" if mode == "tree" else "tree"
+                self.assertEqual(by_key, {(mode, 1): 128, (mode, 64): 16, (mode, 512): 128,
+                                          (other, 1): 32, (other, 64): 64, (other, 512): 128})
+                self.assertEqual(rows[-3:], [{k: str(v) for k, v in r.items()} for r in untouched])
+                _, records = codegen.load_tuned_csv(str(path))
+                for selected_mode in ("chain", "tree"):
+                    entries = codegen._bucket_table_entries([r for r in records
+                        if r["kernel"] == "k_last_mtp" and r["device_name"] == "ZW-M890P"
+                        and r["mode"] == selected_mode])
+                    self.assertEqual(len(entries), 33)
+                    self.assertEqual(entries[4], "{%d, 4, 4, 1}" % by_key[(selected_mode, 64)])
+                    self.assertEqual(entries[-1], "{128, 4, 4, 1}")
+
+    def test_upsert_migrates_csv_without_mode_column(self):
+        spec = importlib.util.spec_from_file_location(
+            "decode_tuner", ROOT / "scripts/decode/auto_tune.py")
+        tuner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(tuner)
+        fields = [name for name in self.row() if name != "mode"]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy.csv"
+            with path.open("w", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore")
+                writer.writeheader()
+                writer.writerows([dict(self.row(bv=32), B=1), dict(self.row(bv=64), B=64)])
+            tuner.merge_tuned_rows(path, fields,
+                [dict(self.row(mode="tree", bv=128), B=64)], "ZW-M890P")
+            with path.open() as stream:
+                rows = list(csv.DictReader(stream))
+            self.assertEqual({(r["mode"], int(r["B"])): int(r["BV"]) for r in rows},
+                             {("chain", 1): 32, ("chain", 64): 64,
+                              ("tree", 1): 32, ("tree", 64): 128})
+
+    def test_flashnext_890p_lut_coverage(self):
         path = ROOT / "lut/tuned_result_ZW-M890P.csv"
         with path.open() as stream:
             rows = list(csv.DictReader(stream))
@@ -157,9 +222,57 @@ class TunedTableTest(unittest.TestCase):
                 for r in matching:
                     self.assertIn(tuple(int(r[n]) for n in
                         ("BV", "WARP_NUM", "STAGE_NUM", "HV_PER_CTA")), valid)
-        _, records = codegen.load_tuned_csv(str(ROOT / "lut/tuned_result_*.csv"))
-        self.assertEqual((GEN_DIR / "tuned_dispatch.h").read_text(),
-                         codegen.generate_tuned_dispatch(records))
+
+    def assert_tuned_header(self, text, generated_dir=GEN_DIR):
+        default = codegen.generate_default_tuned_dispatch()
+        if text == default:
+            self.assertEqual(text, default)
+            return
+        prefix = "// PLA_TUNED_CSV: "
+        marker = ""
+        if text.startswith(prefix):
+            marker = text.splitlines(keepends=True)[0]
+            paths = json.loads(marker[len(prefix):])
+            self.assertIsInstance(paths, list)
+            self.assertTrue(paths)
+            records = []
+            for path in paths:
+                self.assertIsInstance(path, str)
+                _, source = codegen.load_tuned_csv(str(generated_dir / path))
+                records.extend(source)
+        else:
+            _, records = codegen.load_tuned_csv(str(ROOT / "lut/tuned_result_*.csv"))
+        self.assertEqual(text, marker + codegen.generate_tuned_dispatch(records))
+
+    def test_current_build_tuned_header(self):
+        self.assert_tuned_header((GEN_DIR / "tuned_dispatch.h").read_text())
+
+    def test_all_generation_modes_and_stale_header_detection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            custom = root / "tuned_result_ZW-M890P.csv"
+            row = self.row()
+            with custom.open("w", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=list(row))
+                writer.writeheader()
+                writer.writerow(row)
+            for name, arguments in (
+                ("default", ["--default-only"]), ("full", []),
+                ("tuned", ["--tuned-csv", str(ROOT / "lut/tuned_result_*.csv")]),
+                ("custom", ["--tuned-csv", str(custom)]),
+            ):
+                with self.subTest(mode=name):
+                    out = root / name
+                    with mock.patch.object(codegen, "GENERATED_DIR", str(out)), \
+                            mock.patch.object(sys, "argv", ["generate", *arguments]):
+                        codegen.main()
+                    text = (out / "tuned_dispatch.h").read_text()
+                    self.assert_tuned_header(text, out)
+                    with self.assertRaises(AssertionError):
+                        self.assert_tuned_header(text.replace("DEFAULT_PARAMS", "STALE_PARAMS"), out)
+            custom.write_text(custom.read_text().replace(",32,4,4,1,", ",64,4,4,1,"))
+            with self.assertRaises(AssertionError):
+                self.assert_tuned_header((root / "custom/tuned_dispatch.h").read_text(), root / "custom")
 
     def test_decode_build_tracks_tuned_header(self):
         tree = ast.parse((ROOT / "setup.py").read_text())
@@ -172,6 +285,18 @@ class TunedTableTest(unittest.TestCase):
         paths = eval(compile(ast.Expression(depends), "<depends>", "eval"),
                      {"os": os, "here": str(ROOT)})
         self.assertIn(str(GEN_DIR / "tuned_dispatch.h"), paths)
+
+    def test_prefill_build_tracks_kkt_header(self):
+        tree = ast.parse((ROOT / "setup.py").read_text())
+        extension = next(n for n in ast.walk(tree) if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name) and n.func.id == "Extension" and any(
+                k.arg == "name" and isinstance(k.value, ast.Constant)
+                and k.value.value == "pla.prefill.flashqla._C" for k in n.keywords))
+        depends = next(k.value for k in extension.keywords if k.arg == "depends")
+        prefill = ROOT / "src/prefill/flashqla"
+        paths = eval(compile(ast.Expression(depends), "<depends>", "eval"),
+                     {"os": os, "prefill_dir": str(prefill)})
+        self.assertIn(str(prefill / "kernels/kkt_solve_cute_impl.cuh"), paths)
 
     def test_generator_retains_chain_tree_tables(self):
         header = codegen.generate_tuned_dispatch([

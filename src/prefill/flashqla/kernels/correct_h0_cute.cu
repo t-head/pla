@@ -645,7 +645,10 @@ static void ch0_launch(
     // head. Use it only when every DV tile fits in one physical-CU wave; past
     // that point NGRP=2 has the same wave count and its shared mt load wins.
     const bool use_one_group = raw_batch_size * H * 4 <= effective_num_cu;
-    const bool pipe = compute_capability == 89 && num_cu == 39 &&
+    const bool raw_aligned = !has_raw ||
+        reinterpret_cast<std::uintptr_t>(raw_h0) %
+            (raw_h0_is_bf16 ? alignof(uint2) : alignof(float4)) == 0;
+    const bool pipe = raw_aligned && compute_capability == 89 && num_cu == 39 &&
         raw_batch_size == 1 &&
         ((H == 12 && cp_batch_size == 6) || (H == 6 && cp_batch_size == 12));
     const int ngrp = (use_one_group || pipe) ? 1 : 2;
