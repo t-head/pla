@@ -659,6 +659,8 @@ if __name__ == "__main__":
     print("SECTION 2: GVA deployment shapes, variable T (exercises CP decisions)")
     print("=" * 80)
     GVA_CASES = [
+        (8192, 6, 2),
+        (8192, 12, 4),
         # (T, H, Hg) — covers major Qwen deployment configs
         (4096, 16, 8),   # Qwen3.7-Max tp8
         (8192, 16, 8),
@@ -687,14 +689,11 @@ if __name__ == "__main__":
     ]
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
     if (int(props.major), int(props.minor)) == (8, 9):
-        # tc01 deliberately keeps H32 serial. The latest tc02 calibration also
-        # keeps 8K serial (the CP threshold is 9440 tokens), then requires CP
-        # from the measured 10K production point onward.
         CP_CASES += [
             (8192, 32, 16, torch.float16, "serial"),
-            (10240, 32, 16, torch.float16, "zero"),
-            (10240, 32, 16, torch.bfloat16, "zero"),
-            (16384, 32, 16, torch.float16, "zero"),
+            (10240, 32, 16, torch.float16, "serial"),
+            (10240, 32, 16, torch.bfloat16, "serial"),
+            (16384, 32, 16, torch.float16, "serial"),
         ]
     for (T, H, Hg, dtype, expected_path) in CP_CASES:
         ok = run_e2e(

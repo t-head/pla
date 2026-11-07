@@ -99,6 +99,29 @@ H8_HG2_LONG_CP_SEGMENTS = 18
 _cp_plan_cache = []
 
 
+class _CpPlan(tuple):
+    """Five-field CP plan with optional derived full-history launch metadata.
+
+    ``warmup_metadata`` holds the read-only ``[segments, H]`` int32 chunk counts
+    and int8 all-ones fallback mask that prepare_h/correct_h0 consume when every
+    segment replays its complete prefix.  Both depend only on the cached plan, so
+    building them once removes per-call elementwise launches from the API path.
+    """
+
+    warmup_metadata = None
+
+
+def _plan_tensors(plan):
+    tensors = [
+        tensor for tensor in plan[1:]
+        if tensor is not None and tensor.is_cuda
+    ]
+    metadata = getattr(plan, "warmup_metadata", None)
+    if metadata is not None:
+        tensors.extend(tensor for tensor in metadata if tensor.is_cuda)
+    return tensors
+
+
 @dataclass(frozen=True)
 class _PlannerExecutionModel:
     """Execution domains used by the CP planner for one architecture.
@@ -610,16 +633,13 @@ def _record_plan_stream(plan, ready_event, active_streams) -> None:
         return
     stream = torch.cuda.current_stream(device=first_tensor.device)
     stream.wait_event(ready_event)
-    for tensor in plan[1:]:
+    for tensor in _plan_tensors(plan):
         tensor.record_stream(stream)
     active_streams.add(stream_key)
 
 
 def _plan_ready_event(plan):
-    tensors = [
-        tensor for tensor in plan[1:]
-        if tensor is not None and tensor.is_cuda
-    ]
+    tensors = _plan_tensors(plan)
     if not tensors:
         return None, set()
     stream = torch.cuda.current_stream(device=tensors[0].device)
@@ -1054,6 +1074,12 @@ def calc_cp_seqs(
     # architecture route above, independently of fused_head_shards.
     H = num_v_heads
     H_tasks = H * fused_head_shards
+    full_history_segments = (
+        {(12, 4): 6, (6, 2): 12}.get((H, num_k_heads), 0)
+        if execution_model.physical_cu_count == 39 and
+        chunk_size == TC02_SINGLE_SEQ_CALIBRATED_CHUNK_SIZE and
+        raw_cu == (0, 8192) else 0
+    )
     packed_low_grid_cap = _tc02_packed_low_grid_cap(
         H, seqlens, num_chunks, chunk_size
     )
@@ -1179,6 +1205,8 @@ def calc_cp_seqs(
         # Apply this after the generic cap refinements so the measured island
         # remains a single, auditable planner mechanism.
         max_local_chunks = packed_low_grid_cap
+    if full_history_segments:
+        max_local_chunks = _cdiv(num_chunks[0], full_history_segments)
     cp_cu_seqlens = []
     ht_mask = []
     seq_map_c2r = []
@@ -1417,12 +1445,24 @@ def calc_cp_seqs(
                       if raw_batch == 1 else cp_min_tokens(H))
     use_cp = (
         occupancy_ok and has_split and max_seqlen >= min_tokens and
-        _tc02_real_gate_cp_allowed(
+        (bool(full_history_segments) or _tc02_real_gate_cp_allowed(
             raw_cu, chunk_size, H, num_cp_segments
-        )
+        ))
     )
 
+    warmup_metadata = None
     if use_cp:
+        segment_chunks = [
+            _cdiv(cp_cu_seqlens[i + 1] - cp_cu_seqlens[i], chunk_size)
+            for i in range(num_cp_segments)
+        ]
+        warmup_metadata = (
+            torch.tensor(
+                [c for c in segment_chunks for _ in range(H)],
+                dtype=torch.int32, device=device,
+            ).view(num_cp_segments, H),
+            torch.ones((num_cp_segments, H), dtype=torch.int8, device=device),
+        )
         cp_cu_seqlens = torch.tensor(cp_cu_seqlens, dtype=seqlen_dtype, device=device)
         seq_map_c2r = torch.tensor(seq_map_c2r, dtype=seqlen_dtype, device=device)
         seq_map_r2c = torch.tensor(seq_map_r2c, dtype=seqlen_dtype, device=device)
@@ -1432,7 +1472,8 @@ def calc_cp_seqs(
     else:
         cp_cu_seqlens = seq_map_r2c = seq_map_c2r = ht_mask = None
 
-    plan = (use_cp, cp_cu_seqlens, seq_map_r2c, seq_map_c2r, ht_mask)
+    plan = _CpPlan((use_cp, cp_cu_seqlens, seq_map_r2c, seq_map_c2r, ht_mask))
+    plan.warmup_metadata = warmup_metadata
     ready_event, active_streams = _plan_ready_event(plan)
     # Cache negative decisions too: repeatedly proving that a common short or
     # high-occupancy shape is serial has the same Python planning cost.  LRU
