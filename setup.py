@@ -168,6 +168,8 @@ if "pla.decode" in NAMESPACES:
         Extension(
             name='pla.decode._C',
             sources=decode_sources,
+            depends=[os.path.join(here, 'src', 'decode', 'k-last',
+                                  'generated', 'tuned_dispatch.h')],
             extra_compile_args={
                 'cxx': ['-O3'],
                 'hgcc': [

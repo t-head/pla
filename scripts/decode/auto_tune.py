@@ -107,6 +107,9 @@ def parse_all_caselists(caselist_dir):
 
 def merge_tuned_rows(output_path, fieldnames, new_rows, device_name):
     """Upsert tuned rows while preserving other kernels and state dtypes."""
+    fieldnames = list(fieldnames)
+    if "mode" not in fieldnames:
+        fieldnames.append("mode")
     existing_rows = []
     if os.path.exists(output_path):
         with open(output_path, newline="") as f:
@@ -117,11 +120,11 @@ def merge_tuned_rows(output_path, fieldnames, new_rows, device_name):
                 existing_rows.append(normalized)
 
     key_fields = (
-        "device_name", "kernel", "B", "H", "HV", "K", "V", "dtype", "state_dtype"
+        "device_name", "kernel", "B", "H", "HV", "K", "V", "dtype", "state_dtype", "mode"
     )
 
     def row_key(row):
-        return tuple(str(row[name]) for name in key_fields)
+        return tuple(str(row.get(name, "") or "") for name in key_fields)
 
     pending = {row_key(row): row for row in new_rows}
     merged_rows = []
@@ -329,7 +332,8 @@ def main():
                 "B": r["B"], "H": H, "HV": HV, "K": K, "V": V,
                 "dtype": dtype_str, "state_dtype": row_state_dtype,
                 "BV": bv, "WARP_NUM": wn, "STAGE_NUM": sn,
-                "HV_PER_CTA": hpc, "latency": f"{metric_val:.1f}", "unit": unit
+                "HV_PER_CTA": hpc, "latency": f"{metric_val:.1f}", "unit": unit,
+                "mode": "tree" if r["kernel"] == "k_last_mtp" else ""
             })
 
     # Write CSV with device name in filename

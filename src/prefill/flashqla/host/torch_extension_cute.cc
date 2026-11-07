@@ -74,7 +74,8 @@ void launch_correct_h0_no_raw_cute(
     void* cp_h0, const void* ht_buffer, const void* mt_buffer,
     const signed char* fallback_mask, const int* seq_map_r2c,
     int cp_batch_size, int raw_batch_size, int H, bool cp_h0_is_bf16,
-    int dtype_tag, int device_index, int num_cu, hggcStream_t stream);
+    int dtype_tag, int device_index, int num_cu, int compute_capability,
+    hggcStream_t stream);
 
 void launch_correct_h0_raw_cute(
     void* cp_h0, const void* raw_h0, const void* ht_buffer,
@@ -82,7 +83,8 @@ void launch_correct_h0_raw_cute(
     const int* seq_map_r2c, const int* raw_h0_indices,
     int cp_batch_size, int raw_batch_size, int H, int raw_h0_k_last,
     bool raw_h0_is_bf16, bool cp_h0_is_bf16,
-    int dtype_tag, int device_index, int num_cu, hggcStream_t stream);
+    int dtype_tag, int device_index, int num_cu, int compute_capability,
+    hggcStream_t stream);
 
 void launch_prepare_h_cp_cute(
     const void* k, const void* v, const void* a,
@@ -91,7 +93,7 @@ void launch_prepare_h_cp_cute(
     int batch_size, int num_tokens, int H, int Hg, int dtype_tag,
     int64_t v_token_stride,
     int device_index, int num_cu, int compute_capability,
-    hggcStream_t stream);
+    void* precomputed_x, hggcStream_t stream);
 
 void launch_fused_fwd_cp_cute(
     void* o, const void* q, const void* k, const void* v,
@@ -715,14 +717,15 @@ torch::Tensor correct_h0(
             fb, seq_map_r2c.data_ptr<int>(), raw_h0_indices_ptr,
             cp_batch, (int)raw_batch_size, H, raw_h0_k_last ? 1 : 0,
             raw_h0.dtype() == torch::kBFloat16, out_bf16,
-            dtype_tag(ht_buffer), device.index, device.num_cu, stream);
+            dtype_tag(ht_buffer), device.index, device.num_cu,
+            device.compute_capability, stream);
     } else {
         launch_correct_h0_no_raw_cute(
             cp_h0.data_ptr(),
             data_ptr_b16(ht_buffer), data_ptr_b16(mt_buffer),
             fb, seq_map_r2c.data_ptr<int>(),
             cp_batch, (int)raw_batch_size, H, out_bf16, dtype_tag(ht_buffer),
-            device.index, device.num_cu, stream);
+            device.index, device.num_cu, device.compute_capability, stream);
     }
     return cp_h0;
 }
@@ -814,13 +817,21 @@ std::vector<torch::Tensor> prepare_h(
 
     const auto device = logical_device_info(k);
     const hggcStream_t stream = pla::current_stream();
+    const bool precompute_x = device.compute_capability == 89 && device.num_cu == 39 &&
+        T == 8192 && ((H == 12 && Hg == 4 && batch_size == 6) ||
+                      (H == 6 && Hg == 2 && batch_size == 12));
+    torch::Tensor x_scratch;
+    if (precompute_x) {
+        x_scratch = torch::empty({(T + 31) / 32 + batch_size, (int)H, DK, 32}, opt_e);
+    }
     launch_prepare_h_cp_cute(
         data_ptr_b16(k), data_ptr_b16(v), data_ptr_b16(a),
         g.data_ptr<float>(), beta.data_ptr<float>(), data_ptr_b16(ht), data_ptr_b16(mt),
         cu_seqlens.data_ptr<int>(), num_warmup_chunks.data_ptr<int>(),
         batch_size, T, (int)H, (int)Hg, dtype_tag(k),
         v.stride(1),
-        device.index, device.num_cu, device.compute_capability, stream);
+        device.index, device.num_cu, device.compute_capability,
+        precompute_x ? data_ptr_b16(x_scratch) : nullptr, stream);
 
     return {ht, mt};
 }

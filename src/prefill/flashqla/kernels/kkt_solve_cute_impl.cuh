@@ -75,6 +75,7 @@
 #include <hggc_fp16.h>
 #include <hggc_bf16.h>
 #include <cstdint>
+#include <cstdlib>
 #include <hggc_awbarrier.h>
 #include <mutex>
 
@@ -778,7 +779,7 @@ __device__ __forceinline__ void kkt_compute_tri_quad_tc01(
 // ---- TAIL: blocked-recursive triangular inverse + store A.  Reads Mh, writes
 //      Ah, stores A_out.  This is the long serial critical path (warps 2/3 idle
 //      on CS=32) that the just-issued task_{ti+2} DMA hides under. -----------
-template <typename Element>
+template <typename Element, bool SubgroupDiag = false>
 __device__ __forceinline__ void kkt_compute_tri(
     Element* A_out, Element* Mh, Element* Ah, Element* Sbuf,
     int chunk_start, int actual, int head_idx, int num_tokens, int H,
@@ -786,16 +787,42 @@ __device__ __forceinline__ void kkt_compute_tri(
     using namespace cute;
 
     // Step4a: invert diagonal 16x16 blocks (KKT_CS=32 -> 2 blocks, warps 0,1)
-    if (lane < 16 && warp < (KKT_CS / 16)) {
-        const int base = warp * 16;
-        const int l = lane;
-        Ah[(base + l) * KKT_CS + (base + l)] = fq::float_to_element<Element>(1.0f);
-        for (int r = l + 1; r < 16; ++r) {
+    if constexpr (SubgroupDiag) {
+        const int base = (warp >> 1) * 16;
+        const int col = (warp & 1) * 8 + (lane >> 2);
+        const int sublane = lane & 3;
+        if (sublane == 0)
+            Ah[(base + col) * KKT_CS + base + col] =
+                fq::float_to_element<Element>(1.0f);
+        __syncwarp();
+        for (int row = 0; row < 16; ++row) {
             float sum = 0.0f;
-            for (int k = l; k < r; ++k)
-                sum += fq::element_to_float<Element>(Mh[(base + r) * KKT_CS + (base + k)]) *
-                       fq::element_to_float<Element>(Ah[(base + k) * KKT_CS + (base + l)]);
-            Ah[(base + r) * KKT_CS + (base + l)] = fq::float_to_element<Element>(-sum);
+            if (col < row) {
+                for (int k = col + sublane; k < row; k += 4)
+                    sum += fq::element_to_float<Element>(
+                        Mh[(base + row) * KKT_CS + base + k]) *
+                        fq::element_to_float<Element>(
+                            Ah[(base + k) * KKT_CS + base + col]);
+            }
+            sum += __shfl_down_sync(0xffffffff, sum, 2, 4);
+            sum += __shfl_down_sync(0xffffffff, sum, 1, 4);
+            if (sublane == 0 && col < row)
+                Ah[(base + row) * KKT_CS + base + col] =
+                    fq::float_to_element<Element>(-sum);
+            __syncwarp();
+        }
+    } else {
+        if (lane < 16 && warp < (KKT_CS / 16)) {
+            const int base = warp * 16;
+            const int l = lane;
+            Ah[(base + l) * KKT_CS + (base + l)] = fq::float_to_element<Element>(1.0f);
+            for (int r = l + 1; r < 16; ++r) {
+                float sum = 0.0f;
+                for (int k = l; k < r; ++k)
+                    sum += fq::element_to_float<Element>(Mh[(base + r) * KKT_CS + (base + k)]) *
+                           fq::element_to_float<Element>(Ah[(base + k) * KKT_CS + (base + l)]);
+                Ah[(base + r) * KKT_CS + (base + l)] = fq::float_to_element<Element>(-sum);
+            }
         }
     }
     __syncthreads();
@@ -1020,7 +1047,7 @@ __device__ __forceinline__ void kkt_issue_pair_task(
 // ========================================================================
 // Kernel: persistent grid-stride + AIU async double-buffer pipeline
 // ========================================================================
-template <typename Element, bool PerValueHead = false>
+template <typename Element, bool PerValueHead = false, bool SubgroupDiag = false>
 __global__ void __launch_bounds__(KKT_NThreads, 6)
 FLASHQLA_KKT_KERNEL(
     Element* __restrict__ A_out,
@@ -1159,7 +1186,7 @@ FLASHQLA_KKT_KERNEL(
                 }
             }
 #else
-            kkt_compute_tri<Element>(A_out, Mh, Ah, Sbuf, chunk_start, actual,
+            kkt_compute_tri<Element, SubgroupDiag>(A_out, Mh, Ah, Sbuf, chunk_start, actual,
                             head_idx, num_tokens, H, tx, warp, lane);
 #endif
         } else if (have_p2) {
@@ -1413,6 +1440,109 @@ kkt_solve_pair_cute_kernel(
     int, int, int, int) {}
 #endif
 
+// One CTA per (chunk, key head): all four warps build the shared fp32 Gram
+// tile once, then each warp solves one value head mapped to that key head.
+// Lane j owns column j of A = (I + tril(diag(beta) G, -1))^{-1} in registers,
+// so the forward substitution needs only broadcast Gram reads and one beta
+// shuffle per row, with no block or warp barriers inside the recurrence.
+constexpr int KKT_GROUP_OFF_K = 0;
+constexpr int KKT_GROUP_OFF_GRAM = KKT_GROUP_OFF_K + KKT_CS * KKT_DK * 2;
+constexpr int KKT_GROUP_SMEM_BYTES = KKT_GROUP_OFF_GRAM + KKT_CS * KKT_CS * 4;
+
+#if defined(FLASHQLA_ARCH_150)
+template <typename Element>
+__global__ void __launch_bounds__(KKT_NThreads, 12)
+kkt_solve_group_cute_kernel(
+    Element* __restrict__ A_out,
+    const Element* __restrict__ K,
+    const float* __restrict__ beta,
+    const int* __restrict__ cu_seqlens,
+    const int* __restrict__ chunk_indices,
+    int H, int Hg, int num_chunks, int num_tokens) {
+    const int tx = threadIdx.x;
+    const int warp = tx >> 5;
+    const int lane = tx & 31;
+    const int task = blockIdx.x;
+    if (task >= num_chunks * Hg) return;
+
+    const int global_chunk = task / Hg;
+    const int key_head = task % Hg;
+    const int seq_idx = chunk_indices ? chunk_indices[global_chunk * 2] : 0;
+    const int local_chunk = chunk_indices
+        ? chunk_indices[global_chunk * 2 + 1] : global_chunk;
+    const int seq_start = cu_seqlens[seq_idx];
+    const int seq_end = cu_seqlens[seq_idx + 1];
+    const int chunk_start = seq_start + local_chunk * KKT_CS;
+    const int actual = chunk_start < seq_end
+        ? kkt_min(KKT_CS, seq_end - chunk_start) : 0;
+    if (actual <= 0) return;
+
+    extern __shared__ char smem[];
+    Element* K_buf = reinterpret_cast<Element*>(smem + KKT_GROUP_OFF_K);
+    float* Gram = reinterpret_cast<float*>(smem + KKT_GROUP_OFF_GRAM);
+
+    if (lane == 0 && warp < (KKT_DK / 32)) {
+        const Element* src = K +
+            (int64_t)chunk_start * Hg * KKT_DK + key_head * KKT_DK;
+        kkt_aiu_swzl_write_k_cube<Element>(
+            K_buf, src, Hg * KKT_DK, actual, warp);
+    }
+    kkt_aiu_commit();
+
+    const int heads_per_k = H / Hg;
+    const bool solver = warp < heads_per_k;
+    const int head = key_head * heads_per_k + warp;
+    const float beta_r = (solver && lane < actual)
+        ? beta[(int64_t)(chunk_start + lane) * H + head] : 0.0f;
+
+    kkt_aiu_wait_group<0>();
+    __syncthreads();
+    {
+        auto tC = fq::make_acc<KKT_CS, KKT_CS, fq::TiledMmaM32T<Element>, Element>(tx);
+        fq::flashqla_gemm_ss_swzlAB_m32<KKT_CS, KKT_CS, KKT_DK, decltype(tC), Element>(
+            K_buf, K_buf, tx, tC);
+        fq::store_acc_to_smem_fp32<fq::TiledMmaM32T<Element>>(
+            tC, Gram, KKT_CS, KKT_CS, KKT_CS, tx);
+    }
+    __syncthreads();
+    if (!solver) return;
+
+    // Rows past `actual` see zero Gram rows (AIU padz) and zero beta, so they
+    // reduce to identity rows and are never stored.
+    float a[KKT_CS];
+    CUTE_UNROLL
+    for (int r = 0; r < KKT_CS; ++r) {
+        const float* g_row = Gram + r * KKT_CS;
+        float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+        CUTE_UNROLL
+        for (int k = 0; k < r; k += 4) {
+            const float4 g = *reinterpret_cast<const float4*>(g_row + k);
+            s0 = fmaf(g.x, a[k], s0);
+            if (k + 1 < r) s1 = fmaf(g.y, a[k + 1], s1);
+            if (k + 2 < r) s2 = fmaf(g.z, a[k + 2], s2);
+            if (k + 3 < r) s3 = fmaf(g.w, a[k + 3], s3);
+        }
+        const float br = __shfl_sync(0xffffffff, beta_r, r);
+        a[r] = (r == lane ? 1.0f : 0.0f) - br * ((s0 + s1) + (s2 + s3));
+    }
+
+    Element* dst = A_out + (int64_t)chunk_start * H * KKT_CS + head * KKT_CS + lane;
+    CUTE_UNROLL
+    for (int r = 0; r < KKT_CS; ++r) {
+        if (r < actual && chunk_start + r < num_tokens)
+            dst[(int64_t)r * H * KKT_CS] = fq::float_to_element<Element>(a[r]);
+    }
+}
+#else
+template <typename Element>
+__global__ void __launch_bounds__(KKT_NThreads, 12)
+kkt_solve_group_cute_kernel(
+    Element* __restrict__, const Element* __restrict__,
+    const float* __restrict__, const int* __restrict__,
+    const int* __restrict__,
+    int, int, int, int) {}
+#endif
+
 }  // namespace FLASHQLA_KKT_NAMESPACE
 
 // ============================================================
@@ -1436,7 +1566,7 @@ void kkt_configure_dynamic_smem_once(
     std::call_once(configured[device_index], invoke);
 }
 
-template <typename Element, bool PerValueHead>
+template <typename Element, bool PerValueHead, bool SubgroupDiag = false>
 void kkt_configure_main_dynamic_smem(int device_index, int smem_bytes) {
     // One cache per Element x dispatch specialization x logical device.
     static std::once_flag configured[KKT_MAX_CACHED_DEVICES];
@@ -1444,7 +1574,7 @@ void kkt_configure_main_dynamic_smem(int device_index, int smem_bytes) {
         configured, device_index, [smem_bytes]() {
             return hggcFuncSetAttribute(
                 FLASHQLA_KKT_NAMESPACE::FLASHQLA_KKT_KERNEL<
-                    Element, PerValueHead>,
+                    Element, PerValueHead, SubgroupDiag>,
                 hggcFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
         });
 }
@@ -1482,6 +1612,17 @@ void kkt_configure_pair_dynamic_smem(int device_index, int smem_bytes) {
                 hggcFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
         });
 }
+
+template <typename Element>
+void kkt_configure_group_dynamic_smem(int device_index, int smem_bytes) {
+    static std::once_flag configured[KKT_MAX_CACHED_DEVICES];
+    kkt_configure_dynamic_smem_once(
+        configured, device_index, [smem_bytes]() {
+            return hggcFuncSetAttribute(
+                FLASHQLA_KKT_NAMESPACE::kkt_solve_group_cute_kernel<Element>,
+                hggcFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+        });
+}
 #endif
 
 }  // namespace
@@ -1505,6 +1646,8 @@ void FLASHQLA_KKT_LAUNCHER(
 #if !FLASHQLA_KKT_HOST_ARCH_100
     constexpr int pair_smem_bytes =
         FLASHQLA_KKT_NAMESPACE::KKT_PAIR_SMEM_BYTES;
+    constexpr int group_smem_bytes =
+        FLASHQLA_KKT_NAMESPACE::KKT_GROUP_SMEM_BYTES;
 #else
     constexpr int quad_smem_bytes =
         FLASHQLA_KKT_NAMESPACE::KKT_QUAD_SMEM_BYTES;
@@ -1591,6 +1734,9 @@ void FLASHQLA_KKT_LAUNCHER(
     int grid_x = total_tasks;
 #else
     int grid_x = total_tasks < persist ? total_tasks : persist;
+    const bool use_group = nsm == 39 && num_tokens == 8192 &&
+        ((H == 12 && Hg == 4) || (H == 6 && Hg == 2));
+    dim3 group_grid(num_chunks * Hg > 0 ? num_chunks * Hg : 1);
     // Adjacent value heads share one K head exactly when the value-to-key head
     // ratio is even.  Keep odd ratios on the one-head kernel so a pair never
     // crosses a K-head boundary.
@@ -1649,7 +1795,15 @@ void FLASHQLA_KKT_LAUNCHER(
 #else
 #define KKT_LAUNCH(ElementType, TAG) \
     do { \
-      if (use_pair) { \
+      if (use_group) { \
+        kkt_configure_group_dynamic_smem<ElementType>( \
+            device_index, group_smem_bytes); \
+        FLASHQLA_KKT_NAMESPACE::kkt_solve_group_cute_kernel<ElementType> \
+            <<<group_grid, block, group_smem_bytes, stream>>>( \
+                reinterpret_cast<ElementType*>(A), \
+                reinterpret_cast<const ElementType*>(K), beta, cu_seqlens, \
+                chunk_indices, H, Hg, num_chunks, num_tokens); \
+      } else if (use_pair) { \
         kkt_configure_pair_dynamic_smem<ElementType>( \
             device_index, pair_smem_bytes); \
         FLASHQLA_KKT_NAMESPACE::kkt_solve_pair_cute_kernel<ElementType> \

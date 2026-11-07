@@ -133,6 +133,89 @@ def test_qwen38_real_gate_raw_indexed_state_prefill():
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("indexed", [True, False])
+@pytest.mark.parametrize("output_final_state", [False, True])
+@pytest.mark.parametrize("fresh_prefix", [False, True])
+@pytest.mark.parametrize("auto_cp", [False, True])
+@pytest.mark.parametrize("heads", [6, 12])
+def test_gva_history(
+    dtype, state_dtype, indexed, output_final_state, fresh_prefix, auto_cp, heads,
+    monkeypatch,
+):
+    from pla.prefill.flashqla import ops
+
+    total, qk_heads = 8192, heads // 3
+    q = torch.ones(1, total, qk_heads, D, device="cuda", dtype=dtype)
+    k = torch.zeros_like(q)
+    v = torch.zeros(1, total, heads, D, device="cuda", dtype=dtype)
+    gate = torch.full((1, total, heads), -1e-7, device="cuda")
+    gate[0, 64] = torch.tensor(
+        [-6.0, -12.0, -0.25, -0.8], device="cuda").repeat(3)[:heads]
+    beta = torch.zeros_like(gate)
+    cu = torch.tensor([0, total], dtype=torch.int32, device="cuda")
+    indices = torch.tensor([3], dtype=torch.int32, device="cuda")
+    base_pool = torch.ones(5, heads, D, D, device="cuda", dtype=state_dtype)
+    base_pool *= torch.linspace(0.5, 1.5, D, device="cuda")[None, None, :, None]
+    base_pool *= torch.linspace(0.75, 1.25, D, device="cuda")[None, None, None, :]
+    if fresh_prefix:
+        q.zero_()
+        q[..., 0] = 1
+        k[0, 0, :, 0] = 1
+        v[0, 0] = 16 * torch.linspace(0.5, 1.5, D, device="cuda")
+        beta[0, 0] = 1
+        base_pool[3].zero_()
+        decay = gate[0, 1:].double().cumsum(0).exp().float()
+        expected_state = torch.zeros(heads, D, D, device="cuda")
+        expected_state[:, :, 0] = (
+            decay[-1, :, None] * v[0, 0].float() / (1 + 1e-6) ** 0.5)
+        decay = torch.cat((torch.ones(1, heads, device="cuda"), decay), dim=0)
+        expected_output = (
+            decay[None, :, :, None] * v[:, :1].float()
+            / (D * (1 + 1e-6)) ** 0.5)
+    else:
+        decay = gate[0].double().cumsum(0).exp().float()
+        expected_state = base_pool[3].float() * decay[-1, :, None, None]
+        expected_output = (
+            decay[None, :, :, None] * base_pool[3].float().mean(-1)[None, None])
+    state = (base_pool.clone() if indexed else
+             base_pool[3:4].transpose(-1, -2).contiguous())
+    with patch.object(ops, "calc_cp_seqs", wraps=ops.calc_cp_seqs) as planner:
+        result = chunk_gated_delta_rule_fwd(
+            q, k, v, gate, beta, initial_state=state,
+            initial_state_indices=indices if indexed else None,
+            cu_seqlens=cu, raw_cu_seqlens=(0, total), normalize_qk=True,
+            output_final_state=output_final_state, auto_cp=auto_cp,
+        )
+        if auto_cp:
+            assert planner.call_count == 1
+            props = torch.cuda.get_device_properties(q.device)
+            if (props.major, props.minor, props.multi_processor_count) == (8, 9, 39):
+                plan = calc_cp_seqs(cu, 32, heads, (0, total), num_k_heads=qk_heads)
+                assert plan[0] and plan[1].numel() == (13 if heads == 6 else 7)
+        else:
+            planner.assert_not_called()
+    torch.testing.assert_close(result[2].float(), expected_output, rtol=0.05, atol=0.0)
+    if indexed:
+        actual_state = state[3].float()
+        untouched = torch.tensor([0, 1, 2, 4], device="cuda")
+        assert torch.equal(state[untouched], base_pool[untouched])
+    elif output_final_state:
+        actual_state = result[4][0].float().transpose(-1, -2)
+    if indexed or output_final_state:
+        relative = ((actual_state - expected_state).flatten(1).norm(dim=1)
+                    / expected_state.flatten(1).norm(dim=1))
+        assert float(relative.max()) < 0.05
+    if output_final_state:
+        assert result[4].dtype == state_dtype
+        if indexed:
+            assert torch.equal(result[4], state[indices])
+    else:
+        assert result[4] is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a PPU device")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("indexed", [True, False])
 @pytest.mark.parametrize("threshold", [-4.0, None])
 @pytest.mark.parametrize("output_final_state", [False, True])
 def test_cp_finite_initial_state_carry(

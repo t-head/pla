@@ -675,6 +675,59 @@ class Tc02RealGatePlannerTest(unittest.TestCase):
     def _tc02_device_model(_raw_cu_seqlens):
         return cp._planner_execution_model_from_properties(8, 9, 39)
 
+    def test_tc02_h12_target_restores_full_history_cp6(self):
+        with mock.patch.object(
+            cp, "_device_execution_model", side_effect=self._tc02_device_model
+        ):
+            plan = cp.calc_cp_seqs(self._cu(8192), 32, 12, num_k_heads=4)
+            cached = cp.calc_cp_seqs(self._cu(8192), 32, 12, num_k_heads=4)
+        self.assertTrue(plan[0])
+        self.assertIs(plan, cached)
+        self.assertEqual(plan[1].tolist(), [0, 1376, 2752, 4128, 5504, 6848, 8192])
+        self.assertEqual(plan[2].tolist(), [0, 6])
+        self.assertEqual(plan[3].tolist(), [0] * 6)
+        self.assertEqual(plan[4].tolist(), [0] * 5 + [1])
+
+    def test_tc02_h6_target_full_history_cp12(self):
+        with mock.patch.object(
+            cp, "_device_execution_model", side_effect=self._tc02_device_model
+        ):
+            plan = cp.calc_cp_seqs(self._cu(8192), 32, 6, num_k_heads=2)
+            cached = cp.calc_cp_seqs(self._cu(8192), 32, 6, num_k_heads=2)
+        self.assertTrue(plan[0])
+        self.assertIs(plan, cached)
+        self.assertEqual(plan[1].numel(), 13)
+        self.assertEqual(plan[2].tolist(), [0, 12])
+        self.assertEqual(plan[3].tolist(), [0] * 12)
+        self.assertEqual(plan[4].tolist(), [0] * 11 + [1])
+        chunks = (plan[1][1:] - plan[1][:-1]) // 32
+        self.assertEqual(chunks.sum().item(), 256)
+        self.assertLessEqual(chunks.max().item() - chunks.min().item(), 1)
+        warmup, fallback = plan.warmup_metadata
+        self.assertEqual(warmup.tolist(), [[n] * 6 for n in chunks.tolist()])
+        self.assertEqual(fallback.tolist(), [[1] * 6] * 12)
+
+    def test_tc02_h12_target_does_not_expand_neighbors(self):
+        cases = (
+            ((8191,), 32, 4, (8, 9, 39)),
+            ((8193,), 32, 4, (8, 9, 39)),
+            ((8192, 1), 32, 4, (8, 9, 39)),
+            ((8192,), 32, 2, (8, 9, 39)),
+            ((8192,), 32, None, (8, 9, 39)),
+            ((8192,), 64, 4, (8, 9, 39)),
+            ((8192,), 32, 4, (8, 9, 38)),
+            ((8192,), 32, 4, (8, 0, 64)),
+        )
+        for lengths, chunk_size, key_heads, properties in cases:
+            with self.subTest(lengths=lengths, chunk_size=chunk_size,
+                              key_heads=key_heads, properties=properties):
+                model = cp._planner_execution_model_from_properties(*properties)
+                with mock.patch.object(cp, "_device_execution_model", return_value=model):
+                    plan = cp.calc_cp_seqs(
+                        self._cu(*lengths), chunk_size, 12, num_k_heads=key_heads)
+                self.assertFalse(plan[0])
+                self.assertEqual(plan[1:], (None, None, None, None))
+
     def test_tc02_real_gate_aligned_suffix_boundaries(self):
         for heads, batches in cp._TC02_REAL_GATE_CP_MIN_TOKENS.items():
             for batch, threshold in batches.items():
