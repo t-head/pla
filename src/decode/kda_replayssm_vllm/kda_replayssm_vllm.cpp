@@ -153,9 +153,10 @@ Tensor verify(Tensor x, Tensor g, Tensor beta, Tensor weight, Tensor conv, Tenso
   const c10::cuda::CUDAGuard guard(state.device());
   records(rv, rk, gate, rb, windows, state, H, Q, R);
   for (auto& t : {x, g, beta, weight, a, dt, out, cu, source}) tensor(t, state);
-  TORCH_CHECK(x.dim() == 2 && x.size(1) == 3 * H * D && x.stride(1) == 1 &&
+  TORCH_CHECK(x.dim() == 2 && x.size(0) <= INT32_MAX &&
+              x.size(1) == 3 * H * D && x.stride(1) == 1 &&
               x.stride(0) >= 3 * H * D && x.scalar_type() == torch::kBFloat16,
-              "mixed_qkv must be bf16 [T,3*H*128] with contiguous channels");
+              "mixed_qkv must be bf16 [T,3*H*128] with contiguous channels and T <= INT32_MAX");
   const int T = x.size(0);
   auto projection = [&](const Tensor& t, int channels) {
     TORCH_CHECK(t.sizes() == torch::IntArrayRef({T, channels}) && t.stride(1) == 1 &&
@@ -231,7 +232,8 @@ Tensor verify(Tensor x, Tensor g, Tensor beta, Tensor weight, Tensor conv, Tenso
 
 void commit(Tensor table, Tensor candidate, Tensor plan, Tensor sampled, Tensor source,
             Tensor cu, Optional mapping, Optional blocks, Optional computed,
-            int64_t block_size, int H, int slots, int Q, int null) {
+            int64_t block_size, int H, int slots, int Q, int null,
+            int64_t token_capacity) {
   if (pla::instrument::show_params()) {
       pla::instrument::dump_case(source.numel(), Q, D, D, H, H, "bf16", true, &cu);
       pla::instrument::dump_metadata("kda_replay_commit", {{"layers", &table},
@@ -243,6 +245,8 @@ void commit(Tensor table, Tensor candidate, Tensor plan, Tensor sampled, Tensor 
   std::optional<hgtx3::scoped_range> range;
   if (perf_instrument()) range.emplace("kda_replay_commit instrument=HGTX");
   null_id(null);
+  TORCH_CHECK(token_capacity >= 0 && token_capacity <= INT32_MAX,
+              "token_capacity must be between 0 and INT32_MAX");
   TORCH_CHECK(table.is_cuda() && table.dim() == 2 && table.size(0) > 0 &&
               table.size(1) == pla::kda_mtp::kReplayColumns && table.is_contiguous() &&
               table.scalar_type() == torch::kInt64, "invalid layer pointer table");
@@ -272,6 +276,7 @@ void commit(Tensor table, Tensor candidate, Tensor plan, Tensor sampled, Tensor 
       blocks ? IndexArg{blocks->data_ptr(), blocks->scalar_type() == torch::kInt64, 1} : IndexArg{nullptr, false, 1},
       N, R, static_cast<int>(sampled.numel()), blocks ? static_cast<int>(blocks->size(0)) : 0,
       blocks ? static_cast<int>(blocks->size(1)) : 0, slots, Q, null,
+      static_cast<int>(token_capacity),
       blocks ? blocks->stride(0) : 0, blocks ? blocks->stride(1) : 0, block_size};
   const pla::sanity::Context sanity("kda_replay_commit", table);
   if (sanity.values_enabled()) {
@@ -286,6 +291,7 @@ void commit(Tensor table, Tensor candidate, Tensor plan, Tensor sampled, Tensor 
     sanity.check(offsets.front() == 0, "query offsets must begin at zero");
     for (int b = 0; b < N; ++b) {
       sanity.check(offsets[b] >= 0 && offsets[b + 1] >= offsets[b] &&
+                   offsets[b + 1] <= token_capacity &&
                    offsets[b + 1] - offsets[b] <= Q, "invalid query length");
       const auto row = mapping ? map[b] : b;
       sanity.check(row >= 0 && row < sampled.numel(), "request mapping out of bounds");

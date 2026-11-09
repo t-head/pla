@@ -125,14 +125,18 @@ class KDAReplayCommitContext:
 
     def commit(self, num_sampled, state_indices, query_start_loc,
                request_indices=None, block_table=None, num_computed_tokens=None,
-               mamba_block_size=None):
+               mamba_block_size=None, *, token_capacity):
         """Commit clamped sampled-token counts, without subtracting a bonus token.
 
+        Pass the verify projection's ``mixed_qkv.shape[0]`` as token_capacity.
+        The plan skips query intervals that exceed this capacity.
         Align mode requires all three align arguments and block_size >= Q.
         Different active requests may not overlap source/destination slots.
         Invalid device metadata is diagnosed by PLA_SANITY_CHECK in eager mode;
         the graph path safely masks invalid plans without a tensor-value read.
         """
+        if not isinstance(token_capacity, Integral):
+            raise TypeError("token_capacity must be a host integer")
         align = (block_table is not None, num_computed_tokens is not None,
                  mamba_block_size is not None)
         if any(align) and not all(align):
@@ -144,5 +148,5 @@ class KDAReplayCommitContext:
         _C.commit(self._table, self._candidate, self._buffer, num_sampled,
                   state_indices, query_start_loc, request_indices, block_table,
                   num_computed_tokens, 0 if not all(align) else mamba_block_size,
-                  self._heads, self._slots, self._q, self._null)
+                  self._heads, self._slots, self._q, self._null, token_capacity)
         return self.plan

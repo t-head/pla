@@ -12,6 +12,9 @@ __device__ int64_t value(IndexArg a, int64_t i) {
 __device__ bool valid_slot(int64_t slot, const PlanInputs& p) {
   return slot > p.null_id && slot >= 0 && slot < p.slots;
 }
+__device__ bool valid_interval(int64_t begin, int64_t end, const PlanInputs& p) {
+  return begin >= 0 && end > begin && end <= p.token_capacity && end - begin <= p.Q;
+}
 __global__ void build_plan(PlanInputs p, int* candidate) {
   const int b = blockIdx.x * blockDim.x + threadIdx.x;
   if (b >= p.capacity) return;
@@ -21,7 +24,7 @@ __global__ void build_plan(PlanInputs p, int* candidate) {
     const int64_t source = value(p.source, b);
     const int64_t begin = value(p.offsets, b), end = value(p.offsets, b + 1);
     if (value(p.offsets, 0) == 0 && row >= 0 && row < p.sampler_rows && valid_slot(source, p) &&
-        begin >= 0 && end >= begin && end - begin <= p.Q) {
+        valid_interval(begin, end, p)) {
       const int64_t sampled = value(p.sampled, row);
       count = sampled <= 0 ? 0 : sampled > end - begin ? end - begin : sampled;
       final = source;
@@ -85,7 +88,7 @@ __global__ void protect_plan(PlanInputs p, const int* candidate, int* plan) {
       const int64_t os = value(p.source, other);
       const int64_t begin = value(p.offsets, other), end = value(p.offsets, other + 1);
       // A real query with c=0 still owns its source checkpoint.
-      if (valid_slot(os, p) && begin >= 0 && end > begin && end - begin <= p.Q)
+      if (valid_slot(os, p) && valid_interval(begin, end, p))
         conflict |= f == os || (has_d && d == os);
       if (!candidate[other]) continue;
       const int of = candidate[p.capacity + other];

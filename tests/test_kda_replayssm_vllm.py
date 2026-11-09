@@ -392,7 +392,8 @@ def case_precision_commit(device):
         for count in (0, 1, 2, 4):
             layer.kv_cache[1].fill_(1.)
             layer.kv_cache[0].zero_()
-            ctx.commit(vector([count] * 128, device), slots, offsets)
+            ctx.commit(vector([count] * 128, device), slots, offsets,
+                       token_capacity=x["mixed_qkv"].size(0))
             # Fold oracle uses the supplied BF16/FP32 records, not the
             # unquantized verify intermediates. No tolerance relaxation.
             close_scalar(layer.kv_cache[1], factor ** count, 5e-6)
@@ -412,7 +413,7 @@ def case_precision_graph(device):
 
     def run():
         invoke(layer, x, offsets, slots, out, null_block_id=-1)
-        ctx.commit(counts, slots, offsets)
+        ctx.commit(counts, slots, offsets, token_capacity=x["mixed_qkv"].size(0))
 
     run()  # Initialize lazy runtime state before capture.
     graph = torch.cuda.CUDAGraph()
@@ -542,7 +543,8 @@ def case_commit(device, layout, align=False, rounds=4, live=False):
                                        table if align else None,
                                        computed if align else None, 8 if align else None))
         before = [layer.raw.clone() for layer in layers]
-        kwargs = dict(request_indices=vector(mapping, device, torch.int64, True))
+        kwargs = dict(request_indices=vector(mapping, device, torch.int64, True),
+                      token_capacity=x["mixed_qkv"].size(0))
         if align:
             kwargs.update(block_table=torch.tensor(table, device=device, dtype=torch.int32),
                           num_computed_tokens=vector(computed, device), mamba_block_size=8)
@@ -586,7 +588,7 @@ def case_empty(device):
     invoke(layer, x, vector([0, 0, 0], device), vector([0, -1], device), out)
     ctx = context([layer], 2)
     plan = ctx.commit(vector([0, 9], device), vector([0, -1], device),
-                      vector([0, 0, 0], device))
+                      vector([0, 0, 0], device), token_capacity=x["mixed_qkv"].size(0))
     check_plan(plan, [[0, 0]] * 4, device)
     assert torch.equal(layer.raw, before)
 
@@ -611,7 +613,7 @@ def case_graph(device, phase, q=5, heads=1, rows=2, align=True):
         if phase != "commit":
             invoke(layer, x, cu, si, out)
         if phase != "verify":
-            kwargs = dict(request_indices=mapping)
+            kwargs = dict(request_indices=mapping, token_capacity=x["mixed_qkv"].size(0))
             if align:
                 kwargs.update(block_table=table, num_computed_tokens=computed,
                               mamba_block_size=8)
@@ -753,7 +755,7 @@ def case_tp(device, tp, distributed_rank=None):
                         (channel * heads + start + lh) * D] for channel in range(3)], 2))
         # Same acceptance decisions for every head shard.
         context([local], 2).commit(acceptance, vector(slots, device),
-                                    vector(offsets, device))
+                                    vector(offsets, device), token_capacity=lx["mixed_qkv"].size(0))
         states.append(local.kv_cache[1])
         convs.append(ds(local))
     if distributed_rank is not None:
@@ -804,7 +806,8 @@ def case_prefix_continuation(device, layout):
                                           block_table=[[1, 3]], computed=[6], block_size=8)
     plan = ctx.commit(vector([3], device), vector([2], device), vector([0, 5], device),
                       block_table=torch.tensor([[1, 3]], device=device, dtype=torch.int64),
-                      num_computed_tokens=vector([6], device), mamba_block_size=8)
+                      num_computed_tokens=vector([6], device), mamba_block_size=8,
+                      token_capacity=x["mixed_qkv"].size(0))
     check_plan(plan, expected, device)
     close(layer.kv_cache[1][1], state[1], 5e-6)
     close(layer.kv_cache[1][3], state[3], 5e-6)
@@ -829,7 +832,8 @@ def case_prefix_continuation(device, layout):
         outputs.append(out[length - 2:length].clone())
         for name in ("rawv", "rawk", "g", "beta", "conv"):
             getattr(layer.replay_records, name).copy_(getattr(golden, name))
-        ctx.commit(vector([length], device), vector([destination], device), vector([0, length], device))
+        ctx.commit(vector([length], device), vector([destination], device),
+                   vector([0, length], device), token_capacity=tail["mixed_qkv"].size(0))
         states.append(layer.kv_cache[1][destination].clone())
     close(outputs[0], outputs[1])
     close(states[0], states[1], 5e-6)
@@ -861,7 +865,8 @@ def case_mixed_prefill(device):
     targets = [oracle_commit(l, l.replay_records, [0, 5, 7], [6, 2],
                              [999, 1, 888, 5], [3, 1]) for l in layers]
     ctx.commit(vector([999, 1, 888, 5], device), vector([6, 2], device),
-               vector([0, 5, 7], device), request_indices=vector([3, 1], device))
+               vector([0, 5, 7], device), request_indices=vector([3, 1], device),
+               token_capacity=x["mixed_qkv"].size(0))
     for layer, (state, conv, _) in zip(layers, targets):
         close(layer.kv_cache[1], state, 5e-6)
         assert torch.equal(ds(layer), conv)
@@ -883,11 +888,12 @@ def case_all_invalid(device):
         assert torch.equal(getattr(layer.replay_records, name), getattr(rings, name))
     ctx = context([layer], 3)
     plan = ctx.commit(vector([5, 5, 5], device), vector([0, -1, 4], device),
-                      vector([0, 5, 8, 8], device))
+                      vector([0, 5, 8, 8], device), token_capacity=x["mixed_qkv"].size(0))
     check_plan(plan, [[0, 0, 0]] * 4, device)
     assert torch.equal(layer.raw, before)
     invoke(layer, x, vector([0], device), vector([], device), out)
-    check_plan(ctx.commit(vector([], device), vector([], device), vector([0], device)),
+    check_plan(ctx.commit(vector([], device), vector([], device), vector([0], device),
+                          token_capacity=x["mixed_qkv"].size(0)),
                [[0, 0, 0]] * 4, device)
     assert torch.equal(layer.raw, before)
 
@@ -917,7 +923,7 @@ def case_align_shapes(device, q, layout):
         bt.copy_(torch.tensor([table], device=device))
         plan = ctx.commit(vector([count], device), vector([2], device), vector([0, q], device),
                           block_table=bt, num_computed_tokens=vector([position], device),
-                          mamba_block_size=size)
+                          mamba_block_size=size, token_capacity=x["mixed_qkv"].size(0))
         check_plan(plan, expected, device)
         close(layer.kv_cache[1], state, 5e-6)
         assert torch.equal(ds(layer), conv)
@@ -933,7 +939,8 @@ def case_conflicts(device):
     invoke(layer, x, cu, slots, out)
     before = layer.raw.clone()
     kwargs = dict(block_table=torch.tensor([[2, 3], [3, 4]], device=device),
-                  num_computed_tokens=vector([8, 7], device), mamba_block_size=8)
+                  num_computed_tokens=vector([8, 7], device), mamba_block_size=8,
+                  token_capacity=x["mixed_qkv"].size(0))
     for accepted in ([1, 1], [1, 0]):
         counts.copy_(vector(accepted, device))
         if os.environ.get("PLA_SANITY_CHECK") == "1":
@@ -978,7 +985,8 @@ def case_conv_packed(device, layout, history):
     si, cu = vector(sources, device), vector(offsets, device)
     accepted = vector([0, 1, 2, 4], device)
     kwargs = dict(block_table=torch.tensor(table, device=device, dtype=torch.int64),
-                  num_computed_tokens=vector(computed, device), mamba_block_size=8)
+                  num_computed_tokens=vector(computed, device), mamba_block_size=8,
+                  token_capacity=offsets[-1])
     initial = [layer.raw.clone() for layer in layers]
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -1077,18 +1085,19 @@ def case_parallel_conflicts(device, batch, align=True):
         if os.environ.get("PLA_SANITY_CHECK") == "1" and (
                 blocked or variant in ("wide_source", "wide_length")):
             try:
-                ctx.commit(accepted, si, cu, **kwargs)
+                ctx.commit(accepted, si, cu, token_capacity=batch * q, **kwargs)
             except RuntimeError:
                 pass
             else:
                 raise AssertionError("sanity accepted invalid metadata: " + variant)
         else:
-            check_plan(ctx.commit(accepted, si, cu, **kwargs), expected, device)
+            check_plan(ctx.commit(accepted, si, cu, token_capacity=batch * q, **kwargs),
+                       expected, device)
         layer.raw.copy_(before)
         if graph is None:
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                ctx.commit(accepted, si, cu, **kwargs)
+                ctx.commit(accepted, si, cu, token_capacity=batch * q, **kwargs)
         graph.replay()
         torch.cuda.synchronize()
         check_plan(ctx.plan, expected, device)
@@ -1108,16 +1117,19 @@ def case_invalid(device):
     args = (vector([1], device), vector([2], device), vector([0, 1], device))
     for kwargs in (dict(block_table=torch.ones(1, 2, device=device, dtype=torch.int32)),
                    dict(block_table=torch.ones(1, 2, device=device, dtype=torch.int32),
-                        num_computed_tokens=vector([1], device), mamba_block_size=1)):
+                        num_computed_tokens=vector([1], device), mamba_block_size=1),
+                   dict(token_capacity=-1), dict(token_capacity=2**31),
+                   dict(token_capacity=vector([1], device))):
         try:
-            ctx.commit(*args, **kwargs)
-        except (ValueError, RuntimeError):
+            ctx.commit(*args, **({"token_capacity": 1} | kwargs))
+        except (TypeError, ValueError, RuntimeError):
             pass
         else:
-            raise AssertionError("invalid align contract accepted")
+            raise AssertionError("invalid commit arguments accepted")
     try:
         ctx.commit(*args, block_table=torch.ones(1, 2, device=device, dtype=torch.int32),
-                   num_computed_tokens=vector([1], device), mamba_block_size=vector([8], device))
+                   num_computed_tokens=vector([1], device), mamba_block_size=vector([8], device),
+                   token_capacity=1)
     except TypeError:
         pass
     else:
@@ -1169,7 +1181,8 @@ def case_null_minus_one(device):
         got.copy_(target)
     state, conv, expected = oracle_commit(layer, golden, offsets, slots, [1, 2], null_block_id=-1)
     plan = context([layer], 2, -1).commit(vector([1, 2], device), vector(slots, device),
-                                         vector(offsets, device))
+                                         vector(offsets, device),
+                                         token_capacity=x["mixed_qkv"].size(0))
     check_plan(plan, expected, device)
     close(layer.kv_cache[1][0], state[0], 5e-6)
     assert torch.equal(ds(layer), conv)
@@ -1198,7 +1211,8 @@ def case_device_metadata(device, q=2, heads=1, rows=1):
         invoke(layer, x, cu, si, out)
     with torch.cuda.graph(commit_graph):
         ctx.commit(counts, si, cu, request_indices=mapping, block_table=table,
-                   num_computed_tokens=computed, mamba_block_size=8)
+                   num_computed_tokens=computed, mamba_block_size=8,
+                   token_capacity=x["mixed_qkv"].size(0))
     bad_queries = [(1, q, 2), (0, -1, 2), (0, q + 1, 2), (0, q + 2, 2),
                    (0, 2**32 + q, 2), (2**32, 2**32 + q, 2),
                    (0, q, 2**32 + 2), (0, q, 2**63 - 1)]
@@ -1231,7 +1245,8 @@ def case_device_metadata(device, q=2, heads=1, rows=1):
         if os.environ.get("PLA_SANITY_CHECK") == "1":
             try:
                 ctx.commit(counts, si, cu, request_indices=mapping, block_table=table,
-                           num_computed_tokens=computed, mamba_block_size=8)
+                           num_computed_tokens=computed, mamba_block_size=8,
+                           token_capacity=x["mixed_qkv"].size(0))
             except RuntimeError as error:
                 assert "PLA_SANITY_CHECK" in str(error)
             else:
@@ -1240,6 +1255,60 @@ def case_device_metadata(device, q=2, heads=1, rows=1):
         torch.cuda.synchronize()
         check_plan(ctx.plan, [[0] * rows] * 4, device)
         assert torch.equal(layer.raw, before)
+
+
+def case_rejected_verify_commit(device):
+    """Keep stale records and rejected source owners out of graph commits."""
+    torch.manual_seed(2026)
+    layer = pages(8, 1, 2, "SD", device)
+    allocate(layer, 2)
+    ctx = context([layer], 2)
+    x = inputs(1, 1, device)
+    out = torch.empty(1, D, dtype=torch.bfloat16, device=device)
+    cu, si, counts = vector([0, 1, 1], device), vector([2, 3], device), vector([1, 0], device)
+    kwargs = dict(block_table=torch.tensor([[3], [4]], device=device),
+                  num_computed_tokens=vector([0, 0], device), mamba_block_size=8,
+                  token_capacity=x["mixed_qkv"].size(0))
+
+    def run():
+        invoke(layer, x, cu, si, out)
+        ctx.commit(counts, si, cu, **kwargs)
+
+    before = layer.raw.clone()
+    run()
+    layer.raw.copy_(before)
+    records = clone_records(layer.replay_records)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+
+    # Row 0 fits Q but exceeds the actual verify projection capacity.
+    cu.copy_(vector([0, 2, 2], device))
+    if os.environ.get("PLA_SANITY_CHECK") == "1":
+        try:
+            ctx.commit(counts, si, cu, **kwargs)
+        except RuntimeError as error:
+            assert "invalid query length" in str(error)
+        else:
+            raise AssertionError("sanity accepted an interval beyond verify capacity")
+    out.fill_(-11)
+    graph.replay()
+    torch.cuda.synchronize()
+    check_plan(ctx.plan, [[0, 0]] * 4, device)
+    assert torch.equal(layer.raw, before)
+    assert torch.equal(out, torch.full_like(out, -11))
+    for name in ("rawv", "rawk", "g", "beta", "conv"):
+        assert torch.equal(getattr(layer.replay_records, name), getattr(records, name))
+
+    # Row 1 is now rejected and must not claim row 0's destination slot.
+    cu.copy_(vector([0, 1, 2], device))
+    state, conv, expected = oracle_commit(layer, records, [0, 1, 1], [2, 3], [1, 0],
+                                          block_table=[[3], [4]], computed=[0, 0], block_size=8)
+    graph.replay()
+    torch.cuda.synchronize()
+    check_plan(ctx.plan, expected, device)
+    close(layer.kv_cache[1], state, 5e-6)
+    assert torch.equal(ds(layer), conv)
 
 
 def case_diagnostics(device):
@@ -1264,7 +1333,7 @@ def case_diagnostics(device):
     os.environ["PPU_LIB_PERF_INSTRUMENT"] = "0"
     def run(output=out):
         result = invoke(layer, x, cu, si, output)
-        ctx.commit(counts, si, cu)
+        ctx.commit(counts, si, cu, token_capacity=x["mixed_qkv"].size(0))
         return result
     try:
         with tempfile.TemporaryFile() as sink:
@@ -1341,13 +1410,14 @@ def case_diagnostics(device):
         os.environ["PPU_LIB_SHOW_PARAMS"] = "1" if show else "0"
 
 
-def diagnostic_process(config):
+def diagnostic_process(config, device):
     import subprocess
     import sys
     bypass, show, perf = config
     env = dict(os.environ, PLA_BYPASS_EXEC=str(bypass), PPU_LIB_SHOW_PARAMS=str(show),
                PPU_LIB_PERF_INSTRUMENT=str(perf), PLA_SANITY_CHECK="1")
-    result = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--phase=diagnostics"],
+    result = subprocess.run([sys.executable, str(Path(__file__).resolve()),
+                             "--phase=diagnostics", "--device", str(device)],
                             env=env, capture_output=True, text=True, timeout=180)
     assert result.returncode == 0, result.stdout + result.stderr
     print("Fresh-process diagnostics passed")
@@ -1381,6 +1451,10 @@ def main():
         finally:
             torch.distributed.destroy_process_group()
     device = torch.device(args.device)
+    if device.type == "cuda":
+        index = torch.cuda.current_device() if device.index is None else device.index
+        torch.cuda.set_device(index)
+        device = torch.device("cuda", index)
     if args.oracle_only:
         torch.manual_seed(1)
         layer = pages(8, 1, 2, "SD", device)
@@ -1458,6 +1532,7 @@ def main():
             cases.append(("prefix_continuation_" + layout,
                           lambda l=layout: case_prefix_continuation(device, l)))
     if args.phase in ("all", "functional", "graph"):
+        cases.append(("graph_rejected_verify_commit", lambda: case_rejected_verify_commit(device)))
         for phase in ("verify", "commit", "combined"):
             cases.append(("graph_" + phase, lambda p=phase: case_graph(device, p)))
             cases.append(("graph_Q4_native_" + phase, lambda p=phase:
@@ -1472,7 +1547,7 @@ def main():
         cases.append(("diagnostics", lambda: case_diagnostics(device)))
     elif args.phase in ("all", "functional") and not args.skip_diagnostics:
         for config in ((1, 0, 0), (1, 1, 1), (0, 1, 1), (0, 0, 1)):
-            cases.append((f"diagnostics_{config}", lambda c=config: diagnostic_process(c)))
+            cases.append((f"diagnostics_{config}", lambda c=config: diagnostic_process(c, device)))
     rep = CaseReporter("kda_replayssm_vllm", "contract", len(cases))
     rep.header()
     for name, call in cases:
