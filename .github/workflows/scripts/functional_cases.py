@@ -110,4 +110,11 @@ def cases():
         Case("flashqla-cp-planner-contract", "prefill",
              ("scripts/prefill/flashqla/private/test_cp_planner_cpu.py",), 600),
     ])
+    # Real-model gating accuracy gate plus the synthetic CP/state/scheduling
+    # regressions in the same files: full-script pytest run per dev request;
+    # tc01-only cases skip by design on non-tc01 boards.
+    result.append(Case(
+        "real-gate-prefill", "prefill",
+        ("test_kimi_k3_real_gate_prefill.py", "test_qwen38_real_gate_prefill.py"),
+        1800, "pytest"))
     return result

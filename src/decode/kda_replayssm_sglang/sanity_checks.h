@@ -72,7 +72,10 @@ inline void sanity_verify_dspark_inputs(
     const torch::Tensor& ring_rawv, const torch::Tensor& ring_rawk,
     const torch::Tensor& ring_g, const torch::Tensor& ring_beta,
     const torch::Tensor& slot_idx, const torch::Tensor& scratch_idx,
-    const torch::Tensor& cu_seqlens, double scale, double lower_bound) {
+    const torch::Tensor& cu_seqlens, double scale, double lower_bound,
+    const std::optional<torch::Tensor>& onorm_gate,
+    const std::optional<torch::Tensor>& onorm_weight,
+    const std::optional<double>& onorm_eps) {
   const pla::sanity::Context sanity("kda_verify_dspark", x_q);
   if (sanity) {
     for (const auto& item : std::initializer_list<std::pair<const char*, torch::Tensor>>{
@@ -86,11 +89,16 @@ inline void sanity_verify_dspark_inputs(
              {"slot_idx", slot_idx}, {"scratch_idx", scratch_idx},
              {"cu_seqlens", cu_seqlens}})
       kda_sglang_tensor(sanity, item.second, item.first);
+    if (onorm_gate) kda_sglang_tensor(sanity, *onorm_gate, "onorm_gate");
+    if (onorm_weight) kda_sglang_tensor(sanity, *onorm_weight, "onorm_weight");
     sanity.check(std::isfinite(scale) && std::isfinite(static_cast<float>(scale)),
                  "scale must be representable as a finite float32 value");
     sanity.check(std::isfinite(lower_bound) && lower_bound < 0.0 &&
                      std::isfinite(static_cast<float>(lower_bound)),
                  "lower_bound must be a finite negative float32 value");
+    if (onorm_eps)
+      sanity.check(std::isfinite(static_cast<float>(*onorm_eps)) && *onorm_eps >= 0.0,
+                   "onorm_eps must be a finite non-negative float32 value");
   }
 }
 
@@ -102,7 +110,8 @@ inline void sanity_verify_dspark_values(
     const torch::Tensor& ic_q, const torch::Tensor& ic_k, const torch::Tensor& ic_v,
     const torch::Tensor& slot_idx, const torch::Tensor& scratch_idx,
     const torch::Tensor& cu_seqlens,
-    int64_t N, int64_t T, int64_t T_LOOP, int64_t slots) {
+    int64_t N, int64_t T, int64_t T_LOOP, int64_t slots,
+    const std::optional<torch::Tensor>& onorm_weight) {
   const pla::sanity::Context sanity("kda_verify_dspark", x_q);
   if (sanity.values_enabled()) {
     const auto slot_values = kda_sglang_int32_values(sanity, slot_idx);
@@ -141,8 +150,10 @@ inline void sanity_verify_dspark_values(
       sanity.finite(w_q, "w_q");
       sanity.finite(w_k, "w_k");
       sanity.finite(w_v, "w_v");
+      if (onorm_weight) sanity.finite(*onorm_weight, "onorm_weight");
     }
-    // Raw gate/beta logits can contain valid saturating infinities.
+    // Raw gate/beta logits (including the output-norm gate) can contain valid
+    // saturating infinities.
   }
 }
 

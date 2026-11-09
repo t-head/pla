@@ -38,9 +38,9 @@ namespace instead:
     Verify path — matches ``sglang.kernels.ops.kimi_k3.kda_decode_mtp
     .fused_kda_decode_mtp_dspark``. CACHE_RING mode only (all four
     ``replayssm_*`` rings are required, ``intermediate_ssm`` snapshots are
-    skipped, no fused output RMSNorm). The persistent recurrent / conv states
-    are read-only; per-step raw inputs go to the four ring caches (consumed by
-    the commit-time exact fold).
+    skipped); the gated output RMSNorm can be fused through ``onorm_*``. The
+    persistent recurrent / conv states are read-only; per-step raw inputs go to
+    the four ring caches (consumed by the commit-time exact fold).
 
 ``commit_kda_replayssm_after_verify``
     Commit path — matches ``sglang.kernels.ops.attention.fla
@@ -109,7 +109,13 @@ def fused_kda_decode_mtp_dspark(
 
     Keyword-only, matching sglang's entry point. Returns the attention output
     ``out`` (allocated if not supplied). All four ``replayssm_*`` rings must be
-    passed; ``onorm_*`` is not implemented in this port.
+    passed.
+
+    Passing all three ``onorm_*`` arguments fuses the gated output RMSNorm,
+    ``out = o * rsqrt(mean(o**2) + onorm_eps) * onorm_weight * sigmoid(onorm_gate)``
+    over the 128 value channels of each (token, head), computed from the fp32
+    attention output. ``onorm_gate`` is bf16 ``[1, T, H, 128]`` (token stride
+    allowed) and ``onorm_weight`` contiguous fp32 ``[128]``.
 
     Q/K/V and gate inputs may have a token stride (for split mixed-QKV views),
     with contiguous head/channel dimensions. Conv states ``[slot, H*128, 3]``
@@ -122,9 +128,11 @@ def fused_kda_decode_mtp_dspark(
         raise ValueError(
             "pla.decode.kda_mtp_sglang.fused_kda_decode_mtp_dspark implements "
             "CACHE_RING only; pass all four replayssm_* rings.")
-    if onorm_gate is not None or onorm_weight is not None or onorm_eps is not None:
-        raise NotImplementedError(
-            "fused output RMSNorm (onorm_*) is not implemented in the PPU port.")
+    onorm_args = (onorm_gate, onorm_weight, onorm_eps)
+    apply_onorm = all(value is not None for value in onorm_args)
+    if any(value is not None for value in onorm_args) and not apply_onorm:
+        raise ValueError(
+            "fused output norm requires onorm_gate, onorm_weight, and onorm_eps")
 
     if scale is None:
         scale = TILE_K ** -0.5
@@ -145,6 +153,8 @@ def fused_kda_decode_mtp_dspark(
         replayssm_rawv, replayssm_rawk, replayssm_g, replayssm_beta,
         ssm_state_indices, intermediate_state_indices,
         cu_seqlens, float(scale), float(lower_bound),
+        onorm_gate, onorm_weight,
+        float(onorm_eps) if apply_onorm else None,
     )
     return out
 

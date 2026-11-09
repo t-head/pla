@@ -35,7 +35,7 @@ def item(name, status, detail=""):
 
 
 def parse_markers(text):
-    rows, active, planned = [], None, 0
+    rows, active, planned, previous = [], None, 0, ""
     for line in text.splitlines():
         start = START.search(line)
         if start:
@@ -48,8 +48,14 @@ def parse_markers(text):
             if active is None:
                 rows.append(item("protocol", "FAIL", "End marker without a start marker"))
             else:
-                rows.append(item(active, "PASS" if verdict[1] == "pass" else "FAIL"))
+                # Keep the line above the marker (the metrics/assert line) as
+                # the failure detail; junit and the summary otherwise can only
+                # say "see group log".
+                rows.append(item(active, "PASS" if verdict[1] == "pass" else "FAIL",
+                                 "" if verdict[1] == "pass" else previous.strip()))
             active = None
+        if line.strip():
+            previous = line
     if active is not None:
         rows.append(item(active, "FAIL", "Missing result when the process ended"))
     totals = re.findall(r"^Total cases:\s*(\d+)", text, re.MULTILINE)
@@ -85,6 +91,33 @@ def parse_jsonl(path, expected):
     if len(rows) != expected or expected == 0:
         rows.append(item("inventory", "FAIL", f"Expected {expected}, received {len(rows)}"))
     return rows
+
+
+def print_fail_blocks(case, text, limit=20):
+    """Print failed case blocks (header, raw case, metrics, verdict marker).
+
+    A tail window cannot show them: marker scripts end with a SUMMARY block,
+    so the last lines are always passing cases and the mid-file failure
+    markers never reach the job console.
+    """
+    lines = text.splitlines()
+    fails = []
+    for index, line in enumerate(lines):
+        verdict = VERDICT.search(line)
+        if verdict and verdict[1] == "fail":
+            fails.append(index)
+    for index in fails[:limit]:
+        start = index
+        while start > 0 and not START.search(lines[start]):
+            start -= 1
+        print("\n".join(lines[start:index + 1]), flush=True)
+    if fails:
+        more = f" ({len(fails) - limit} more not shown)" if len(fails) > limit else ""
+        print(f"{len(fails)} failed block(s){more}; full log: {case.name}/stdout.log", flush=True)
+    else:
+        # Crash/timeout path: no verdict markers at all, the tail is the clue.
+        print("\n".join(lines[-30:]), flush=True)
+        print(f"no fail markers found; tail shown; full log: {case.name}/stdout.log", flush=True)
 
 
 def execute(command, cwd, env, log, timeout):
@@ -177,7 +210,14 @@ def run_case(case, output, timeout):
         env["PLA_FLASHKDA_TC01_IMPL"] = "legacy"
     log = directory / "stdout.log"
     command, cwd, expected = prepare(case, directory)
+    # Marker scripts append fail.log in their cwd; scope it to this group so
+    # the copy below never carries failures over from an earlier group, and
+    # keep it in the report dir instead of losing it with the worker pod.
+    group_fail_log = Path(cwd) / "fail.log"
+    group_fail_log.unlink(missing_ok=True)
     rc = execute(command, cwd, env, log, timeout)
+    if group_fail_log.is_file():
+        shutil.copyfile(group_fail_log, directory / "fail.log")
     text = log.read_text(errors="replace")
     try:
         if case.report == "markers":
@@ -200,7 +240,7 @@ def run_case(case, output, timeout):
               "command": command, "log": f"{case.name}/stdout.log"}
     print(f"{case.name}: {status} {dict(counts)} ({result['seconds']}s)", flush=True)
     if status == "FAIL":
-        print("\n".join(text.splitlines()[-30:]), flush=True)
+        print_fail_blocks(case, text)
     return result
 
 
@@ -263,11 +303,13 @@ def summarize(root, boards=BOARDS):
         except (OSError, ValueError, KeyError, TypeError) as exc:
             texts.append(f"FAIL: Cannot parse report {path.name}: {exc}\n")
             failed = True
+    annotations = []
     for board in boards:
         for phase in PHASES:
             report = reports.get((board, phase))
             if report is None:
                 texts.append(f"## {board} / {phase}\nFAIL: No report received. Check build, scheduling, or environment setup logs.\n")
+                annotations.append(f"::error::PLA {board}/{phase}: no report received; check build, scheduling, or environment logs")
                 failed = True
                 continue
             expected = {case.name for case in cases() if case.phase == phase} | {"environment"}
@@ -275,8 +317,33 @@ def summarize(root, boards=BOARDS):
             if actual != expected or len(actual) != len(report["results"]):
                 texts.append(f"FAIL: Incomplete test group inventory for {board}/{phase}.\n")
                 failed = True
-            failed |= any(row["status"] not in ("PASS", "SKIP") for row in report["results"])
+            bad_rows = [row for row in report["results"] if row["status"] not in ("PASS", "SKIP")]
+            failed |= bool(bad_rows)
             texts.append(markdown(report))
+            if not bad_rows:
+                continue
+            # The group table alone hides the cause: list every failed group
+            # with its failed sub-cases so the Summary page shows the reason.
+            details = [f"## {board} / {phase} failure details"]
+            for row in bad_rows:
+                bad = [child for child in row.get("children", []) if child["status"] == "FAIL"]
+                details.append(f"### {row['name']}: {row['status']}, {len(bad)} failed sub-case(s)")
+                for child in bad[:20]:
+                    details.append(f"- {child['name']}: {child.get('detail') or 'see group log'}")
+                if len(bad) > 20:
+                    details.append(f"- ... {len(bad) - 20} more failed sub-cases")
+                details.append(f"- full log: {board}/{phase}/{row['name']}/stdout.log")
+                annotations.append(
+                    f"::error::PLA {board}/{phase}/{row['name']}: {len(bad)} failed sub-case(s);"
+                    f" reason in summary and artifact {board}/{phase}/{row['name']}/stdout.log")
+            texts.append("\n".join(details) + "\n")
+    # Workflow commands are honored on stderr, and keeping them off stdout
+    # preserves "summarize stdout is exactly the summary text".
+    for line in annotations[:10]:
+        print(line, file=sys.stderr, flush=True)
+    if len(annotations) > 10:
+        print(f"::error::PLA: {len(annotations) - 10} more failed groups listed in the summary below",
+              file=sys.stderr, flush=True)
     text = "\n".join(texts)
     print(text)
     if os.environ.get("GITHUB_STEP_SUMMARY"):

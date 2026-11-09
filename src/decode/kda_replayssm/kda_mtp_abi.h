@@ -79,6 +79,21 @@ struct VerifyStrides {
   WindowStrides ic_q, ic_k, ic_v;
 };
 
+// Optional fused gated output RMSNorm (Kimi-K3 o_norm), applied per (token,
+// head) over the 128 value rows of the fp32 attention output:
+//   out = o * rsqrt(mean(o^2) + eps) * weight * sigmoid(gate)
+// gate == nullptr disables it. Only an unsplit stepwise launch sees a whole
+// head row; split stepwise launches and the generic kernel stage fp32 o in
+// `staging` ([T, H, 128], contiguous) and a separate epilogue kernel
+// normalises it.
+struct OnormArgs {
+  const void* gate;     // bf16 [T, H, 128], token stride gate_stride
+  const float* weight;  // fp32 [128], shared by every head
+  float* staging;
+  int64_t gate_stride;
+  float eps;
+};
+
 // A 1-D index tensor exactly as the caller passed it, int32 or int64 elements.
 // Kernels widen it in place, so int64 indices (the commit's
 // last_correct_step_indices arrive as int64) no longer cost a cast kernel per
@@ -260,6 +275,22 @@ inline int verify_steps_split(int H, int N, int steps) {
              ? 2 : 1;
 }
 
+// The same split with the fused output norm. A split launch needs the
+// separate norm epilogue (one more kernel, ~2.7us) while VS=1 normalises in
+// the CTA, so splitting only pays on much smaller grids. Measured on ZW-M890P
+// over steps 1-6/8 x H*N=4..192 with CUDA-graph replay: max regret 1.6% against
+// the best split per shape (reusing verify_steps_split: 36%, at steps=1).
+inline int verify_steps_split_norm(int H, int N, int steps) {
+  const int64_t forced = verify_split_override();
+  if (forced == 1 || forced == 2 || forced == 4 || forced == 8)
+    return static_cast<int>(forced);
+  const int64_t ctas = static_cast<int64_t>(H) * N;
+  if (steps <= 1) return 1;
+  if (ctas <= (steps <= 2 ? 8 : 12)) return 8;
+  if (ctas < 48 && steps >= 4 && steps <= 6) return steps == 6 ? 2 : 4;
+  return 1;
+}
+
 // Whether a VS=1 launch keeps two passes of state rows in flight (EAGER). It
 // shortens every CTA but, past steps=1, costs registers: on ZW-M890P (39 CUs)
 // 72 -> 104-120 at steps 3/4, i.e. 14 -> 8 blocks/CU, so it only pays where it
@@ -295,7 +326,8 @@ void launch_verify(
     void* ring_rawv, void* ring_rawk, float* ring_g, float* ring_beta,
     IndexArg slot_idx, IndexArg scratch_idx, IndexArg cu_seqlens,
     int H, int N, int t_loop, int ring_len,
-    float scale, float lower_bound, VerifyStrides strides, hggcStream_t stream);
+    float scale, float lower_bound, VerifyStrides strides,
+    const OnormArgs& onorm, hggcStream_t stream);
 
 }  // namespace kda_mtp
 }  // namespace pla
