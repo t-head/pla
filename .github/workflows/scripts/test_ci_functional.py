@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
+import ast
 from collections import Counter
 from contextlib import redirect_stdout
 import io
@@ -8,6 +9,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 import xml.etree.ElementTree as ET
@@ -28,11 +30,60 @@ class FunctionalCITests(unittest.TestCase):
 
     def test_inventory_matches_checkin_counts_and_assets(self):
         selected = cases()
-        self.assertEqual(Counter(case.phase for case in selected), {"decode": 33, "prefill": 20})
-        self.assertEqual(len({case.name for case in selected}), 53)
+        self.assertEqual(Counter(case.phase for case in selected), {"decode": 34, "prefill": 20})
+        self.assertEqual(len({case.name for case in selected}), 54)
         runner.validate_inventory(selected)
         self.assertEqual(sum("--kernel=cuda" in case.argv for case in selected), 4)
         self.assertFalse(any("--max-cases" in arg for case in selected for arg in case.argv))
+
+    def test_vllm_replay_contract_is_registered(self):
+        case = next(case for case in cases() if case.name == "kda-replayssm-vllm")
+        self.assertEqual((case.phase, case.timeout, case.report), ("decode", 1800, "markers"))
+        self.assertEqual(case.argv, ("tests/test_kda_replayssm_vllm.py", "--phase=functional"))
+        self.assertIn("pla/decode/kda_replayssm_vllm", runner.EXTENSION_DIRS)
+
+    def test_replay_phase_inventory_preserves_strict_assessment(self):
+        # Execute only case registration, without importing torch or calling a
+        # test. This verifies CI selection while retaining the full assessment.
+        path = Path(__file__).resolve().parents[3] / "tests/test_kda_replayssm_vllm.py"
+        main = next(node for node in ast.parse(path.read_text()).body
+                    if isinstance(node, ast.FunctionDef) and node.name == "main")
+
+        def assigns(node, name):
+            return isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Name) and target.id == name for target in node.targets)
+
+        start = next(i for i, node in enumerate(main.body) if assigns(node, "cases"))
+        end = next(i for i, node in enumerate(main.body[start:], start) if assigns(node, "rep"))
+        registration = compile(ast.Module(body=main.body[start:end], type_ignores=[]),
+                               str(path), "exec")
+
+        def names(phase, skip_diagnostics=False):
+            scope = dict(args=SimpleNamespace(phase=phase, skip_diagnostics=skip_diagnostics),
+                         device=None, torch=SimpleNamespace(int32="int32", int64="int64"))
+            exec(registration, scope)
+            return [name for name, _ in scope["cases"]]
+
+        precision = ["precision_" + name for name in (
+            "cancellation_Q4", "finite_gate_overflow_Q4", "state_projection_Q4",
+            "cancellation_generic", "finite_gate_overflow_generic", "state_projection_generic",
+            "commit_cancellation", "graph_metadata")]
+        all_cases = names("all")
+        gate_checks = {"precision_finite_gate_overflow_Q4", "precision_finite_gate_overflow_generic"}
+        self.assertEqual(len(all_cases), 65)
+        self.assertEqual(len(set(all_cases)), 65)
+        self.assertEqual(names("precision"), precision)
+        self.assertEqual(names("functional"), [name for name in all_cases
+                         if name not in precision or name in gate_checks])
+        self.assertEqual(len(names("functional")), 59)
+        self.assertEqual(names("functional", True), [name for name in names("functional")
+                         if not name.startswith("diagnostics_")])
+        phase_arg = next(node for node in ast.walk(main) if isinstance(node, ast.Call)
+                         and isinstance(node.func, ast.Attribute) and node.func.attr == "add_argument"
+                         and node.args and isinstance(node.args[0], ast.Constant)
+                         and node.args[0].value == "--phase")
+        default = next(keyword.value for keyword in phase_arg.keywords if keyword.arg == "default")
+        self.assertEqual(ast.literal_eval(default), "all")
 
     def make_wheel(self, directories=None, source=b"# source\n", manifest=True):
         package = self.root / "pla"
@@ -51,7 +102,7 @@ class FunctionalCITests(unittest.TestCase):
         wheel = self.make_wheel()
         with redirect_stdout(io.StringIO()):
             runner.stage_wheel(wheel, self.root)
-        self.assertEqual(len(list(self.root.rglob("*.so"))), 6)
+        self.assertEqual(len(list(self.root.rglob("*.so"))), 7)
         self.assertEqual((self.root / runner.BUILD_MANIFEST).read_bytes(), b"{}")
         self.assertEqual((self.root / "pla/__init__.py").read_bytes(), b"# source\n")
 

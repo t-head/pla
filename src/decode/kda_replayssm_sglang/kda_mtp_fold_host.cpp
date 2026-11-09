@@ -31,7 +31,7 @@
  */
 
 // Torch-facing wrappers for the KDA MTP fold and conv-scatter kernels.
-// The .cu sibling is device-only and is reached through kda_mtp_abi.h.
+// The shared device implementation is reached through kda_mtp_abi.h.
 
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -47,7 +47,7 @@
 #include "../../bypass_exec.h"
 #include "../../op_forge_case.h"
 #include "../../ppu_torch_stream.h"
-#include "kda_mtp_abi.h"
+#include "../kda_replayssm/kda_mtp_abi.h"
 
 namespace {
 void check_fold(const torch::Tensor& t, const char* nm, int dim) {

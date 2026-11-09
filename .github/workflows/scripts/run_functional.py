@@ -21,7 +21,8 @@ ROOT = Path(__file__).resolve().parents[3]
 BOARDS = ("OAM-810E", "ZW-M890P")
 PHASES = ("decode", "prefill")
 EXTENSION_DIRS = {
-    "pla/decode", "pla/decode/gdn/v_last", "pla/decode/kda_mtp_sglang",
+    "pla/decode", "pla/decode/gdn/v_last", "pla/decode/kda_replayssm_sglang",
+    "pla/decode/kda_replayssm_vllm",
     "pla/prefill/flashqla", "pla/prefill/flashkdapro", "pla/prefill/flashkdapro/_tc01_fla",
 }
 BUILD_MANIFEST = "pla/prefill/flashkdapro/_tc01_fla/_build_manifest.json"
@@ -145,7 +146,7 @@ def stage_wheel(wheel, root=ROOT):
                       if Path(name).name.startswith("_C.") and name.endswith(".so")]
         if (len(extensions) != len(EXTENSION_DIRS)
                 or {str(Path(name).parent) for name in extensions} != EXTENSION_DIRS):
-            raise ValueError("Wheel must contain all six PLA extensions")
+            raise ValueError("Wheel must contain all seven PLA extensions")
         if BUILD_MANIFEST not in archive.namelist():
             raise ValueError("Wheel is missing the FLA build manifest")
         for name in archive.namelist():
@@ -394,7 +395,7 @@ def main():
             "print('torch=', torch.__version__, 'devices=', torch.cuda.device_count()); "
             "print(torch.cuda.get_device_name(0)); "
             "[print(importlib.import_module(n).__file__) for n in "
-            "('pla.decode._C','pla.decode.gdn.v_last._C','pla.decode.kda_mtp_sglang._C',"
+            "('pla.decode._C','pla.decode.gdn.v_last._C','pla.decode.kda_replayssm_sglang._C','pla.decode.kda_replayssm_vllm._C',"
             "'pla.prefill.flashqla._C','pla.prefill.flashkdapro._C','pla.prefill.flashkdapro._tc01_fla._C')]; "
             "torch.cuda.synchronize()"
         )

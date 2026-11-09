@@ -31,12 +31,10 @@
  */
 
 /*
- * pla.decode.kda_mtp_sglang -- pybind hub for the two SGLang KDA MTP kernels.
+ * pla.decode.kda_replayssm_sglang -- Python binding for SGLang KDA ReplaySSM.
  *
- * One namespace = one compiled extension = one PYBIND11_MODULE. The device
- * launchers are defined in the sibling .cu files (kda_mtp_verify.cu,
- * kda_mtp_fold.cu) and only forward-declared here, mirroring how
- * fused_sigmoid_gating.cpp fronts the k-last decode extension.
+ * The host functions below call the shared device launchers in
+ * src/decode/kda_replayssm.
  *
  * Ported from SGLang's Kimi-K3 KDA MTP-verify / commit path:
  *   verify_dspark        <- fused_kda_decode_mtp_dspark
@@ -79,7 +77,7 @@ void kda_verify_dspark(torch::Tensor x_q, torch::Tensor x_k, torch::Tensor x_v,
                        std::optional<double> onorm_eps);
 
 // ---- commit: exact fold + conv rollback -------------------------------------
-// Defined in kda_mtp_fold.cu.
+// Defined in kda_mtp_fold_host.cpp.
 void kda_fold_all_layers(torch::Tensor h0, torch::Tensor rawv,
                          torch::Tensor rawk, torch::Tensor gk,
                          torch::Tensor beta, torch::Tensor slot_idx,

@@ -37,9 +37,11 @@
 // __expf / rsqrtf / __bfloat16* conversions -- there is no per-namespace
 // compat shim.
 //
-// Arithmetic order is the recurrent baseline's IS_KDA branch verbatim:
+// The fast path retains the recurrent baseline's IS_KDA evaluation order:
 //   division-form L2 norm with eps inside the sqrt, per-K gate decay,
 //   h *= exp(gk), then decay -> delta -> rank-1.
+// Selected ill-conditioned native updates use a separate FP64 recurrence until
+// FP32 stores; that path is intentionally not bitwise identical to the baseline.
 #include <hggc_bf16.h>
 #include <hggc_runtime.h>
 
@@ -57,7 +59,7 @@ using pla::kda_mtp::IndexArg;
 // outstanding scalar load before the next index load, serializing the cold
 // slot / accept_lens misses at CTA start.
 __device__ __forceinline__ int index_at(IndexArg idx, int i) {
-  return __ldg(static_cast<const int*>(idx.data) + (i << (idx.wide ? 1 : 0)));
+  return __ldg(static_cast<const int*>(idx.data) + (i * idx.stride << (idx.wide ? 1 : 0)));
 }
 
 constexpr int KDIM = 128;
@@ -93,10 +95,91 @@ __device__ __forceinline__ int f4_index(int k_grp, int i) {
 }
 constexpr float L2_EPS = 1e-6f;
 
+__device__ __forceinline__ void store_native_state_vector(float4* dst, float4 value) {
+#ifdef __HGGC_ARCH__
+  typedef float F4 __attribute__((ext_vector_type(4)));
+  *(__attribute__((address_space(1))) F4*)dst = *reinterpret_cast<F4*>(&value);
+#else
+  *dst = value;
+#endif
+}
+
 __device__ __forceinline__ float warp_bfly_add(float x, int width) {
   for (int off = width >> 1; off >= 1; off >>= 1)
     x += __shfl_xor_sync(0xffffffffu, x, off, 32);
   return x;
+}
+
+__device__ __forceinline__ float sum_abs4(float4 value) {
+  // Addition propagates non-finite components into the aggregate; fmaxf can
+  // silently discard a NaN while combining otherwise finite components.
+  return fabsf(value.x) + fabsf(value.y) + fabsf(value.z) + fabsf(value.w);
+}
+
+__device__ __forceinline__ double warp_bfly_add_double(double x) {
+#pragma unroll
+  for (int off = 16; off >= 1; off >>= 1)
+    x += __shfl_xor_sync(0xffffffffu, x, off, 32);
+  return x;
+}
+
+// A nearly unit beta can leave a small residual after the rank-1 subtraction.
+// Keep that recurrence in double until the final/boundary FP32 stores. One warp
+// owns one value row at a time, so each lane needs only four double state values.
+// Boundary storage may alias the source, but the current row stays in registers
+// through every accepted step; later rows have disjoint state elements.
+template <bool GLOBAL_STORE>
+__device__ __forceinline__ void fold_accurate_rows(
+    const float* source, float* destination, float* boundary,
+    const BF16* rawv, const BF16* rawk, const float* gates, const float* betas,
+    int n_commit, int v_base, int V, int track_step) {
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int warps = blockDim.x >> 5;
+  for (int local_v = warp; local_v < STAGE_BV; local_v += warps) {
+    const int v = v_base + local_v;
+    if (v >= V) continue;
+    const long offset = (long)v * KDIM + lane * 4;
+    const float4 initial = *reinterpret_cast<const float4*>(source + offset);
+    double state[4] = {initial.x, initial.y, initial.z, initial.w};
+    for (int t = 0; t < n_commit; ++t) {
+      double key[4];
+      double squared = 0.0;
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        key[i] = static_cast<double>(__bfloat162float(
+            rawk[(long)t * KDIM + lane * 4 + i]));
+        squared += key[i] * key[i];
+      }
+      const double norm = sqrt(warp_bfly_add_double(squared) + 1e-6);
+      double projected = 0.0;
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        key[i] /= norm;
+        state[i] *= exp(static_cast<double>(gates[(long)t * KDIM + lane * 4 + i]));
+        projected += state[i] * key[i];
+      }
+      projected = warp_bfly_add_double(projected);
+      const double value = static_cast<double>(__bfloat162float(rawv[(long)t * V + v]));
+      const double delta = (value - projected) * static_cast<double>(betas[t]);
+#pragma unroll
+      for (int i = 0; i < 4; ++i) state[i] = fma(delta, key[i], state[i]);
+      if (boundary && t == track_step) {
+        const float4 result = make_float4(static_cast<float>(state[0]),
+            static_cast<float>(state[1]), static_cast<float>(state[2]),
+            static_cast<float>(state[3]));
+        float4* target = reinterpret_cast<float4*>(boundary + offset);
+        if constexpr (GLOBAL_STORE) store_native_state_vector(target, result);
+        else *target = result;
+      }
+    }
+    const float4 result = make_float4(static_cast<float>(state[0]),
+        static_cast<float>(state[1]), static_cast<float>(state[2]),
+        static_cast<float>(state[3]));
+    float4* target = reinterpret_cast<float4*>(destination + offset);
+    if constexpr (GLOBAL_STORE) store_native_state_vector(target, result);
+    else *target = result;
+  }
 }
 
 constexpr int K_PER_LANE = KDIM / 32;
@@ -168,7 +251,8 @@ __device__ __forceinline__ void stage_window(
 // rawk   [layers, slots, H,  L, K] bf16
 // gk     [layers, slots, HV, L, K] fp32
 // beta   [layers, slots, HV, L]    fp32
-template <bool STAGE_VALUES, int ROWS>
+template <bool STAGE_VALUES, int ROWS, bool NATIVE = false, bool GLOBAL_STORE = false,
+          bool INPLACE = false>
 __global__ __launch_bounds__(STAGE_VALUES ? STAGE_LANES / ROWS : THREADS)
 void fold_kernel(
     float* __restrict__ h0, const BF16* __restrict__ rawv,
@@ -178,9 +262,12 @@ void fold_kernel(
     long stride_h_slot, long stride_rawv_layer, long stride_rawv_slot,
     long stride_rawk_layer, long stride_rawk_slot, long stride_gk_layer,
     long stride_gk_slot, long stride_beta_layer, long stride_beta_slot, int H,
-    int HV, int V, int L, int null_block_id, bool has_track) {
+    int HV, int V, int L, int null_block_id, bool has_track,
+    pla::kda_mtp::NativeFold native = {}) {
+  constexpr bool PROTECT = NATIVE && GLOBAL_STORE && pla::kda_mtp::kNativeNumericalProtection;
   static_assert(STAGE_VALUES || ROWS == 1, "only the staged path blocks rows");
   constexpr int THREADS = STAGE_VALUES ? STAGE_LANES / ROWS : KDA_FOLD_THREADS;
+  if constexpr (INPLACE) has_track = false;
   constexpr int BV = STAGE_VALUES ? STAGE_BV : KDA_FOLD_BV;
   constexpr int KGRPS = THREADS * ROWS / BV;
   constexpr int ROW_STEP = BV / ROWS;  // a thread's rows are ROW_STEP apart
@@ -190,13 +277,26 @@ void fold_kernel(
   // overlap; the head/layer split is 32-bit (a long divide here was a
   // ~100-instruction software sequence ahead of the loads).
   const int i_n = STAGE_VALUES ? blockIdx.z : blockIdx.y;
+  int* precision_flag = nullptr;
+  if constexpr (PROTECT) {
+    precision_flag = native.precision_flags +
+        ((long)i_n * gridDim.y + blockIdx.y) * (KDIM / STAGE_BV) + blockIdx.x;
+    // The caller zeros the contiguous flag buffer on this stream before each
+    // invocation, including graph replays. Only selected tiles write a flag.
+  }
+  int n_commit;
+  if constexpr (NATIVE && GLOBAL_STORE) {
+    n_commit = __ldg(static_cast<const int*>(accept_lens.data) + i_n);
+    if (n_commit <= 0) return;
+  }
   const int slot = index_at(slot_idx, i_n);
-  const int n_commit = index_at(accept_lens, i_n);
+  if constexpr (!(NATIVE && GLOBAL_STORE))
+    n_commit = index_at(accept_lens, i_n);
   // Without tracking the host aliases track_* to slot_idx/accept_lens, so the
   // unconditional loads stay in bounds and need no branch.
-  const int t_track_raw = index_at(track_step, i_n);
-  const int slot_track_raw = index_at(track_idx, i_n);
-  const int t_track = has_track ? t_track_raw : -1;
+  const int t_track_raw = INPLACE ? 0 : index_at(track_step, i_n);
+  const int slot_track_raw = INPLACE ? null_block_id : index_at(track_idx, i_n);
+  const int t_track = has_track ? t_track_raw - (NATIVE ? 1 : 0) : -1;
   const int slot_track = has_track ? slot_track_raw : null_block_id;
   const int i_vtile = blockIdx.x;
   const int i_hvl = STAGE_VALUES ? blockIdx.y : blockIdx.z;
@@ -204,12 +304,32 @@ void fold_kernel(
   const int i_hv = i_hvl % HV;
   const int i_h = i_hv / (HV / H);
   if (slot <= null_block_id || n_commit <= 0) return;
+  if constexpr (NATIVE) {
+    const int64_t* table = native.layers + i_layer * pla::kda_mtp::kReplayColumns;
+    const auto descriptor = [&](int column) {
+      if constexpr (GLOBAL_STORE) return __ldg(table + column);
+      else return table[column];
+    };
+    h0 = reinterpret_cast<float*>(descriptor(pla::kda_mtp::kState));
+    rawv = reinterpret_cast<const BF16*>(descriptor(pla::kda_mtp::kRawV));
+    rawk = reinterpret_cast<const BF16*>(descriptor(pla::kda_mtp::kRawK));
+    gkc = reinterpret_cast<const float*>(descriptor(pla::kda_mtp::kGate));
+    betac = reinterpret_cast<const float*>(descriptor(pla::kda_mtp::kBeta));
+    stride_h_layer = stride_rawv_layer = stride_rawk_layer = 0;
+    stride_gk_layer = stride_beta_layer = 0;
+    stride_h_slot = descriptor(pla::kda_mtp::kStateStride);
+    stride_rawv_slot = (long)HV * L * V;
+    stride_rawk_slot = (long)H * L * KDIM;
+    stride_gk_slot = (long)HV * L * KDIM;
+    stride_beta_slot = (long)HV * L;
+  }
+  const int record_row = NATIVE ? i_n : slot;
 
   const int tid = threadIdx.x;
   const int v_local = tid / KGRPS;
   const int k_grp = tid % KGRPS;
   const int v = i_vtile * BV + v_local;
-  const bool v_ok = v < V;
+  const bool v_ok = (NATIVE && GLOBAL_STORE) || v < V;
 
   float* h_base = h0 + i_layer * stride_h_layer + slot * stride_h_slot +
                       (long)i_hv * V * KDIM;
@@ -217,15 +337,37 @@ void fold_kernel(
   float* p_h_row = h_base + (long)v * KDIM;
 
   const BF16* rawk_p =
-      rawk + i_layer * stride_rawk_layer + slot * stride_rawk_slot +
+      rawk + i_layer * stride_rawk_layer + record_row * stride_rawk_slot +
       (long)i_h * L * KDIM;
   const BF16* rawv_p =
-      rawv + i_layer * stride_rawv_layer + slot * stride_rawv_slot +
+      rawv + i_layer * stride_rawv_layer + record_row * stride_rawv_slot +
       (long)i_hv * L * V;
-  const float* gk_p = gkc + i_layer * stride_gk_layer + slot * stride_gk_slot +
+  const float* gk_p = gkc + i_layer * stride_gk_layer + record_row * stride_gk_slot +
                       (long)i_hv * L * KDIM;
   const float* beta_p = betac + i_layer * stride_beta_layer +
-                        slot * stride_beta_slot + (long)i_hv * L;
+                        record_row * stride_beta_slot + (long)i_hv * L;
+
+  bool check_condition = false;
+  if constexpr (PROTECT) {
+    // Short windows measure residual conditioning only when their largest beta
+    // exceeds this count-aware empirical threshold. This is not a universal
+    // condition-number bound for unrestricted state/value inputs.
+    const float condition_beta = 1.f - 0.025f * n_commit;
+    for (int t = 0; t < n_commit; ++t)
+      check_condition |= __ldg(beta_p + t) >= condition_beta;
+    // Long sequences can accumulate error without a severely conditioned
+    // individual step. Keep prequalified long windows entirely in FP64.
+    if (n_commit > 16 && check_condition) {
+      if (tid == 0) *precision_flag = 1;
+      return;
+    }
+    // A provisional source-aliasing boundary would destroy the checkpoint
+    // needed by a later repair. Route it before any state access or writes.
+    if (has_track && slot_track == slot && t_track >= 0 && t_track < n_commit - 1) {
+      if (tid == 0) *precision_flag = 1;
+      return;
+    }
+  }
 
   extern __shared__ char smem_raw[];
   float* const s_kk = reinterpret_cast<float*>(smem_raw);
@@ -251,6 +393,7 @@ void fold_kernel(
     __syncthreads();
   }
 
+  bool repair_needed = false;
   for (int t = 0; t < n_commit; ++t) {
     const float4* sh_kk4 =
         reinterpret_cast<const float4*>(s_kk + (long)t * KDIM);
@@ -260,6 +403,7 @@ void fold_kernel(
     // One k/decay load per float4 serves all ROWS rows and both the projection
     // and the rank-1 update.
     float4 k4[F4_PER_THREAD];
+    float key_scale = 0.f;
     float shk[ROWS];
 #pragma unroll
     for (int r = 0; r < ROWS; ++r) shk[r] = 0.f;
@@ -267,6 +411,9 @@ void fold_kernel(
     for (int i = 0; i < F4_PER_THREAD; ++i) {
       const int f4 = f4_index<KGRPS>(k_grp, i);
       k4[i] = sh_kk4[f4];
+      if constexpr (PROTECT) {
+        if (check_condition) key_scale += sum_abs4(k4[i]);
+      }
       const float4 d4 = sh_dc4[f4];
 #pragma unroll
       for (int r = 0; r < ROWS; ++r) {
@@ -288,35 +435,155 @@ void fold_kernel(
       const float vv = STAGE_VALUES ? s_v[t * BV + v_local + r * ROW_STEP] :
           (v_ok ? __bfloat162float(rawv_p[(long)t * V + v]) : 0.f);
       const float vn = (vv - sum) * (STAGE_VALUES ? s_beta[t] : beta_p[t]);
+      float state_scale = 0.f, residual_scale = 0.f;
 #pragma unroll
       for (int i = 0; i < F4_PER_THREAD; ++i) {
         float4& s = st[r][i];
+        if constexpr (PROTECT) {
+          if (check_condition)
+            state_scale += sum_abs4(s);
+        }
         s.x = fmaf(vn, k4[i].x, s.x);
         s.y = fmaf(vn, k4[i].y, s.y);
         s.z = fmaf(vn, k4[i].z, s.z);
         s.w = fmaf(vn, k4[i].w, s.w);
+        if constexpr (PROTECT) {
+          if (check_condition) {
+            residual_scale += sum_abs4(s);
+          }
+        }
+      }
+      if constexpr (PROTECT) {
+        if (check_condition) {
+          // Each value row has its own condition measure. Combining maxima
+          // across rows can hide a small residual behind a larger row.
+          const float terms = warp_bfly_add(state_scale + fabsf(vn) * key_scale, KGRPS);
+          const float residual = warp_bfly_add(residual_scale, KGRPS);
+          repair_needed |= !isfinite(terms) || !isfinite(residual) ||
+              residual < 0.25f * terms;
+        }
       }
     }
 
-    if (has_track && t == t_track && slot_track > null_block_id && v_ok) {
+    const bool defer_boundary = PROTECT && check_condition && slot_track == slot;
+    if (has_track && t == t_track && slot_track > null_block_id && v_ok && !defer_boundary) {
       float4* p_tr = reinterpret_cast<float4*>(
           h0 + i_layer * stride_h_layer + (long)slot_track * stride_h_slot +
           (long)i_hv * V * KDIM + (long)v * KDIM);
 #pragma unroll
       for (int r = 0; r < ROWS; ++r)
 #pragma unroll
-        for (int i = 0; i < F4_PER_THREAD; ++i)
-          p_tr[r * ROW_STEP * KDIM / 4 + f4_index<KGRPS>(k_grp, i)] = st[r][i];
+        for (int i = 0; i < F4_PER_THREAD; ++i) {
+          const int offset = r * ROW_STEP * KDIM / 4 + f4_index<KGRPS>(k_grp, i);
+          if constexpr (NATIVE && GLOBAL_STORE)
+            store_native_state_vector(p_tr + offset, st[r][i]);
+          else
+            p_tr[offset] = st[r][i];
+        }
+    }
+  }
+
+  if constexpr (PROTECT) {
+    if (check_condition) {
+      __shared__ int repair_votes[THREADS / 32];
+      const int warp_repair = __any_sync(0xffffffffu, repair_needed);
+      if ((tid & 31) == 0) repair_votes[tid >> 5] = warp_repair;
+      __syncthreads();
+      bool repair = false;
+#pragma unroll
+      for (int warp = 0; warp < THREADS / 32; ++warp) repair |= repair_votes[warp] != 0;
+      if (repair) {
+        if (tid == 0) *precision_flag = 1;
+        return;  // Leave the original checkpoint intact for sparse FP64 repair.
+      }
+      // The source-aliasing final boundary was deferred until this decision.
+      if (has_track && slot_track == slot && t_track == n_commit - 1) {
+        float4* boundary = reinterpret_cast<float4*>(p_h_row);
+#pragma unroll
+        for (int r = 0; r < ROWS; ++r)
+#pragma unroll
+          for (int i = 0; i < F4_PER_THREAD; ++i)
+            store_native_state_vector(boundary + r * ROW_STEP * KDIM / 4 +
+                                      f4_index<KGRPS>(k_grp, i), st[r][i]);
+      }
     }
   }
 
   if (v_ok) {
-    float4* o4 = reinterpret_cast<float4*>(p_h_row);
+    float* destination = p_h_row;
+    if constexpr (NATIVE && !INPLACE)
+      destination = h0 + (long)index_at(native.final_indices, i_n) * stride_h_slot +
+                    (long)i_hv * V * KDIM + (long)v * KDIM;
+    float4* o4 = reinterpret_cast<float4*>(destination);
 #pragma unroll
     for (int r = 0; r < ROWS; ++r)
 #pragma unroll
-      for (int i = 0; i < F4_PER_THREAD; ++i)
-        o4[r * ROW_STEP * KDIM / 4 + f4_index<KGRPS>(k_grp, i)] = st[r][i];
+      for (int i = 0; i < F4_PER_THREAD; ++i) {
+        const int offset = r * ROW_STEP * KDIM / 4 + f4_index<KGRPS>(k_grp, i);
+        if constexpr (NATIVE && GLOBAL_STORE)
+          store_native_state_vector(o4 + offset, st[r][i]);
+        else
+          o4[offset] = st[r][i];
+      }
+  }
+}
+
+// Scan 128 original fold tiles per CTA, then cooperate only on flagged tiles.
+// Unselected tiles never load checkpoint state. Fast fold leaves every selected
+// source tile untouched, including source-aliasing boundary cases.
+template <bool INPLACE>
+__global__ __launch_bounds__(128) void fold_precise_native(
+    const int64_t* layers, IndexArg source, IndexArg lengths,
+    IndexArg final_indices, IndexArg boundary_indices, IndexArg boundary_lengths,
+    int nlayers, int batch, int heads, int Q, int null_block_id,
+    const int* precision_flags) {
+  constexpr int TILES = KDIM / STAGE_BV;
+  const long total = (long)batch * heads * nlayers * TILES;
+  const long first = (long)blockIdx.x * blockDim.x;
+  const long candidate = first + threadIdx.x;
+  const bool selected = candidate < total && __ldg(precision_flags + candidate) != 0;
+  __shared__ unsigned selected_warps[4];
+  const unsigned mask = __ballot_sync(0xffffffffu, selected);
+  if ((threadIdx.x & 31) == 0) selected_warps[threadIdx.x >> 5] = mask;
+  __syncthreads();
+  for (int warp = 0; warp < 4; ++warp) {
+    unsigned pending = selected_warps[warp];
+    while (pending) {
+      const int bit = __ffs(pending) - 1;
+      pending &= pending - 1;
+      const long tile = first + warp * 32 + bit;
+      const int vtile = tile % TILES;
+      const long head_row = tile / TILES;
+      const int head_layer = head_row % (heads * nlayers);
+      const int row = head_row / (heads * nlayers);
+      const int layer = head_layer / heads, head = head_layer % heads;
+      const int count = index_at(lengths, row);
+      const int slot = index_at(source, row);
+      if (count <= 0 || slot <= null_block_id) continue;
+      const int64_t* table = layers + (long)layer * pla::kda_mtp::kReplayColumns;
+      auto descriptor = [&](int column) { return __ldg(table + column); };
+      float* state = reinterpret_cast<float*>(descriptor(pla::kda_mtp::kState));
+      const long stride = descriptor(pla::kda_mtp::kStateStride);
+      const BF16* rawv = reinterpret_cast<const BF16*>(descriptor(pla::kda_mtp::kRawV));
+      const BF16* rawk = reinterpret_cast<const BF16*>(descriptor(pla::kda_mtp::kRawK));
+      const float* gate = reinterpret_cast<const float*>(descriptor(pla::kda_mtp::kGate));
+      const float* beta = reinterpret_cast<const float*>(descriptor(pla::kda_mtp::kBeta));
+      const long record = ((long)row * heads + head) * Q;
+      const long state_head = (long)head * KDIM * KDIM;
+      const int final_slot = INPLACE ? slot : index_at(final_indices, row);
+      float* destination = state + (long)final_slot * stride + state_head;
+      float* boundary = nullptr;
+      int track_step = -1;
+      if constexpr (!INPLACE) {
+        const int boundary_slot = index_at(boundary_indices, row);
+        track_step = index_at(boundary_lengths, row) - 1;
+        if (track_step >= 0 && boundary_slot > null_block_id)
+          boundary = state + (long)boundary_slot * stride + state_head;
+      }
+      fold_accurate_rows<true>(state + (long)slot * stride + state_head,
+          destination, boundary, rawv + record * KDIM, rawk + record * KDIM,
+          gate + record * KDIM, beta + record, count, vtile * STAGE_BV, KDIM, track_step);
+    }
   }
 }
 
@@ -505,6 +772,146 @@ void launch_conv_scatter(
     dispatch_conv_window<float>(PLA_CONV_ARGS);
   }
 #undef PLA_CONV_ARGS
+}
+
+void launch_fold_native(const int64_t* layers, IndexArg source,
+                        IndexArg lengths, IndexArg final_indices,
+                        IndexArg boundary, IndexArg boundary_lengths,
+                        int nlayers, int batch, int heads, int Q, int slots,
+                        int null_block_id, bool has_align, int* precision_flags,
+                        hggcStream_t stream) {
+  if (!batch) return;
+  constexpr int rows = 2;
+  const int smem = Q * (2 * KDIM + STAGE_BV + 1) * sizeof(float);
+#define PLA_NATIVE_FOLD_LAUNCH(GLOBAL_STORE, INPLACE)                          \
+  do {                                                                        \
+    if (smem > 48 * 1024)                                                      \
+      hggcFuncSetAttribute(fold_kernel<true, rows, true, GLOBAL_STORE, INPLACE>, \
+                          hggcFuncAttributeMaxDynamicSharedMemorySize, smem);  \
+    fold_kernel<true, rows, true, GLOBAL_STORE, INPLACE>                        \
+        <<<dim3(128 / STAGE_BV, heads * nlayers, batch),                        \
+           STAGE_LANES / rows, smem, stream>>>(                               \
+        nullptr, nullptr, nullptr, nullptr, nullptr, source, lengths,          \
+        boundary, boundary_lengths, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,              \
+        heads, heads, 128, Q, null_block_id, true,                              \
+        {layers, final_indices, slots, precision_flags});                      \
+  } while (false)
+  if (current_device_is_ppu15()) {
+    if (has_align) PLA_NATIVE_FOLD_LAUNCH(true, false);
+    else PLA_NATIVE_FOLD_LAUNCH(true, true);
+    if constexpr (kNativeNumericalProtection) {
+      const long tiles = (long)batch * heads * nlayers * (KDIM / STAGE_BV);
+      if (has_align)
+        fold_precise_native<false><<<(tiles + 127) / 128, 128, 0, stream>>>(
+            layers, source, lengths, final_indices, boundary, boundary_lengths,
+            nlayers, batch, heads, Q, null_block_id, precision_flags);
+      else
+        fold_precise_native<true><<<(tiles + 127) / 128, 128, 0, stream>>>(
+            layers, source, lengths, final_indices, boundary, boundary_lengths,
+            nlayers, batch, heads, Q, null_block_id, precision_flags);
+    }
+  } else PLA_NATIVE_FOLD_LAUNCH(false, false);
+#undef PLA_NATIVE_FOLD_LAUNCH
+}
+
+namespace {
+__device__ __forceinline__ void copy_native_conv_vector(const BF16* src, BF16* dst) {
+#ifdef __HGGC_ARCH__
+  typedef unsigned int U4 __attribute__((ext_vector_type(4)));
+  *(__attribute__((address_space(1))) U4*)dst =
+      *(const __attribute__((address_space(1))) U4*)src;
+#else
+  *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
+#endif
+}
+
+template <bool TILED>
+__global__ void native_conv_scatter(const int64_t* layers, IndexArg lengths,
+                                   IndexArg final_indices, IndexArg boundary,
+                                   IndexArg boundary_lengths, int heads, int Q,
+                                   int slots, int null_block_id) {
+  const int row = blockIdx.x, layer = blockIdx.y;
+  const int count = index_at(lengths, row);
+  if (count <= 0) return;
+  const int64_t* table = layers + layer * kReplayColumns;
+  BF16* dst = reinterpret_cast<BF16*>(table[kConv]);
+  const BF16* src = reinterpret_cast<const BF16*>(table[kWindows]);
+  const int final_slot = index_at(final_indices, row);
+  const int boundary_slot = index_at(boundary, row);
+  const int bc = index_at(boundary_lengths, row);
+  const int dim = 3 * heads * KDIM;
+  if constexpr (TILED) {
+    const bool final_valid = final_slot > null_block_id && final_slot < slots;
+    const bool boundary_valid = bc > 0 && boundary_slot > null_block_id && boundary_slot < slots;
+    const long final_src = ((long)row * Q + count - 1) * dim * 3;
+    const long boundary_src = ((long)row * Q + bc - 1) * dim * 3;
+    const long final_dst = (long)final_slot * table[kConvSlot];
+    const long boundary_dst = (long)boundary_slot * table[kConvSlot];
+    const bool packed = table[kConvChannel] == 3 && table[kConvWindow] == 1 &&
+        table[kConvSlot] % 8 == 0 && ((long)dim * 3) % 8 == 0 &&
+        reinterpret_cast<uintptr_t>(src) % 16 == 0 &&
+        reinterpret_cast<uintptr_t>(dst) % 16 == 0;
+    if (packed) {
+      constexpr int vectors_per_tile = kConvBlock * kConvDPerThread * 3 / 8;
+      const long first = (long)blockIdx.z * vectors_per_tile;
+      for (int i = threadIdx.x; i < vectors_per_tile; i += kConvBlock) {
+        const long offset = (first + i) * 8;
+        if (offset >= (long)dim * 3) continue;
+        if (boundary_valid)
+          copy_native_conv_vector(src + boundary_src + offset, dst + boundary_dst + offset);
+        if (final_valid)
+          copy_native_conv_vector(src + final_src + offset, dst + final_dst + offset);
+      }
+      return;
+    }
+    const int channel0 = blockIdx.z * (kConvBlock * kConvDPerThread) + threadIdx.x;
+#pragma unroll
+    for (int r = 0; r < kConvDPerThread; ++r) {
+      const int channel = channel0 + r * kConvBlock;
+      if (channel >= dim) break;
+#pragma unroll
+      for (int w = 0; w < 3; ++w) {
+        const long offset = (long)channel * table[kConvChannel] + w * table[kConvWindow];
+        if (boundary_valid)
+          dst[boundary_dst + offset] = src[boundary_src + channel * 3 + w];
+        if (final_valid)
+          dst[final_dst + offset] = src[final_src + channel * 3 + w];
+      }
+    }
+    return;
+  }
+  for (int i = blockIdx.z * blockDim.x + threadIdx.x; i < dim * 3;
+       i += gridDim.z * blockDim.x) {
+    const int channel = i / 3, w = i % 3;
+    const long offset = (long)channel * table[kConvChannel] + w * table[kConvWindow];
+    if (bc > 0 && boundary_slot > null_block_id && boundary_slot < slots)
+      dst[(long)boundary_slot * table[kConvSlot] + offset] =
+          src[((long)row * Q + bc - 1) * dim * 3 + i];
+    if (final_slot > null_block_id && final_slot < slots)
+      dst[(long)final_slot * table[kConvSlot] + offset] =
+          src[((long)row * Q + count - 1) * dim * 3 + i];
+  }
+}
+}
+
+void launch_conv_native(const int64_t* layers, IndexArg lengths,
+                        IndexArg final_indices, IndexArg boundary,
+                        IndexArg boundary_lengths, int nlayers, int batch,
+                        int heads, int Q, int slots, int null_block_id,
+                        hggcStream_t stream) {
+  if (!batch) return;
+  const int64_t gate = conv_packed_gate();
+  if (gate >= 0 && (int64_t)batch * heads * 3 * KDIM * nlayers >= gate &&
+      current_device_is_ppu15()) {
+    const int tiles = (3 * heads * KDIM + kConvBlock * kConvDPerThread - 1) /
+                      (kConvBlock * kConvDPerThread);
+    native_conv_scatter<true><<<dim3(batch, nlayers, tiles), kConvBlock, 0, stream>>>(
+        layers, lengths, final_indices, boundary, boundary_lengths, heads, Q, slots, null_block_id);
+  } else {
+    native_conv_scatter<false><<<dim3(batch, nlayers, (3 * heads * KDIM * 3 + 255) / 256),
+                                256, 0, stream>>>(layers, lengths, final_indices, boundary,
+                                                 boundary_lengths, heads, Q, slots, null_block_id);
+  }
 }
 
 }  // namespace kda_mtp
