@@ -31,7 +31,7 @@
  */
 
 // Torch-facing wrapper for the KDA MTP verify kernel.
-// The .cu sibling is device-only and is reached through kda_mtp_abi.h.
+// The shared device implementation is reached through kda_mtp_abi.h.
 
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -43,7 +43,7 @@
 #include "../../bypass_exec.h"
 #include "../../op_forge_case.h"
 #include "../../ppu_torch_stream.h"
-#include "kda_mtp_abi.h"
+#include "../kda_replayssm/kda_mtp_abi.h"
 
 void kda_verify_dspark(torch::Tensor x_q, torch::Tensor x_k, torch::Tensor x_v,
                        torch::Tensor g_in, torch::Tensor beta_in,

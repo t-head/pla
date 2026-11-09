@@ -54,7 +54,7 @@ Build a single namespace when only one kernel family is required:
 ```bash
 python scripts/build.py --namespace pla.decode
 python scripts/build.py --namespace pla.decode.gdn.v_last
-python scripts/build.py --namespace pla.decode.kda_mtp_sglang
+python scripts/build.py --namespace pla.decode.kda_replayssm_sglang
 python scripts/build.py --namespace pla.prefill.flashqla
 python scripts/build.py --namespace pla.prefill.flashkdapro
 ```
@@ -65,7 +65,8 @@ python scripts/build.py --namespace pla.prefill.flashkdapro
 |---|---|
 | `pla.decode` | k-last GDN/KDA decode, packed decode, and KDA compatibility APIs |
 | `pla.decode.gdn.v_last` | v-last GDN decode |
-| `pla.decode.kda_mtp_sglang` | KDA ReplaySSM verification and state commit |
+| `pla.decode.kda_replayssm_sglang` | SGLang KDA ReplaySSM verification and state commit |
+| `pla.decode.kda_mtp_sglang` | Compatibility API and build selector for SGLang ReplaySSM |
 | `pla.prefill.flashqla` | FlashQLA GDN prefill and packed-QKV GDN prefill |
 | `pla.prefill.flashkdapro` | FlashKDAPro KDA prefill |
 

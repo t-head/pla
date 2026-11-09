@@ -1,7 +1,7 @@
 // Copyright (c) 2022-2026 T-Head (Shanghai) Semiconductor Co., Ltd.
 // SPDX-License-Identifier: BSD-3-Clause
 #pragma once
-#include "../kda_mtp_sglang/kda_mtp_abi.h"
+#include "../kda_replayssm/kda_mtp_abi.h"
 
 namespace pla::kda_mtp {
 struct PlanInputs {

@@ -58,7 +58,7 @@ BUILD_ENV = os.environ.copy()
 
 # Keep in sync with ALL_NAMESPACES in setup.py.
 ALL_NAMESPACES = ("pla.decode", "pla.decode.gdn.v_last",
-                  "pla.decode.kda_mtp_sglang", "pla.decode.kda_replayssm_vllm",
+                  "pla.decode.kda_replayssm_sglang", "pla.decode.kda_replayssm_vllm",
                   "pla.prefill.flashqla", "pla.prefill.flashkdapro")
 
 

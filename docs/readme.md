@@ -13,7 +13,7 @@ exported from the root `pla` package; import the required namespace explicitly.
 | `pla.decode.kda.fused_recurrent_kda` | vLLM-specific recurrent KDA decode | Version not tracked | same decode extension |
 | `pla.decode.kda.fused_kda_decode_mega_forward` | Fused Kimi K3 decode | SGLang `v0.5.17`; vLLM `v0.27.0` | same decode extension |
 | `pla.decode.gdn.v_last.fused_sigmoid_gating_delta_rule` | v-last GDN decode wrapper | SGLang `v0.5.9` | `pla/decode/gdn/v_last/_C*.so` |
-| `pla.decode.kda_mtp_sglang.fused_kda_decode_mtp_dspark` | Kimi K3 ReplaySSM verify | SGLang `v0.5.17` | `pla/decode/kda_mtp_sglang/_C*.so` |
+| `pla.decode.kda_mtp_sglang.fused_kda_decode_mtp_dspark` | Kimi K3 ReplaySSM verify | SGLang `v0.5.17` | `pla/decode/kda_replayssm_sglang/_C*.so` |
 | `pla.decode.kda_mtp_sglang.commit_kda_replayssm_after_verify` | Accepted-prefix state commit | SGLang `v0.5.17` | same ReplaySSM extension |
 | `pla.prefill.flashqla.chunk_gated_delta_rule_fwd` | GDN prefill | vLLM `v0.27.0` | `pla/prefill/flashqla/_C*.so` |
 | `pla.prefill.flashqla.gdn_prefill_packed_qkv_fwd` | Packed-QKV GDN prefill without a separate QKV split | Version not tracked | same FlashQLA extension |
