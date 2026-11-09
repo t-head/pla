@@ -28,8 +28,8 @@ class FunctionalCITests(unittest.TestCase):
 
     def test_inventory_matches_checkin_counts_and_assets(self):
         selected = cases()
-        self.assertEqual(Counter(case.phase for case in selected), {"decode": 33, "prefill": 19})
-        self.assertEqual(len({case.name for case in selected}), 52)
+        self.assertEqual(Counter(case.phase for case in selected), {"decode": 33, "prefill": 20})
+        self.assertEqual(len({case.name for case in selected}), 53)
         runner.validate_inventory(selected)
         self.assertEqual(sum("--kernel=cuda" in case.argv for case in selected), 4)
         self.assertFalse(any("--max-cases" in arg for case in selected for arg in case.argv))
@@ -125,6 +125,17 @@ class FunctionalCITests(unittest.TestCase):
         command, cwd, _ = runner.prepare(case, self.root)
         self.assertEqual(cwd, runner.ROOT / "tests")
         self.assertEqual(command[1:3], ["-m", "pytest"])
+
+    def test_real_gate_case_runs_full_scripts_from_tests_dir(self):
+        case = next(case for case in cases() if case.name == "real-gate-prefill")
+        self.assertEqual(case.phase, "prefill")
+        self.assertEqual(case.argv,
+                         ("test_kimi_k3_real_gate_prefill.py",
+                          "test_qwen38_real_gate_prefill.py"))
+        command, cwd, _ = runner.prepare(case, self.root)
+        self.assertEqual(cwd, runner.ROOT / "tests")
+        self.assertIn("test_kimi_k3_real_gate_prefill.py", command)
+        self.assertIn("test_qwen38_real_gate_prefill.py", command)
 
     def test_failure_does_not_prevent_next_group(self):
         with redirect_stdout(io.StringIO()):
