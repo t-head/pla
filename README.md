@@ -89,7 +89,8 @@ Allocate each layer's records with
 Pass these records to verify and expose them as `layer.replay_records` alongside
 `layer.kv_cache = (conv_state, checkpoint_state)`. Create the commit context
 before CUDA Graph capture and keep the cache and record tensors in place for
-its lifetime.
+its lifetime. Layers can share a storage allocation when their writable cache
+regions are disjoint.
 
 The following commit uses the same projection capacity and query metadata as
 verify.
@@ -109,6 +110,11 @@ plan = ctx.commit(
     token_capacity=mixed_qkv.shape[0],
 )
 ```
+
+The context reuses plan buffers. Order its commits, plan reads, and graph replays
+on the same stream or with stream events. A later commit or replay overwrites
+the plan. Use separate contexts and nonconflicting cache accesses for concurrent
+execution.
 
 Default replay uses FP32 arithmetic. Set `PLA_KDA_NATIVE_FP64_REPAIR=1` at
 build time to enable diagnostic repair. See the

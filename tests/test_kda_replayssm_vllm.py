@@ -875,6 +875,54 @@ def case_mixed_prefill(device):
     assert torch.equal(x["storage"], prefix), "mixed projection storage changed"
 
 
+def case_context_cache_overlap(device, layout):
+    arena = pages(6, 1, 1, layout, device, history=6)
+    conv, state = arena.kv_cache
+    history_dim = 2 if layout == "DS" else 1
+    first_conv, second_conv = conv[::2].split(3, dim=history_dim)
+    layers = []
+    # Share storage across layers. State pages alternate and conv histories
+    # occupy disjoint portions of the same pages, including strided DS views.
+    for kv_cache in ((first_conv, state[::2]), (second_conv, state[1::2])):
+        layer = SimpleNamespace(**vars(arena))
+        layer.kv_cache = kv_cache
+        allocate(layer, 1)
+        layers.append(layer)
+    first, second = layers
+
+    ctx = context(layers, 1)
+    targets = []
+    for i, layer in enumerate(layers):
+        records = layer.replay_records
+        records.g.fill_(-1)
+        records.beta.zero_()
+        records.conv.fill_(i + 1)
+        targets.append(oracle_commit(layer, records, [0, 1], [1], [1]))
+    ctx.commit(vector([1], device), vector([1], device), vector([0, 1], device),
+               token_capacity=1)
+    for layer, (want_state, want_conv, _) in zip(layers, targets):
+        close(layer.kv_cache[1], want_state, 5e-6)
+        assert torch.equal(ds(layer), want_conv)
+
+    first_state, second_state = first.kv_cache[1], second.kv_cache[1]
+    partial_state = first_state.as_strided(first_state.shape, first_state.stride(),
+                                           first_state.storage_offset() + 4)
+    partial_conv = conv[::2].narrow(history_dim, 2, 3)
+    conv_in_state = second_conv.as_strided(second_conv.shape, second_conv.stride(),
+                                          2 * first_state.storage_offset())
+    overlapping_layers = [first]
+    for kv_cache in ((second_conv, partial_state), (second_conv, state[2:5]),
+                     (partial_conv, second_state), (conv_in_state, second_state)):
+        overlapping_layers.append(SimpleNamespace(**(vars(second) | dict(kv_cache=kv_cache))))
+    for layer in overlapping_layers:
+        try:
+            context([first, layer], 1)
+        except ValueError as error:
+            assert "overlapping writable caches" in str(error), error
+        else:
+            raise AssertionError("overlapping layer cache accepted")
+
+
 def case_all_invalid(device):
     layer = pages(8, 1, 5, "DS", device)
     allocate(layer, 3)
@@ -1519,6 +1567,8 @@ def main():
             cases.append((f"conv_{layout}_history{history}", lambda l=layout, h=history:
                           case_conv_packed(device, l, h)))
         for layout in ("DS", "SD"):
+            cases.append(("context_cache_overlap_" + layout,
+                          lambda l=layout: case_context_cache_overlap(device, l)))
             cases.append(("live_pipeline_" + layout,
                           lambda l=layout: case_commit(device, l, live=True)))
             for align in (False, True):

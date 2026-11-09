@@ -70,12 +70,12 @@ class FunctionalCITests(unittest.TestCase):
             "commit_cancellation", "graph_metadata")]
         all_cases = names("all")
         gate_checks = {"precision_finite_gate_overflow_Q4", "precision_finite_gate_overflow_generic"}
-        self.assertEqual(len(all_cases), 63)
-        self.assertEqual(len(set(all_cases)), 63)
+        self.assertEqual(len(all_cases), 65)
+        self.assertEqual(len(set(all_cases)), 65)
         self.assertEqual(names("precision"), precision)
         self.assertEqual(names("functional"), [name for name in all_cases
                          if name not in precision or name in gate_checks])
-        self.assertEqual(len(names("functional")), 57)
+        self.assertEqual(len(names("functional")), 59)
         self.assertEqual(names("functional", True), [name for name in names("functional")
                          if not name.startswith("diagnostics_")])
         phase_arg = next(node for node in ast.walk(main) if isinstance(node, ast.Call)

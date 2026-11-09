@@ -76,12 +76,87 @@ class KDAReplayCommitPlan:
     boundary_recovery_lens: torch.Tensor
 
 
+def _intersecting_runs(left, left_bytes, right, right_bytes):
+    """Yield intersecting pairs of byte runs from two strided sequences."""
+    a, b = left.start, right.start
+    while a < left.stop and b < right.stop:
+        a_end, b_end = a + left_bytes, b + right_bytes
+        if a_end <= b:
+            a += ((b - a_end) // left.step + 1) * left.step
+        elif b_end <= a:
+            b += ((a - b_end) // right.step + 1) * right.step
+        else:
+            yield a, b
+            if a_end <= b_end:
+                a += left.step
+            else:
+                b += right.step
+
+
+@dataclass(frozen=True)
+class _CacheWrites:
+    pages: range
+    offsets: range
+    run_bytes: int
+
+    @classmethod
+    def from_tensor(cls, tensor, run_size, run_count=1, run_stride=1):
+        item_bytes = tensor.element_size()
+        start = tensor.data_ptr()
+        page_stride = tensor.stride(0) * item_bytes
+        pages = range(start, start + tensor.size(0) * page_stride, page_stride)
+        if run_stride == run_size:
+            return cls(pages, range(1), run_size * run_count * item_bytes)
+        stride_bytes = run_stride * item_bytes
+        return cls(pages, range(0, run_count * stride_bytes, stride_bytes),
+                   run_size * item_bytes)
+
+    def overlaps(self, other):
+        left, right = self, other
+        if left.pages.start > right.pages.start:
+            left, right = right, left
+        a_pages, b_pages = left.pages, right.pages
+        if a_pages.step == b_pages.step:
+            # All later page pairs repeat the relative offsets of the first
+            # right page and its at most two left neighbors.
+            first = (b_pages.start - a_pages.start) // a_pages.step
+            a_pages, b_pages = a_pages[first:first + 2], b_pages[:1]
+        a_extent = left.offsets[-1] + left.run_bytes
+        b_extent = right.offsets[-1] + right.run_bytes
+        for a, b in _intersecting_runs(a_pages, a_extent, b_pages, b_extent):
+            a_runs = range(a, a + left.offsets.stop, left.offsets.step)
+            b_runs = range(b, b + right.offsets.stop, right.offsets.step)
+            if next(_intersecting_runs(a_runs, left.run_bytes, b_runs,
+                                       right.run_bytes), None) is not None:
+                return True
+        return False
+
+
+def _cache_writes(conv, state, layout):
+    # The native descriptor has validated both tensors and their page strides.
+    state_writes = _CacheWrites.from_tensor(state, state.numel() // state.size(0))
+    conv_ds = conv if layout == "DS" else conv.transpose(1, 2)
+    channels = conv_ds.size(1)
+    # Scatter writes only the first three history items of each channel.
+    if conv_ds.stride(2) == 1:
+        conv_writes = _CacheWrites.from_tensor(conv_ds, 3, channels, conv_ds.stride(1))
+    else:
+        conv_writes = _CacheWrites.from_tensor(conv_ds, channels, 3, conv_ds.stride(2))
+    return state_writes, conv_writes
+
+
 class KDAReplayCommitContext:
     """Own immutable layer pointers and reusable GPU plan buffers.
 
-    Create outside capture. Cache/record tensors must not be resized or replaced
-    during the context lifetime. The returned plan is overwritten by the next
-    commit and has max_num_reqs entries; inactive capacity entries are zero.
+    Create outside capture and keep cache and record tensors in place for the
+    context lifetime. Writable cache regions of different layers must be disjoint.
+
+    Serialize commits, reads of the returned plan, and replays of graphs
+    captured with this context on one stream or through stream event dependencies.
+    The next commit or replay overwrites the plan. Use separate contexts and
+    nonconflicting cache accesses for concurrent work.
+
+    The plan has max_num_reqs entries, with zeroes in inactive capacity entries.
     """
     @classmethod
     def create(cls, layers, spec_query_len, max_num_reqs,
@@ -100,7 +175,8 @@ class KDAReplayCommitContext:
         slots, heads = layers[0].kv_cache[1].shape[:2]
         descriptors = []
         keepalive = []
-        for layer in layers:
+        layer_writes = []
+        for index, layer in enumerate(layers):
             conv, state = layer.kv_cache
             records = layer.replay_records
             tensors = (conv, state, records.rawv, records.rawk, records.g,
@@ -110,6 +186,12 @@ class KDAReplayCommitContext:
                                                    max_num_reqs))
             if any(t.device != device for t in tensors):
                 raise ValueError("all context layers must share one device")
+            writes = _cache_writes(conv, state, conv_state_layout)
+            for previous, other_writes in enumerate(layer_writes):
+                if any(a.overlaps(b) for a in writes for b in other_writes):
+                    raise ValueError(
+                        f"context layers {previous} and {index} have overlapping writable caches")
+            layer_writes.append(writes)
             keepalive.extend(tensors)
         result = cls()
         result._keepalive = tuple(keepalive)
