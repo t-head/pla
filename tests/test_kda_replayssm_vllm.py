@@ -179,7 +179,7 @@ def oracle_commit(layer, records, offsets, slots, counts, mapping=None,
 
 
 def invoke(layer, x, offsets, slots, out, null_block_id=0):
-    from pla.decode.kda_mtp_vllm import kda_replay_verify
+    from pla.decode.kda_replayssm_vllm import kda_replay_verify
     args = {k: v for k, v in x.items() if k != "storage"}
     return kda_replay_verify(**args, conv_state=layer.kv_cache[0],
                              checkpoint_state=layer.kv_cache[1],
@@ -189,7 +189,7 @@ def invoke(layer, x, offsets, slots, out, null_block_id=0):
 
 
 def allocate(layer, rows):
-    from pla.decode.kda_mtp_vllm import KDAReplayRecords
+    from pla.decode.kda_replayssm_vllm import KDAReplayRecords
     layer.replay_records = KDAReplayRecords.allocate(rows, layer.heads, layer.q,
                                                     layer.raw.device)
     for name in ("rawv", "rawk", "g", "beta", "conv"):
@@ -197,7 +197,7 @@ def allocate(layer, rows):
 
 
 def context(layers, rows, null_block_id=0):
-    from pla.decode.kda_mtp_vllm import KDAReplayCommitContext
+    from pla.decode.kda_replayssm_vllm import KDAReplayCommitContext
     return KDAReplayCommitContext.create(layers, spec_query_len=layers[0].q,
                                         max_num_reqs=rows,
                                         conv_state_layout=layers[0].layout,
@@ -1122,7 +1122,7 @@ def case_invalid(device):
         pass
     else:
         raise AssertionError("device block-size scalar accepted")
-    from pla.decode.kda_mtp_vllm import kda_replay_verify
+    from pla.decode.kda_replayssm_vllm import kda_replay_verify
     x = inputs(1, 2, device)
     kwargs = {k: v for k, v in x.items() if k != "storage"}
     kwargs.update(conv_state=layer.kv_cache[0], checkpoint_state=layer.kv_cache[1],
@@ -1367,7 +1367,7 @@ def main():
         device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
         rank, world = torch.distributed.get_rank(), torch.distributed.get_world_size()
         assert world >= 2, "distributed mode requires at least two ranks"
-        rep = CaseReporter("kda_mtp_vllm", "distributed_contract", 1)
+        rep = CaseReporter("kda_replayssm_vllm", "distributed_contract", 1)
         if rank == 0:
             rep.header()
             rep.start(f"distributed_TP{world}")
@@ -1399,7 +1399,7 @@ def main():
         assert torch.equal(conv[4, :, :3], golden.conv[0, 1])
         print("Oracle self-check passed")
         return 0
-    from pla.decode.kda_mtp_vllm import KDAReplayRecords  # fail loudly when unbuilt
+    from pla.decode.kda_replayssm_vllm import KDAReplayRecords  # fail loudly when unbuilt
     cases = []
     if args.phase in ("all", "functional", "verify"):
         for layout, q, h, dtype in (("DS", 1, 1, torch.int32), ("SD", 2, 3, torch.int64),
@@ -1473,7 +1473,7 @@ def main():
     elif args.phase in ("all", "functional") and not args.skip_diagnostics:
         for config in ((1, 0, 0), (1, 1, 1), (0, 1, 1), (0, 0, 1)):
             cases.append((f"diagnostics_{config}", lambda c=config: diagnostic_process(c)))
-    rep = CaseReporter("kda_mtp_vllm", "contract", len(cases))
+    rep = CaseReporter("kda_replayssm_vllm", "contract", len(cases))
     rep.header()
     for name, call in cases:
         rep.start(name)

@@ -36,7 +36,7 @@ package. Import the namespace you need:
     pla.decode                    fused sigmoid gating delta rule (GDN) decode
     pla.decode.kda                Kimi Delta Attention decode
     pla.decode.kda_mtp_sglang     SGLang KDA MTP verify + commit kernels
-    pla.decode.kda_mtp_vllm       Native paged KDA replay verify + commit
+    pla.decode.kda_replayssm_vllm       Native paged KDA replay verify + commit
     pla.decode.private            tunable entry points (auto-tune only)
     pla.prefill.flashqla          FlashQLA prefill forward
     pla.prefill.flashqla.private  FlashQLA prefill building blocks

@@ -91,7 +91,7 @@ here = os.path.abspath(os.path.dirname(__file__))
 # Namespace selection
 # ---------------------------------------------------------------------------
 ALL_NAMESPACES = ("pla.decode", "pla.decode.gdn.v_last",
-                  "pla.decode.kda_mtp_sglang", "pla.decode.kda_mtp_vllm",
+                  "pla.decode.kda_mtp_sglang", "pla.decode.kda_replayssm_vllm",
                   "pla.prefill.flashqla", "pla.prefill.flashkdapro")
 
 
@@ -259,7 +259,7 @@ if "pla.decode.gdn.v_last" in NAMESPACES:
 # ---------------------------------------------------------------------------
 # pla.decode.kda_mtp_sglang
 # ---------------------------------------------------------------------------
-for kda_namespace in ("pla.decode.kda_mtp_sglang", "pla.decode.kda_mtp_vllm"):
+for kda_namespace in ("pla.decode.kda_mtp_sglang", "pla.decode.kda_replayssm_vllm"):
     if kda_namespace not in NAMESPACES:
         continue
     kda_fp64_repair = os.environ.get("PLA_KDA_NATIVE_FP64_REPAIR", "0")
@@ -274,9 +274,9 @@ for kda_namespace in ("pla.decode.kda_mtp_sglang", "pla.decode.kda_mtp_vllm"):
                             ("kda_mtp_sglang.cpp", "kda_mtp_verify_host.cpp",
                              "kda_mtp_fold_host.cpp")]
     else:
-        native_dir = os.path.join(here, "src", "decode", "kda_mtp_vllm")
+        native_dir = os.path.join(here, "src", "decode", "kda_replayssm_vllm")
         kda_mtp_sources += [os.path.join(native_dir, name) for name in
-                            ("kda_mtp_vllm.cpp", "commit_plan.cu")]
+                            ("kda_replayssm_vllm.cpp", "commit_plan.cu")]
 
     ext_modules.append(
         Extension(

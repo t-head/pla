@@ -37,15 +37,15 @@ class FunctionalCITests(unittest.TestCase):
         self.assertFalse(any("--max-cases" in arg for case in selected for arg in case.argv))
 
     def test_vllm_replay_contract_is_registered(self):
-        case = next(case for case in cases() if case.name == "kda-mtp-vllm")
+        case = next(case for case in cases() if case.name == "kda-replayssm-vllm")
         self.assertEqual((case.phase, case.timeout, case.report), ("decode", 1800, "markers"))
-        self.assertEqual(case.argv, ("tests/test_kda_mtp_vllm.py", "--phase=functional"))
-        self.assertIn("pla/decode/kda_mtp_vllm", runner.EXTENSION_DIRS)
+        self.assertEqual(case.argv, ("tests/test_kda_replayssm_vllm.py", "--phase=functional"))
+        self.assertIn("pla/decode/kda_replayssm_vllm", runner.EXTENSION_DIRS)
 
     def test_replay_phase_inventory_preserves_strict_assessment(self):
         # Execute only case registration, without importing torch or calling a
         # test. This verifies CI selection while retaining the full assessment.
-        path = Path(__file__).resolve().parents[3] / "tests/test_kda_mtp_vllm.py"
+        path = Path(__file__).resolve().parents[3] / "tests/test_kda_replayssm_vllm.py"
         main = next(node for node in ast.parse(path.read_text()).body
                     if isinstance(node, ast.FunctionDef) and node.name == "main")
 
