@@ -12,6 +12,18 @@ import triton.language as tl
 
 exp = tl.exp
 
+# Grid dims 1 and 2 are capped at 65535 and CTAs past the cap are silently
+# dropped. Packed decode uses SGLang's flat (NV, B * HV) grid while B * HV fits
+# and keeps the (NV, HV, B) grid beyond it.
+MAX_GRID_DIM_Y = 65535
+
+
+def packed_decode_grid(NV, B, HV):
+    """Return (grid, FLAT_GRID) for the packed decode kernels."""
+    if B * HV <= MAX_GRID_DIM_Y:
+        return (NV, B * HV), True
+    return (NV, HV, B), False
+
 
 def input_guard(fn):
     """Make tensor inputs contiguous and run on the first tensor's device."""
@@ -233,8 +245,13 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     BV: tl.constexpr,
     SOFTPLUS_THRESHOLD: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+    FLAT_GRID: tl.constexpr,
 ):
-    i_v, i_hv, i_n = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    if FLAT_GRID:
+        i_v, i_nh = tl.program_id(0), tl.program_id(1)
+        i_n, i_hv = i_nh // HV, i_nh % HV
+    else:
+        i_v, i_hv, i_n = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_h = i_hv // (HV // H)
 
     o_k = tl.arange(0, BK)
@@ -394,7 +411,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     stride_indices_seq = ssm_state_indices.stride(0)
 
     NV = triton.cdiv(V, BV)
-    grid = (NV, HV, B)
+    grid, flat_grid = packed_decode_grid(NV, B, HV)
     fused_recurrent_gated_delta_rule_packed_decode_kernel[grid](
         mixed_qkv=mixed_qkv,
         a=a,
@@ -420,6 +437,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         BV=BV,
         SOFTPLUS_THRESHOLD=20.0,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+        FLAT_GRID=flat_grid,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -981,6 +999,7 @@ def fused_recurrent_kda_packed_decode_kernel(
     ht,
     ssm_state_indices,
     scale,
+    lower_bound,
     stride_mixed_qkv_tok: tl.constexpr,
     stride_a_tok: tl.constexpr,
     stride_b_tok: tl.constexpr,
@@ -995,8 +1014,14 @@ def fused_recurrent_kda_packed_decode_kernel(
     BV: tl.constexpr,
     SOFTPLUS_THRESHOLD: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+    USE_LOWER_BOUND: tl.constexpr,
+    FLAT_GRID: tl.constexpr,
 ):
-    i_v, i_hv, i_n = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    if FLAT_GRID:
+        i_v, i_nh = tl.program_id(0), tl.program_id(1)
+        i_n, i_hv = i_nh // HV, i_nh % HV
+    else:
+        i_v, i_hv, i_n = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_h = i_hv // (HV // H)
 
     o_k = tl.arange(0, BK)
@@ -1037,8 +1062,13 @@ def fused_recurrent_kda_packed_decode_kernel(
     A_log_val = tl.load(A_log + i_hv).to(tl.float32)
 
     x = b_a + b_dt
-    softplus_x = tl.where(x <= SOFTPLUS_THRESHOLD, tl.log(1.0 + tl.exp(x)), x)
-    b_g = -tl.exp(A_log_val) * softplus_x
+    if USE_LOWER_BOUND:
+        # KDA safe gate: lower_bound * sigmoid(exp(A_log) * (g + bias)),
+        # matching the chunked prefill kernel (kda.py) and FLA reference.
+        b_g = lower_bound * tl.sigmoid(tl.exp(A_log_val) * x)
+    else:
+        softplus_x = tl.where(x <= SOFTPLUS_THRESHOLD, tl.log(1.0 + tl.exp(x)), x)
+        b_g = -tl.exp(A_log_val) * softplus_x
 
     b_val = tl.load(b + i_n * stride_b_tok + i_hv).to(tl.float32)
     beta_val = tl.sigmoid(b_val).to(tl.float32)
@@ -1066,6 +1096,7 @@ def fused_recurrent_kda_packed_decode(
     out: torch.Tensor,
     ssm_state_indices: torch.Tensor,
     use_qk_l2norm_in_kernel: bool = False,
+    lower_bound: Optional[float] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     B = mixed_qkv.shape[0]
     HV, V, K = initial_state.shape[-3:]
@@ -1085,7 +1116,7 @@ def fused_recurrent_kda_packed_decode(
     stride_indices_seq = ssm_state_indices.stride(0)
 
     NV = triton.cdiv(V, BV)
-    grid = (NV, HV, B)
+    grid, flat_grid = packed_decode_grid(NV, B, HV)
     fused_recurrent_kda_packed_decode_kernel[grid](
         mixed_qkv=mixed_qkv,
         a=a,
@@ -1097,6 +1128,7 @@ def fused_recurrent_kda_packed_decode(
         ht=initial_state,
         ssm_state_indices=ssm_state_indices,
         scale=scale,
+        lower_bound=lower_bound if lower_bound is not None else 0.0,
         stride_mixed_qkv_tok=stride_mixed_qkv_tok,
         stride_a_tok=stride_a_tok,
         stride_b_tok=stride_b_tok,
@@ -1111,6 +1143,8 @@ def fused_recurrent_kda_packed_decode(
         BV=BV,
         SOFTPLUS_THRESHOLD=20.0,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+        USE_LOWER_BOUND=lower_bound is not None,
+        FLAT_GRID=flat_grid,
         num_warps=1,
         num_stages=3,
     )

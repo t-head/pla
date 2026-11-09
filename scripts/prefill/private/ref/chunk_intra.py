@@ -12,7 +12,7 @@ from .chunk_intra_token_parallel import (
 from .index import (
     prepare_chunk_indices,
 )
-from .op import exp, gather
+from .op import exp2, gather
 from .utils import (
     autotune_cache_kwargs,
     is_gather_supported,
@@ -167,9 +167,9 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
             )
             b_q0 = tl.load(p_q0, boundary_check=(0, 1)).to(tl.float32)
             b_gn0 = tl.load(g + i_tc0 * H * K + o_k, mask=m_k, other=0).to(tl.float32)
-            b_gm0 = tl.clamp(b_g0 - b_gn0[None, :], -85.0, 85.0)
-            b_gq0 = tl.where(m_tc0[:, None], exp(b_gm0), 0.0)
-            b_gk0 = tl.where(m_tc0[:, None], exp(-b_gm0), 0.0)
+            b_gm0 = tl.clamp(b_g0 - b_gn0[None, :], -126.0, 126.0)
+            b_gq0 = tl.where(m_tc0[:, None], exp2(b_gm0), 0.0)
+            b_gk0 = tl.where(m_tc0[:, None], exp2(-b_gm0), 0.0)
             b_kgt_d0 = tl.trans(b_k0 * b_gk0)
             b_Aqk_d0 += tl.dot(b_q0 * b_gq0, b_kgt_d0)
             b_Akk_d0 += tl.dot(b_k0 * b_gq0, b_kgt_d0)
@@ -191,9 +191,9 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
             # [BK]
             b_gn1 = tl.load(g + i_tc1 * H * K + o_k, mask=m_k, other=0).to(tl.float32)
             # [BC, BK]
-            b_gqn = tl.where(m_tc1[:, None], exp(b_g1 - b_gn1[None, :]), 0)
+            b_gqn = tl.where(m_tc1[:, None], exp2(b_g1 - b_gn1[None, :]), 0)
             # [BK, BC]
-            b_kgt = tl.trans(b_k0 * exp(b_gn1[None, :] - b_g0)).to(tl.bfloat16)
+            b_kgt = tl.trans(b_k0 * exp2(b_gn1[None, :] - b_g0)).to(tl.bfloat16)
             # [BC, BC]
             b_qg1 = (b_q1 * b_gqn).to(tl.bfloat16)
             b_kg1 = (b_k1 * b_gqn).to(tl.bfloat16)
@@ -201,8 +201,8 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
             b_Akk10 += tl.dot(b_kg1, b_kgt)
 
             if FUSE_DIAGONAL:
-                b_gm1_d = tl.clamp(b_gn1[None, :] - b_g1, -85.0, 85.0)
-                b_gk1_d = tl.where(m_tc1[:, None], exp(b_gm1_d), 0.0)
+                b_gm1_d = tl.clamp(b_gn1[None, :] - b_g1, -126.0, 126.0)
+                b_gk1_d = tl.where(m_tc1[:, None], exp2(b_gm1_d), 0.0)
                 b_kgt_d1 = tl.trans(b_k1 * b_gk1_d)
                 b_Aqk_d1 += tl.dot(b_q1 * b_gqn, b_kgt_d1)
                 b_Akk_d1 += tl.dot(b_k1 * b_gqn, b_kgt_d1)
@@ -226,22 +226,22 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
                     tl.float32
                 )
                 # [BC, BK]
-                b_gqn2 = tl.where(m_tc2[:, None], exp(b_g2 - b_gn2[None, :]), 0)
+                b_gqn2 = tl.where(m_tc2[:, None], exp2(b_g2 - b_gn2[None, :]), 0)
                 b_qg2 = (b_q2 * b_gqn2).to(tl.bfloat16)
                 b_kg2 = (b_k2 * b_gqn2).to(tl.bfloat16)
                 # [BK, BC]
-                b_kgt = tl.trans(b_k0 * exp(b_gn2[None, :] - b_g0)).to(tl.bfloat16)
+                b_kgt = tl.trans(b_k0 * exp2(b_gn2[None, :] - b_g0)).to(tl.bfloat16)
                 b_Aqk20 += tl.dot(b_qg2, b_kgt)
                 b_Akk20 += tl.dot(b_kg2, b_kgt)
                 # [BC, BC]
-                b_kgt = tl.trans(b_k1 * exp(b_gn2[None, :] - b_g1)).to(tl.bfloat16)
+                b_kgt = tl.trans(b_k1 * exp2(b_gn2[None, :] - b_g1)).to(tl.bfloat16)
                 # [BC, BC]
                 b_Aqk21 += tl.dot(b_qg2, b_kgt)
                 b_Akk21 += tl.dot(b_kg2, b_kgt)
 
                 if FUSE_DIAGONAL:
-                    b_gm2_d = tl.clamp(b_gn2[None, :] - b_g2, -85.0, 85.0)
-                    b_gk2_d = tl.where(m_tc2[:, None], exp(b_gm2_d), 0.0)
+                    b_gm2_d = tl.clamp(b_gn2[None, :] - b_g2, -126.0, 126.0)
+                    b_gk2_d = tl.where(m_tc2[:, None], exp2(b_gm2_d), 0.0)
                     b_kgt_d2 = tl.trans(b_k2 * b_gk2_d)
                     b_Aqk_d2 += tl.dot(b_q2 * b_gqn2, b_kgt_d2)
                     b_Akk_d2 += tl.dot(b_k2 * b_gqn2, b_kgt_d2)
@@ -265,28 +265,28 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
                         tl.float32
                     )
                     # [BC, BK]
-                    b_gqn3 = tl.where(m_tc3[:, None], exp(b_g3 - b_gn3[None, :]), 0)
+                    b_gqn3 = tl.where(m_tc3[:, None], exp2(b_g3 - b_gn3[None, :]), 0)
                     b_qg3 = (b_q3 * b_gqn3).to(tl.bfloat16)
                     b_kg3 = (b_k3 * b_gqn3).to(tl.bfloat16)
                     # [BK, BC]
-                    b_kgt = tl.trans(b_k0 * exp(b_gn3[None, :] - b_g0)).to(tl.bfloat16)
+                    b_kgt = tl.trans(b_k0 * exp2(b_gn3[None, :] - b_g0)).to(tl.bfloat16)
                     # [BC, BC]
                     b_Aqk30 += tl.dot(b_qg3, b_kgt)
                     b_Akk30 += tl.dot(b_kg3, b_kgt)
                     # [BK, BC]
-                    b_kgt = tl.trans(b_k1 * exp(b_gn3[None, :] - b_g1)).to(tl.bfloat16)
+                    b_kgt = tl.trans(b_k1 * exp2(b_gn3[None, :] - b_g1)).to(tl.bfloat16)
                     # [BC, BC]
                     b_Aqk31 += tl.dot(b_qg3, b_kgt)
                     b_Akk31 += tl.dot(b_kg3, b_kgt)
                     # [BK, BC]
-                    b_kgt = tl.trans(b_k2 * exp(b_gn3[None, :] - b_g2)).to(tl.bfloat16)
+                    b_kgt = tl.trans(b_k2 * exp2(b_gn3[None, :] - b_g2)).to(tl.bfloat16)
                     # [BC, BC]
                     b_Aqk32 += tl.dot(b_qg3, b_kgt)
                     b_Akk32 += tl.dot(b_kg3, b_kgt)
 
                     if FUSE_DIAGONAL:
-                        b_gm3_d = tl.clamp(b_gn3[None, :] - b_g3, -85.0, 85.0)
-                        b_gk3_d = tl.where(m_tc3[:, None], exp(b_gm3_d), 0.0)
+                        b_gm3_d = tl.clamp(b_gn3[None, :] - b_g3, -126.0, 126.0)
+                        b_gk3_d = tl.where(m_tc3[:, None], exp2(b_gm3_d), 0.0)
                         b_kgt_d3 = tl.trans(b_k3 * b_gk3_d)
                         b_Aqk_d3 += tl.dot(b_q3 * b_gqn3, b_kgt_d3)
                         b_Akk_d3 += tl.dot(b_k3 * b_gqn3, b_kgt_d3)
@@ -633,7 +633,7 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
             tl.store(p_u2, b_u2.to(p_u2.dtype.element_ty), boundary_check=(0, 1))
             tl.store(p_u3, b_u3.to(p_u3.dtype.element_ty), boundary_check=(0, 1))
 
-        # ---- w = A_inv @ (k * beta * exp(gk)), kg = k * exp(gn - gk) ----
+        # ---- w = A_inv @ (k * beta * exp2(gk)), kg = k * exp2(gn - gk) ----
         w_base = w_out + (bos * H + i_h) * K
         kg_base = kg_out + (bos * H + i_h) * K
         last_idx = min(i_t * BT + BT, T) - 1
@@ -681,10 +681,10 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
             b_gk2r = tl.load(p_gk2, boundary_check=(0, 1)).to(tl.float32)
             b_gk3r = tl.load(p_gk3, boundary_check=(0, 1)).to(tl.float32)
 
-            b_kb0 = (b_k0r * b_b0[:, None] * exp(b_gk0r)).to(b_k0r.dtype)
-            b_kb1 = (b_k1r * b_b1r[:, None] * exp(b_gk1r)).to(b_k1r.dtype)
-            b_kb2 = (b_k2r * b_b2r[:, None] * exp(b_gk2r)).to(b_k2r.dtype)
-            b_kb3 = (b_k3r * b_b3r[:, None] * exp(b_gk3r)).to(b_k3r.dtype)
+            b_kb0 = (b_k0r * b_b0[:, None] * exp2(b_gk0r)).to(b_k0r.dtype)
+            b_kb1 = (b_k1r * b_b1r[:, None] * exp2(b_gk1r)).to(b_k1r.dtype)
+            b_kb2 = (b_k2r * b_b2r[:, None] * exp2(b_gk2r)).to(b_k2r.dtype)
+            b_kb3 = (b_k3r * b_b3r[:, None] * exp2(b_gk3r)).to(b_k3r.dtype)
 
             b_w0 = tl.dot(b_Ai00_h, b_kb0)
             b_w1 = tl.dot(b_Ai10_h, b_kb0) + tl.dot(b_Ai11_h, b_kb1)
@@ -717,10 +717,10 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
             tl.store(p_w2, b_w2.to(p_w2.dtype.element_ty), boundary_check=(0, 1))
             tl.store(p_w3, b_w3.to(p_w3.dtype.element_ty), boundary_check=(0, 1))
 
-            b_kg0 = b_k0r * exp(b_gn[None, :] - b_gk0r)
-            b_kg1 = b_k1r * exp(b_gn[None, :] - b_gk1r)
-            b_kg2 = b_k2r * exp(b_gn[None, :] - b_gk2r)
-            b_kg3 = b_k3r * exp(b_gn[None, :] - b_gk3r)
+            b_kg0 = b_k0r * exp2(b_gn[None, :] - b_gk0r)
+            b_kg1 = b_k1r * exp2(b_gn[None, :] - b_gk1r)
+            b_kg2 = b_k2r * exp2(b_gn[None, :] - b_gk2r)
+            b_kg3 = b_k3r * exp2(b_gn[None, :] - b_gk3r)
 
             p_kg0 = tl.make_block_ptr(
                 kg_base, (T, K), (H * K, 1), (i_tc0, i_k * BK), (BC, BK), (1, 0)
@@ -866,11 +866,11 @@ def chunk_kda_fwd_kernel_intra_sub_chunk(
         b_gn = b_gn[None, :]
 
     # current block, keep numerical stability by subtracting the left boundary
-    # Natural-log gates require exp; keep magnitudes below 85 to avoid overflow.
+    # less than 85 to avoid overflow in exp2
     b_gm = (b_g - b_gn).to(tl.float32)
 
-    b_gq = tl.where(m_c[:, None], exp(b_gm), 0.0)
-    b_gk = tl.where(m_c[:, None], exp(-b_gm), 0.0)
+    b_gq = tl.where(m_c[:, None], exp2(b_gm), 0.0)
+    b_gk = tl.where(m_c[:, None], exp2(-b_gm), 0.0)
 
     b_kgt = tl.trans(b_k * b_gk)
 
@@ -919,7 +919,6 @@ def chunk_kda_fwd_intra(
     chunk_size: int = 64,
     chunk_indices: torch.LongTensor | None = None,
     safe_gate: bool = False,
-    disable_recompute: bool = False,
     fuse_recompute: bool = False,
     fuse_diagonal: bool = False,
 ):
@@ -1043,14 +1042,13 @@ def chunk_kda_fwd_intra(
         recompute_w_u_fwd as kda_recompute_w_u_fwd,
     )
 
-    w, u, qg, kg = kda_recompute_w_u_fwd(
+    w, u, kg = kda_recompute_w_u_fwd(
         k=k,
         v=v,
         beta=beta,
         A=Akk,
-        q=q if disable_recompute else None,
         gk=gk,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
     )
-    return w, u, qg, kg, Aqk, Akk
+    return w, u, None, kg, Aqk, Akk
