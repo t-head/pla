@@ -54,6 +54,7 @@
 #include <hggc_runtime.h>
 
 #include <cstdint>
+#include <cmath>
 #include <utility>
 
 #include "kda_mtp_abi.h"
@@ -83,10 +84,26 @@ __device__ __forceinline__ float ppu_sigmoid(float x) {
 }
 __device__ __forceinline__ float ppu_silu(float x) { return x * ppu_sigmoid(x); }
 
+// A finite A_log may overflow expf. The mathematical product is still zero
+// when the gate sum is zero; avoid forming inf * 0 before the sigmoid.
+__device__ __forceinline__ float gate_product(float exp_a, float gate_sum) {
+  return gate_sum == 0.f ? 0.f : exp_a * gate_sum;
+}
+
 constexpr int DIM = 128;
 constexpr int CONV_W = 4;
 constexpr int CONV_WIN = CONV_W - 1;
 constexpr float L2_EPS = 1e-6f;
+
+// Empirical FP32 conditioning guard, qualified by directed cancellation and
+// checkpoint-derived replay. A large beta alone is not evidence of loss of
+// precision: require the computed residual to be small relative to the terms
+// that formed it. This is not a proof for all unrestricted finite inputs.
+__device__ __forceinline__ bool precision_risk(float residual, float terms) {
+  constexpr float max_finite = 0x1.fffffep127f;
+  return !(residual <= max_finite && terms <= max_finite) ||
+         (terms > 0.f && residual <= 1e-2f * terms);
+}
 
 #ifndef KDA_V_THREADS
 #define KDA_V_THREADS 256
@@ -137,6 +154,12 @@ __device__ __forceinline__ float bfly_add(float x, int width) {
   return x;
 }
 
+__device__ __forceinline__ float bfly_max(float x, int width) {
+  for (int off = width >> 1; off >= 1; off >>= 1)
+    x = fmaxf(x, __shfl_xor_sync(0xffffffffu, x, off, 32));
+  return x;
+}
+
 struct Smem {
   float q[DIM];
   float k[DIM];
@@ -158,7 +181,7 @@ using pla::kda_mtp::ConvStrides;
 using pla::kda_mtp::WindowStrides;
 using pla::kda_mtp::VerifyStrides;
 
-template <int VS>
+template <int VS, bool NATIVE = false>
 __global__ __launch_bounds__(THREADS) void verify_kernel(
     const BF16* __restrict__ x_q, const BF16* __restrict__ x_k,
     const BF16* __restrict__ x_v, const BF16* __restrict__ g_in,
@@ -173,7 +196,9 @@ __global__ __launch_bounds__(THREADS) void verify_kernel(
     float* __restrict__ ring_g, float* __restrict__ ring_beta,
     IndexArg slot_idx, IndexArg scratch_idx,
     IndexArg cu_seqlens, int H, int T_LOOP, int L, float scale,
-    float lower_bound, VerifyStrides strides) {
+    float lower_bound, VerifyStrides strides,
+    pla::kda_mtp::NativeVerify native = {}) {
+  constexpr bool PROTECT = NATIVE && pla::kda_mtp::kNativeNumericalProtection;
   const int i_hv = blockIdx.x;
   const int i_n = blockIdx.y;
   const int i_vs = blockIdx.z;              // v-split index (0..VS-1)
@@ -181,17 +206,35 @@ __global__ __launch_bounds__(THREADS) void verify_kernel(
   constexpr int PASSES_PB = VPASSES / VS;   // value-row passes per block
   static_assert(VPASSES % VS == 0, "VS must divide VPASSES");
   const int tid = threadIdx.x;
+  if constexpr (PROTECT) {
+    static_assert(VS == 1, "native conditioning owns all four value tiles");
+    if (native.precision_flags && tid < 4)
+      native.precision_flags[((long)i_n * H + i_hv) * 4 + tid] = 0;
+  }
 
-  const int bos = index_at(cu_seqlens, i_n);
-  const int n_tok = index_at(cu_seqlens, i_n + 1) - bos;
-  const int slot = index_at(slot_idx, i_n);
-  const int srow = index_at(scratch_idx, i_n);  // issued with the others
+  auto read_index = [](IndexArg arg, int n) -> int64_t {
+    if constexpr (NATIVE)
+      return arg.wide ? static_cast<const int64_t*>(arg.data)[n * arg.stride] :
+                        static_cast<const int*>(arg.data)[n * arg.stride];
+    return index_at(arg, n);
+  };
+  const int64_t begin = read_index(cu_seqlens, i_n);
+  const int64_t end = read_index(cu_seqlens, i_n + 1);
+  const int64_t state_slot = read_index(slot_idx, i_n);
+  if constexpr (NATIVE) {
+    if (read_index(cu_seqlens, 0) != 0 || begin < 0 || end < begin ||
+        end > native.tokens || end - begin > T_LOOP ||
+        state_slot >= native.slots || begin == end) return;
+  }
+  const int bos = begin, n_tok = end - begin, slot = state_slot;
+  const int srow = NATIVE ? i_n : index_at(scratch_idx, i_n);
+  const int ring_row = NATIVE ? i_n : slot;
   const long head_off = (long)i_hv * DIM;
 
   // CUDA-graph padding rows: zero the output, touch no cache.
-  if (slot < 0) {
+  if (NATIVE ? state_slot <= native.null_block_id : slot < 0) {
     if (ring_writer)
-      for (int t = 0; t < T_LOOP; ++t)
+      for (int t = 0; t < (NATIVE ? n_tok : T_LOOP); ++t)
         for (int j = tid; j < DIM; j += THREADS)
           out[(long)(bos + t) * H * DIM + head_off + j] = __float2bfloat16(0.f);
     return;
@@ -199,6 +242,8 @@ __global__ __launch_bounds__(THREADS) void verify_kernel(
 
   extern __shared__ char smem_raw[];
   Smem& sh = *reinterpret_cast<Smem*>(smem_raw);
+  // Used only by the native instantiation. Each warp covers 32/KGRPS rows.
+  __shared__ float condition[PROTECT ? 4 : 1][PROTECT ? 4 : 1][PROTECT ? KGRPS : 1];
 
   const int v_local = tid / KGRPS;
   const int k_grp = tid % KGRPS;
@@ -229,7 +274,8 @@ __global__ __launch_bounds__(THREADS) void verify_kernel(
   for (int p = 0; p < PASSES_PB; ++p) {
     const int v = v_local + (i_vs * PASSES_PB + p) * VROWS;
     const float4* g4 = reinterpret_cast<const float4*>(
-        h0 + ((long)slot * H + i_hv) * DIM * DIM + (long)v * DIM);
+        h0 + (NATIVE ? (long)slot * native.state_slot_stride + (long)i_hv * DIM * DIM :
+                       ((long)slot * H + i_hv) * DIM * DIM) + (long)v * DIM);
 #pragma unroll
     for (int i = 0; i < F4_PER_THREAD; ++i) st[p][i] = g4[k_grp + KGRPS * i];
   }
@@ -237,10 +283,10 @@ __global__ __launch_bounds__(THREADS) void verify_kernel(
   const float exp_A = __expf(A_log[i_hv]);
   __syncthreads();
 
-  for (int t = 0; t < T_LOOP; ++t) {
+  for (int t = 0; t < (NATIVE ? n_tok : T_LOOP); ++t) {
     // the DSL clamps the token index so a short request re-reads its last token
     const int tok = bos + (t < n_tok ? t : n_tok - 1);
-    const long ro_base = ((long)slot * H + i_hv) * (long)L * DIM + (long)t * DIM;
+    const long ro_base = ((long)ring_row * H + i_hv) * (long)L * DIM + (long)t * DIM;
 
     for (int j = tid; j < DIM; j += THREADS) {
       const float xq = __bfloat162float(x_q[tok * strides.x_q + head_off + j]);
@@ -261,9 +307,9 @@ __global__ __launch_bounds__(THREADS) void verify_kernel(
       cv = ppu_silu(cv);
 
       const float gk = lower_bound *
-                       ppu_sigmoid(exp_A * (__bfloat162float(g_in[
+                       ppu_sigmoid(gate_product(exp_A, (__bfloat162float(g_in[
                                               tok * strides.g + head_off + j]) +
-                                              dt_bias[head_off + j]));
+                                              dt_bias[head_off + j])));
       if (ring_writer) {
         ring_rawk[ro_base + j] = __float2bfloat16(ck);
         ring_rawv[ro_base + j] = __float2bfloat16(cv);
@@ -298,7 +344,7 @@ __global__ __launch_bounds__(THREADS) void verify_kernel(
     if (tid == 0) {
       sh.beta = ppu_sigmoid(__bfloat162float(beta_in[tok * strides.beta + i_hv]));
       if (ring_writer)
-        ring_beta[((long)slot * H + i_hv) * (long)L + t] = sh.beta;
+        ring_beta[((long)ring_row * H + i_hv) * (long)L + t] = sh.beta;
     }
     __syncthreads();  // phase 1 done writing sh.q/k/v/decay
 
@@ -398,14 +444,30 @@ __global__ __launch_bounds__(THREADS) void verify_kernel(
       const float vnk = vn * kfold;         // rank-1: st += vn * (kfold*k)
 
       float shq = 0.f;
+      float state_residual = 0.f, state_terms = 0.f, projection_terms = 0.f;
 #pragma unroll
       for (int i = 0; i < F4_PER_THREAD; ++i) {
         const int f4 = k_grp + KGRPS * i;
         const float4 kk = sk4[f4], qq = sq4[f4];
+        if constexpr (PROTECT) {
+          if (native.precision_flags)
+            state_terms += fabsf(st[p][i].x) + fabsf(st[p][i].y) +
+                           fabsf(st[p][i].z) + fabsf(st[p][i].w) +
+                           fabsf(vnk * kk.x) + fabsf(vnk * kk.y) +
+                           fabsf(vnk * kk.z) + fabsf(vnk * kk.w);
+        }
         st[p][i].x = fmaf(vnk, kk.x, st[p][i].x);
         st[p][i].y = fmaf(vnk, kk.y, st[p][i].y);
         st[p][i].z = fmaf(vnk, kk.z, st[p][i].z);
         st[p][i].w = fmaf(vnk, kk.w, st[p][i].w);
+        if constexpr (PROTECT) {
+          if (native.precision_flags) {
+            state_residual += fabsf(st[p][i].x) + fabsf(st[p][i].y) +
+                              fabsf(st[p][i].z) + fabsf(st[p][i].w);
+            projection_terms += fabsf(st[p][i].x * qq.x) + fabsf(st[p][i].y * qq.y) +
+                                fabsf(st[p][i].z * qq.z) + fabsf(st[p][i].w * qq.w);
+          }
+        }
         if constexpr (VS < 2) {
           shq = fmaf(st[p][i].w, qq.w,
                      fmaf(st[p][i].z, qq.z,
@@ -417,10 +479,41 @@ __global__ __launch_bounds__(THREADS) void verify_kernel(
         }
       }
       shq = bfly_add(shq, KGRPS) * qfold;   // qfold = nq (VS>=2) or 1
+      if constexpr (PROTECT) {
+        if (native.precision_flags) {
+          const float sr = bfly_add(state_residual, 32);
+          const float sb = bfly_add(state_terms, 32);
+          const float qr = bfly_add(k_grp == 0 ? fabsf(shq) : 0.f, 32);
+          const float qb = bfly_add(projection_terms, 32) * fabsf(qfold);
+          if (lane == 0) {
+            const int first_value = p * VROWS + wid * (32 / KGRPS);
+            const int tile = first_value / 32;
+            const int part = (first_value % 32) / (32 / KGRPS);
+            condition[0][tile][part] = sr;
+            condition[1][tile][part] = sb;
+            condition[2][tile][part] = qr;
+            condition[3][tile][part] = qb;
+          }
+        }
+      }
       if (k_grp == 0 && t < n_tok)
         out[(long)(bos + t) * H * DIM + head_off + v] = __float2bfloat16(shq);
     }
     __syncthreads();
+    if constexpr (PROTECT) {
+      if (native.precision_flags && tid < 4) {
+        float sr = 0.f, sb = 0.f, qr = 0.f, qb = 0.f;
+#pragma unroll
+        for (int part = 0; part < KGRPS; ++part) {
+          sr += condition[0][tid][part];
+          sb += condition[1][tid][part];
+          qr += condition[2][tid][part];
+          qb += condition[3][tid][part];
+        }
+        if (precision_risk(sr, sb) || precision_risk(qr, qb))
+          native.precision_flags[((long)i_n * H + i_hv) * 4 + tid] = 1;
+      }
+    }
   }
   // recurrent_state is read-only for verify: nothing is written back
 }
@@ -509,7 +602,7 @@ struct VerifySteps {
   }
 };
 
-template <int STEPS, int VS, bool EAGER>
+template <int STEPS, int VS, bool EAGER, bool NATIVE = false>
 __global__ __launch_bounds__(128) void verify_steps_kernel(
     const BF16* __restrict__ x_q, const BF16* __restrict__ x_k,
     const BF16* __restrict__ x_v, const BF16* __restrict__ g_in,
@@ -523,8 +616,11 @@ __global__ __launch_bounds__(128) void verify_steps_kernel(
     float* __restrict__ ring_g, float* __restrict__ ring_beta,
     IndexArg slot_idx, IndexArg scratch_idx, IndexArg cu, int H, int L,
     float scale, float lower_bound, VerifyStrides strides,
-    const float* __restrict__ h0) {
+    const float* __restrict__ h0, pla::kda_mtp::NativeVerify native = {}) {
+  constexpr bool PROTECT = NATIVE && pla::kda_mtp::kNativeNumericalProtection;
   using Layout = VerifySteps<STEPS>;
+  static_assert(!PROTECT || Layout::SUMS >= 4 * STEPS + 1,
+                "native final conditioning must fit the shared reduction table");
   constexpr int WARPS = 128 / 32;
   constexpr int ROWS = DIM / VS;  // value rows projected by this CTA
   constexpr int GROUPS = 8;       // threads per state row
@@ -546,9 +642,37 @@ __global__ __launch_bounds__(128) void verify_steps_kernel(
   const int row0 = VS == 1 ? 0 : static_cast<int>(blockIdx.z) * ROWS;
   const bool writer = VS == 1 || blockIdx.z == 0;
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-  const int slot = index_at(slot_idx, n), bos = index_at(cu, n);
-  const int n_tok = index_at(cu, n + 1) - bos;
-  const int srow = index_at(scratch_idx, n);  // issued with the others
+  if constexpr (PROTECT) {
+    static_assert(VS == 1, "native conditioning owns all four value tiles");
+    static_assert(Layout::SUMS >= 4 * STEPS, "native conditioning scratch capacity");
+  }
+  int slot, bos, n_tok, srow;
+  if constexpr (NATIVE) {
+    auto read_index = [](IndexArg arg, int i) -> int64_t {
+      return arg.wide ? static_cast<const int64_t*>(arg.data)[i * arg.stride] :
+                        static_cast<const int*>(arg.data)[i * arg.stride];
+    };
+    const int64_t begin = read_index(cu, n), end = read_index(cu, n + 1);
+    const int64_t source = read_index(slot_idx, n);
+    if (read_index(cu, 0) != 0 || begin < 0 || end < begin ||
+        end > native.tokens || end - begin > STEPS || begin == end ||
+        source >= native.slots) {
+      if constexpr (PROTECT) {
+        if (native.precision_flags && tid < 4)
+          native.precision_flags[((long)n * H + h) * 4 + tid] = 0;
+      }
+      return;
+    }
+    bos = static_cast<int>(begin);
+    n_tok = static_cast<int>(end - begin);
+    slot = source <= native.null_block_id ? -1 : static_cast<int>(source);
+    srow = n;
+  } else {
+    slot = index_at(slot_idx, n);
+    bos = index_at(cu, n);
+    n_tok = index_at(cu, n + 1) - bos;
+    srow = index_at(scratch_idx, n);
+  }
   // The per-channel weights do not depend on the indices: issue them now so
   // they overlap the index misses instead of joining the slot-dependent loads.
   const int channel = tid;
@@ -559,14 +683,19 @@ __global__ __launch_bounds__(128) void verify_steps_kernel(
   const float a_h = a_log[h];
   const float bias = dt_bias[ch];
   if (slot < 0) {
-    for (int i = tid; i < STEPS * ROWS; i += 128)
+    if constexpr (PROTECT) {
+      if (native.precision_flags && tid < 4)
+        native.precision_flags[((long)n * H + h) * 4 + tid] = 0;
+    }
+    for (int i = tid; i < (NATIVE ? n_tok : STEPS) * ROWS; i += 128)
       out[(long)(bos + i / ROWS) * H * DIM + h * DIM + row0 + i % ROWS] =
           __float2bfloat16(0.f);
     return;
   }
   const int kg = tid % GROUPS, rlocal = tid / GROUPS;
+  const long state_stride = NATIVE ? native.state_slot_stride : (long)H * DIM * DIM;
   const float4* state = reinterpret_cast<const float4*>(
-      h0 + (((long)slot * H + h) * DIM + row0) * DIM);
+      h0 + (long)slot * state_stride + ((long)h * DIM + row0) * DIM);
   float4 early[EARLY > 0 ? EARLY : 1][VECTORS];
 #pragma unroll
   for (int p = 0; p < EARLY; ++p)
@@ -578,6 +707,8 @@ __global__ __launch_bounds__(128) void verify_steps_kernel(
   __shared__ float total[Layout::TOTAL];
   __shared__ __align__(16) float result[2 * STEPS][DIM];
   __shared__ float stage[STEPS][ROWS];
+  __shared__ float query_terms[PROTECT ? STEPS : 1][PROTECT ? DIM : 1];
+  __shared__ float state_max[PROTECT ? ROWS : 1];
   float q[STEPS], k[STEPS], d[STEPS], v[STEPS];
   {
     float cq[3], ck[3], cv[3];
@@ -593,6 +724,14 @@ __global__ __launch_bounds__(128) void verify_steps_kernel(
     const float exp_a = __expf(a_h);
 #pragma unroll
     for (int step = 0; step < STEPS; ++step) {
+      if constexpr (NATIVE) {
+        if (step >= n_tok) {
+          q[step] = k[step] = v[step] = 0.f;
+          d[step] = 1.f;
+          if (channel == 0) total[Layout::BETA_OFF + step] = 0.f;
+          continue;
+        }
+      }
       const int tok = bos + (step < n_tok ? step : n_tok - 1);
       const float xq = __bfloat162float(x_q[tok * strides.x_q + ch]);
       const float xk = __bfloat162float(x_k[tok * strides.x_k + ch]);
@@ -606,7 +745,7 @@ __global__ __launch_bounds__(128) void verify_steps_kernel(
       q[step] = ppu_silu(cq_t);
       k[step] = ppu_silu(ck_t);
       v[step] = ppu_silu(cv_t);
-      const float g = lower_bound * ppu_sigmoid(exp_a * (gate_input + bias));
+      const float g = lower_bound * ppu_sigmoid(gate_product(exp_a, gate_input + bias));
       d[step] = __expf(g);
       cq[0] = cq[1]; cq[1] = cq[2]; cq[2] = xq;
       ck[0] = ck[1]; ck[1] = ck[2]; ck[2] = xk;
@@ -614,7 +753,7 @@ __global__ __launch_bounds__(128) void verify_steps_kernel(
       const float b = ppu_sigmoid(beta_input);
       if (channel == 0) total[Layout::BETA_OFF + step] = b;
       if (writer) {
-        const long ri = ((long)slot * H + h) * L * DIM + step * DIM + channel;
+        const long ri = ((long)(NATIVE ? n : slot) * H + h) * L * DIM + step * DIM + channel;
         rawk[ri] = __float2bfloat16(k[step]);
         rawv[ri] = __float2bfloat16(v[step]);
         ring_g[ri] = g;
@@ -630,7 +769,7 @@ __global__ __launch_bounds__(128) void verify_steps_kernel(
               ch * strides.ic_v.channel + j * strides.ic_v.window] =
               __float2bfloat16(cv[j]);
         }
-        if (channel == 0) ring_beta[((long)slot * H + h) * L + step] = b;
+        if (channel == 0) ring_beta[((long)(NATIVE ? n : slot) * H + h) * L + step] = b;
       }
     }
   }
@@ -703,15 +842,30 @@ __global__ __launch_bounds__(128) void verify_steps_kernel(
       update_k[step] = b * uk;
       update_v[step] = b * uv;
       float pq = cum * q[step] * total[step];
-      float pv = 0.f;
+      float pq_terms = fabsf(pq);
+      float pv = 0.f, pv_terms = 0.f;
 #pragma unroll
       for (int prev = 0; prev <= step; ++prev) {
         const float c = total[Layout::kq(step, prev)];
+        if constexpr (PROTECT) {
+          if (native.precision_flags) {
+            pq_terms += fabsf(c * update_k[prev]);
+            pv_terms += fabsf(c * update_v[prev]);
+          }
+        }
         pq = fmaf(-c, update_k[prev], pq);
         pv = fmaf(c, update_v[prev], pv);
       }
       result[step][channel] = pq;
       result[STEPS + step][channel] = pv;
+      if constexpr (PROTECT) {
+        // Stage is not needed for output until projection. Reuse it to carry
+        // the absolute value-update terms without another shared allocation.
+        if (native.precision_flags) {
+          stage[step][channel] = pv_terms;
+          query_terms[step][channel] = pq_terms;
+        }
+      }
     }
   }
   __syncthreads();
@@ -721,11 +875,27 @@ __global__ __launch_bounds__(128) void verify_steps_kernel(
 #pragma unroll
     for (int pair = 0; pair < PREFETCH; ++pair) {
       const int p = pass + pair;
+      float magnitude = 0.f;
 #pragma unroll
-      for (int i = 0; i < VECTORS; ++i)
+      for (int i = 0; i < VECTORS; ++i) {
         loaded[pair][i] = p < EARLY
             ? early[p < EARLY ? p : 0][i]
             : state[(rlocal + p * PASS_ROWS) * (DIM / 4) + kg + GROUPS * i];
+        if constexpr (PROTECT) {
+          if (native.precision_flags) {
+            const float4 s = loaded[pair][i];
+            magnitude = fmaxf(magnitude,
+                fmaxf(fmaxf(fabsf(s.x), fabsf(s.y)),
+                      fmaxf(fabsf(s.z), fabsf(s.w))));
+          }
+        }
+      }
+      if constexpr (PROTECT) {
+        if (native.precision_flags) {
+          magnitude = bfly_max(magnitude, GROUPS);
+          if (kg == 0) state_max[rlocal + p * PASS_ROWS] = magnitude;
+        }
+      }
     }
     float dot[PREFETCH][STEPS] = {};
 #pragma unroll
@@ -746,16 +916,267 @@ __global__ __launch_bounds__(128) void verify_steps_kernel(
     for (int pair = 0; pair < PREFETCH; ++pair) {
       const int row = rlocal + (pass + pair) * PASS_ROWS;
       group_sums<STEPS, GROUPS>(dot[pair], lane, [&](int step, float s) {
-        stage[step][row] = s + result[STEPS + step][row0 + row];
+        const float bias = result[STEPS + step][row0 + row];
+        if constexpr (PROTECT) {
+          if (native.precision_flags) {
+            // Preserve the value-update term bound in the consumed bias slot.
+            // The final guard adds ||H0_row||inf * ||qeff_step||1, which also
+            // bounds cancellation inside the state projection itself.
+            result[STEPS + step][row0 + row] = stage[step][row];
+          }
+        }
+        stage[step][row] = s + bias;
       });
     }
   }
   __syncthreads();
+  if constexpr (PROTECT) {
+    if (native.precision_flags) {
+      // The state projection is finished, so these reduction temporaries do
+      // not overlap its live registers. One transpose reduction replaces the
+      // separate query reduction and four pairs of output butterflies.
+      float conditioning[4 * STEPS + 1];
+#pragma unroll
+      for (int step = 0; step < STEPS; ++step) {
+        const float value = stage[step][tid];
+        conditioning[step] = fabsf(result[step][tid]);
+        conditioning[STEPS + step] = query_terms[step][tid];
+        conditioning[2 * STEPS + step] = fabsf(value);
+        conditioning[3 * STEPS + step] = result[STEPS + step][tid];
+        if (step < n_tok)
+          out[(long)(bos + step) * H * DIM + h * DIM + tid] =
+              __float2bfloat16(value);
+      }
+      conditioning[4 * STEPS] = state_max[tid];
+      group_sums<4 * STEPS + 1, 32>(conditioning, lane,
+          [&](int i, float s) { partial[warp][i] = s; });
+      __syncthreads();
+      // Four adjacent lanes publish one contiguous head flag vector. Every
+      // valid head writes once; early-return paths above write explicit zeroes.
+      if (tid < 4) {
+        bool risky = false;
+#pragma unroll
+        for (int step = 0; step < STEPS; ++step) {
+          float residual = 0.f, terms = 0.f;
+#pragma unroll
+          for (int w = 0; w < WARPS; ++w) {
+            residual += partial[w][step];
+            terms += partial[w][STEPS + step];
+          }
+          if (step < n_tok)
+            risky |= precision_risk(residual, terms) ||
+                     precision_risk(partial[tid][2 * STEPS + step],
+                                    residual * partial[tid][4 * STEPS] +
+                                    partial[tid][3 * STEPS + step]);
+        }
+        native.precision_flags[((long)n * H + h) * 4 + tid] = risky;
+      }
+      return;
+    }
+  }
   for (int i = tid; i < STEPS * ROWS; i += 128) {
     const int step = i / ROWS, r = i % ROWS;
     if (step < n_tok)
       out[(long)(bos + step) * H * DIM + h * DIM + row0 + r] =
           __float2bfloat16(stage[step][r]);
+  }
+}
+
+__device__ __forceinline__ double accurate_sigmoid(double x) {
+  if (x >= 0.0) return 1.0 / (1.0 + ::exp(-x));
+  const double e = ::exp(x);
+  return e / (1.0 + e);
+}
+
+__device__ __forceinline__ double accurate_gate(double a, double x,
+                                                double lower_bound) {
+  if (x == 0.0) return lower_bound * 0.5;
+  // x is a sum of finite BF16/FP32 inputs. Outside this range even the
+  // smallest nonzero such sum is saturated, or the product is negligible.
+  if (a > 700.0) return x > 0.0 ? lower_bound : 0.0;
+  if (a < -700.0) return lower_bound * 0.5;
+  return lower_bound * accurate_sigmoid(::exp(a) * x);
+}
+
+__device__ __forceinline__ double accurate_warp_sum(double x) {
+#pragma unroll
+  for (int offset = 16; offset; offset >>= 1)
+    x += __shfl_xor_sync(0xffffffffu, x, offset, 32);
+  return x;
+}
+
+// Conditional native precision repair. A separate kernel keeps FP64 state and math
+// out of the common kernels' register allocation. Each CTA first scans 128
+// head/request pairs and cooperatively repairs only selected pairs. Persistent
+// state is read-only, so the common output can safely be overwritten here.
+//
+// The common kernels publish observed cancellation flags. Very negative gate
+// bounds retain a direct guard; A_log and beta magnitudes alone do not select
+// this slow path. This is not a universal finite-input conditioning proof.
+__global__ __launch_bounds__(128) void verify_precise_native(
+    const BF16* x_q, const BF16* x_k, const BF16* x_v,
+    const BF16* g_in, const BF16* beta_in,
+    const float* w_q, const float* w_k, const float* w_v,
+    const BF16* cs_q, const BF16* cs_k, const BF16* cs_v,
+    const float* a_log, const float* dt_bias, const float* h0,
+    BF16* out, BF16* ic_q, BF16* ic_k, BF16* ic_v,
+    BF16* rawv, BF16* rawk, float* ring_g, float* ring_beta,
+    IndexArg slots, IndexArg cu, int H, int N, int Q,
+    float scale, float lower_bound, VerifyStrides strides,
+    pla::kda_mtp::NativeVerify native) {
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  auto read_index = [](IndexArg arg, int i) -> int64_t {
+    return arg.wide ? static_cast<const int64_t*>(arg.data)[i * arg.stride] :
+                      static_cast<const int*>(arg.data)[i * arg.stride];
+  };
+  const int64_t first = static_cast<int64_t>(blockIdx.x) * 128;
+  const int64_t candidate = first + tid;
+  bool repair = false;
+  if (candidate < static_cast<int64_t>(H) * N) {
+    const int n = candidate / H, h = candidate % H;
+    const int64_t begin = read_index(cu, n), end = read_index(cu, n + 1);
+    const int64_t source = read_index(slots, n);
+    if (read_index(cu, 0) == 0 && begin >= 0 && end > begin &&
+        end <= native.tokens && end - begin <= Q &&
+        source > native.null_block_id && source < native.slots) {
+      repair = lower_bound < -32.f;
+      if (native.precision_flags) {
+        const int* flags = native.precision_flags + candidate * 4;
+        repair |= flags[0] || flags[1] || flags[2] || flags[3];
+      }
+    }
+  }
+  __shared__ unsigned masks[4];
+  const unsigned mask = __ballot_sync(0xffffffffu, repair);
+  if (lane == 0) masks[warp] = mask;
+  __syncthreads();
+  if (!(masks[0] | masks[1] | masks[2] | masks[3])) return;
+
+  __shared__ double sq[DIM], sk[DIM], sv[DIM], sd[DIM];
+  __shared__ double norm_q[4], norm_k[4], inv_q, inv_k;
+  // Four warps own 32 value rows per pass. Each lane retains only four key
+  // components for each of eight rows, rather than an entire state row.
+  constexpr int VALUE_ROWS = 8;
+  for (int group = 0; group < 4; ++group) {
+    unsigned remaining = masks[group];
+    while (remaining) {
+      const int selected = __ffs(remaining) - 1;
+      remaining &= remaining - 1;
+      const int64_t identity = first + group * 32 + selected;
+      const int n = identity / H, h = identity % H;
+      const int64_t begin = read_index(cu, n), end = read_index(cu, n + 1);
+      const int source = static_cast<int>(read_index(slots, n));
+      const long channel = static_cast<long>(h) * DIM + tid;
+      double weights_q[4], weights_k[4], weights_v[4];
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        weights_q[j] = w_q[channel * 4 + j];
+        weights_k[j] = w_k[channel * 4 + j];
+        weights_v[j] = w_v[channel * 4 + j];
+      }
+      const double a = a_log[h], bias = dt_bias[channel];
+      for (int pass = 0; pass < DIM / (4 * VALUE_ROWS); ++pass) {
+        double state[VALUE_ROWS][4];
+#pragma unroll
+        for (int row = 0; row < VALUE_ROWS; ++row) {
+          const int value_row = pass * 4 * VALUE_ROWS + warp * VALUE_ROWS + row;
+#pragma unroll
+          for (int j = 0; j < 4; ++j)
+            state[row][j] = h0[static_cast<long>(source) * native.state_slot_stride +
+                (static_cast<long>(h) * DIM + value_row) * DIM + lane + j * 32];
+        }
+        double history_q[3], history_k[3], history_v[3];
+#pragma unroll
+        for (int j = 0; j < 3; ++j) {
+          history_q[j] = __bfloat162float(cs_q[static_cast<long>(source) * strides.cs_q.slot +
+              channel * strides.cs_q.channel + j * strides.cs_q.window]);
+          history_k[j] = __bfloat162float(cs_k[static_cast<long>(source) * strides.cs_k.slot +
+              channel * strides.cs_k.channel + j * strides.cs_k.window]);
+          history_v[j] = __bfloat162float(cs_v[static_cast<long>(source) * strides.cs_v.slot +
+              channel * strides.cs_v.channel + j * strides.cs_v.window]);
+        }
+        for (int t = 0; t < end - begin; ++t) {
+          const long token = begin + t;
+          const double xq = __bfloat162float(x_q[token * strides.x_q + channel]);
+          const double xk = __bfloat162float(x_k[token * strides.x_k + channel]);
+          const double xv = __bfloat162float(x_v[token * strides.x_v + channel]);
+          double q = xq * weights_q[3], k = xk * weights_k[3], v = xv * weights_v[3];
+#pragma unroll
+          for (int j = 0; j < 3; ++j) {
+            q += history_q[j] * weights_q[j];
+            k += history_k[j] * weights_k[j];
+            v += history_v[j] * weights_v[j];
+          }
+          q *= accurate_sigmoid(q);
+          k *= accurate_sigmoid(k);
+          v *= accurate_sigmoid(v);
+          const double gate = accurate_gate(a,
+              static_cast<double>(__bfloat162float(g_in[token * strides.g + channel])) + bias,
+              static_cast<double>(lower_bound));
+          const double beta = accurate_sigmoid(
+              static_cast<double>(__bfloat162float(beta_in[token * strides.beta + h])));
+          history_q[0] = history_q[1]; history_q[1] = history_q[2]; history_q[2] = xq;
+          history_k[0] = history_k[1]; history_k[1] = history_k[2]; history_k[2] = xk;
+          history_v[0] = history_v[1]; history_v[1] = history_v[2]; history_v[2] = xv;
+          sq[tid] = q; sk[tid] = k; sv[tid] = v; sd[tid] = ::exp(gate);
+          const double qsum = accurate_warp_sum(q * q);
+          const double ksum = accurate_warp_sum(k * k);
+          if (lane == 0) { norm_q[warp] = qsum; norm_k[warp] = ksum; }
+          if (pass == 0) {
+            const long record = ((static_cast<long>(n) * H + h) * Q + t) * DIM + tid;
+            rawk[record] = __float2bfloat16(static_cast<float>(k));
+            rawv[record] = __float2bfloat16(static_cast<float>(v));
+            ring_g[record] = static_cast<float>(gate);
+            if (tid == 0) ring_beta[(static_cast<long>(n) * H + h) * Q + t] = static_cast<float>(beta);
+#pragma unroll
+            for (int j = 0; j < 3; ++j) {
+              ic_q[static_cast<long>(n) * strides.ic_q.row + t * strides.ic_q.step +
+                  channel * strides.ic_q.channel + j * strides.ic_q.window] =
+                  __float2bfloat16(static_cast<float>(history_q[j]));
+              ic_k[static_cast<long>(n) * strides.ic_k.row + t * strides.ic_k.step +
+                  channel * strides.ic_k.channel + j * strides.ic_k.window] =
+                  __float2bfloat16(static_cast<float>(history_k[j]));
+              ic_v[static_cast<long>(n) * strides.ic_v.row + t * strides.ic_v.step +
+                  channel * strides.ic_v.channel + j * strides.ic_v.window] =
+                  __float2bfloat16(static_cast<float>(history_v[j]));
+            }
+          }
+          __syncthreads();
+          if (tid == 0) {
+            inv_q = static_cast<double>(scale) / ::sqrt(norm_q[0] + norm_q[1] + norm_q[2] + norm_q[3] + 1.0e-6);
+            inv_k = 1.0 / ::sqrt(norm_k[0] + norm_k[1] + norm_k[2] + norm_k[3] + 1.0e-6);
+          }
+          __syncthreads();
+          sq[tid] *= inv_q; sk[tid] *= inv_k;
+          __syncthreads();
+#pragma unroll
+          for (int row = 0; row < VALUE_ROWS; ++row) {
+            const int value_row = pass * 4 * VALUE_ROWS + warp * VALUE_ROWS + row;
+            double dot_k = 0.0;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+              const int key = lane + j * 32;
+              state[row][j] *= sd[key];
+              dot_k = ::fma(state[row][j], sk[key], dot_k);
+            }
+            dot_k = accurate_warp_sum(dot_k);
+            const double delta = (sv[value_row] - dot_k) * beta;
+            double dot_q = 0.0;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+              const int key = lane + j * 32;
+              state[row][j] = ::fma(delta, sk[key], state[row][j]);
+              dot_q = ::fma(state[row][j], sq[key], dot_q);
+            }
+            dot_q = accurate_warp_sum(dot_q);
+            if (lane == 0)
+              out[token * H * DIM + static_cast<long>(h) * DIM + value_row] =
+                  __float2bfloat16(static_cast<float>(dot_q));
+          }
+          __syncthreads();
+        }
+      }
+    }
   }
 }
 
@@ -891,6 +1312,60 @@ void launch_verify(
     launch_verify_vsplit<1>(PLA_VERIFY_ARGS);
   }
 #undef PLA_VERIFY_ARGS
+}
+
+void launch_verify_native(
+    const void* x_q, const void* x_k, const void* x_v,
+    const void* g_in, const void* beta_in,
+    const float* w_q, const float* w_k, const float* w_v,
+    const void* cs_q, const void* cs_k, const void* cs_v,
+    const float* a_log, const float* dt_bias, const float* h0,
+    void* out, void* ic_q, void* ic_k, void* ic_v,
+    void* rawv, void* rawk, float* gate, float* beta,
+    IndexArg slots, IndexArg cu, int H, int N, int Q,
+    float scale, float lower_bound, VerifyStrides strides,
+    NativeVerify native, hggcStream_t stream) {
+  if (N == 0) return;
+  const bool ppu15 = current_device_is_ppu15();
+  if (Q == 4 && static_cast<int64_t>(H) * N >= 768 &&
+      use_verify_fast(H, N, Q) && ppu15 &&
+      reinterpret_cast<uintptr_t>(w_q) % 16 == 0 &&
+      reinterpret_cast<uintptr_t>(w_k) % 16 == 0 &&
+      reinterpret_cast<uintptr_t>(w_v) % 16 == 0) {
+    verify_steps_kernel<4, 1, false, true><<<dim3(H, N, 1), 128, 0, stream>>>(
+        static_cast<const BF16*>(x_q), static_cast<const BF16*>(x_k),
+        static_cast<const BF16*>(x_v), static_cast<const BF16*>(g_in),
+        static_cast<const BF16*>(beta_in), w_q, w_k, w_v,
+        static_cast<const BF16*>(cs_q), static_cast<const BF16*>(cs_k),
+        static_cast<const BF16*>(cs_v), a_log, dt_bias,
+        static_cast<BF16*>(out), static_cast<BF16*>(ic_q),
+        static_cast<BF16*>(ic_k), static_cast<BF16*>(ic_v),
+        static_cast<BF16*>(rawv), static_cast<BF16*>(rawk), gate, beta,
+        slots, slots, cu, H, Q, scale, lower_bound, strides, h0, native);
+  } else {
+    verify_kernel<1, true><<<dim3(H, N, 1), THREADS, sizeof(Smem), stream>>>(
+      static_cast<const BF16*>(x_q), static_cast<const BF16*>(x_k),
+      static_cast<const BF16*>(x_v), static_cast<const BF16*>(g_in),
+      static_cast<const BF16*>(beta_in), w_q, w_k, w_v,
+      static_cast<const BF16*>(cs_q), static_cast<const BF16*>(cs_k),
+      static_cast<const BF16*>(cs_v), a_log, dt_bias, h0,
+      static_cast<BF16*>(out), static_cast<BF16*>(ic_q),
+      static_cast<BF16*>(ic_k), static_cast<BF16*>(ic_v),
+      static_cast<BF16*>(rawv), static_cast<BF16*>(rawk), gate, beta,
+      slots, slots, cu, H, Q, Q, scale, lower_bound, strides, native);
+  }
+  if constexpr (kNativeNumericalProtection) {
+    if (ppu15) verify_precise_native<<<(static_cast<int64_t>(H) * N + 127) / 128, 128, 0, stream>>>(
+      static_cast<const BF16*>(x_q), static_cast<const BF16*>(x_k),
+      static_cast<const BF16*>(x_v), static_cast<const BF16*>(g_in),
+      static_cast<const BF16*>(beta_in), w_q, w_k, w_v,
+      static_cast<const BF16*>(cs_q), static_cast<const BF16*>(cs_k),
+      static_cast<const BF16*>(cs_v), a_log, dt_bias, h0,
+      static_cast<BF16*>(out), static_cast<BF16*>(ic_q),
+      static_cast<BF16*>(ic_k), static_cast<BF16*>(ic_v),
+      static_cast<BF16*>(rawv), static_cast<BF16*>(rawk), gate, beta,
+      slots, cu, H, N, Q, scale, lower_bound, strides, native);
+  }
 }
 
 }  // namespace kda_mtp

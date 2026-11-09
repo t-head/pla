@@ -46,6 +46,17 @@
 namespace pla {
 namespace kda_mtp {
 
+// Default native replay uses FP32 arithmetic without conditioning scans or
+// FP64 repair. Define this consistently in host/device translation units to
+// enable the diagnostic robust build; metadata/ownership checks are independent.
+#ifndef PLA_KDA_NATIVE_FP64_REPAIR
+#define PLA_KDA_NATIVE_FP64_REPAIR 0
+#endif
+#if PLA_KDA_NATIVE_FP64_REPAIR != 0 && PLA_KDA_NATIVE_FP64_REPAIR != 1
+#error "PLA_KDA_NATIVE_FP64_REPAIR must be 0 or 1"
+#endif
+inline constexpr bool kNativeNumericalProtection = PLA_KDA_NATIVE_FP64_REPAIR != 0;
+
 enum class ConvDType : int {
   kBFloat16 = 0,
   kFloat32,
@@ -75,7 +86,53 @@ struct VerifyStrides {
 struct IndexArg {
   const void* data;
   bool wide;
+  int64_t stride = 1;
 };
+
+// Native replay consumes paged checkpoints and request-row records.
+struct NativeVerify {
+  int64_t state_slot_stride;
+  int slots, tokens, null_block_id;
+  int* precision_flags = nullptr;  // [request, head, value_tile=4], private scratch
+};
+
+// Columns in the persistent device table, one row per layer.
+enum ReplayColumn {
+  kState = 0, kStateStride, kConv, kConvSlot, kConvChannel, kConvWindow,
+  kRawV, kRawK, kGate, kBeta, kWindows, kReplayColumns
+};
+
+struct NativeFold {
+  const int64_t* layers;
+  IndexArg final_indices;
+  int slots;
+  int* precision_flags = nullptr;  // [request, head_and_layer, value_tile=4]
+};
+
+void launch_verify_native(
+    const void* x_q, const void* x_k, const void* x_v,
+    const void* g_in, const void* beta_in,
+    const float* w_q, const float* w_k, const float* w_v,
+    const void* cs_q, const void* cs_k, const void* cs_v,
+    const float* a_log, const float* dt_bias, const float* h0,
+    void* out, void* ic_q, void* ic_k, void* ic_v,
+    void* rawv, void* rawk, float* gate, float* beta,
+    IndexArg slots, IndexArg cu, int H, int N, int Q,
+    float scale, float lower_bound, VerifyStrides strides,
+    NativeVerify native, hggcStream_t stream);
+
+void launch_fold_native(const int64_t* layers, IndexArg source,
+                        IndexArg lengths, IndexArg final_indices,
+                        IndexArg boundary, IndexArg boundary_lengths,
+                        int nlayers, int batch, int heads, int Q, int slots,
+                        int null_block_id, bool has_align, int* precision_flags,
+                        hggcStream_t stream);
+
+void launch_conv_native(const int64_t* layers, IndexArg lengths,
+                        IndexArg final_indices, IndexArg boundary,
+                        IndexArg boundary_lengths, int nlayers, int batch,
+                        int heads, int Q, int slots, int null_block_id,
+                        hggcStream_t stream);
 
 void launch_fold(
     float* h0, const void* rawv, const void* rawk,

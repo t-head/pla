@@ -52,6 +52,11 @@ selects just that one, so ``pla.decode`` does not drag in the nested
 ``pla.prefill.flashkdapro``). It is the env-var form because ``pip install .``
 gives no clean way to forward custom options.
 
+Native KDA replay uses FP32 arithmetic by default. Set
+``PLA_KDA_NATIVE_FP64_REPAIR=1`` when building to enable the diagnostic
+conditioning checks and FP64 repair path. The define is passed to both host
+and device compilers; changing this build option requires rebuilding the extension.
+
 Build speed:
   * ninja + all cores (override with MAX_JOBS)
   * per-file hgcc ``--threads`` (override with HGCC_THREADS)
@@ -86,7 +91,7 @@ here = os.path.abspath(os.path.dirname(__file__))
 # Namespace selection
 # ---------------------------------------------------------------------------
 ALL_NAMESPACES = ("pla.decode", "pla.decode.gdn.v_last",
-                  "pla.decode.kda_mtp_sglang",
+                  "pla.decode.kda_mtp_sglang", "pla.decode.kda_mtp_vllm",
                   "pla.prefill.flashqla", "pla.prefill.flashkdapro")
 
 
@@ -254,22 +259,31 @@ if "pla.decode.gdn.v_last" in NAMESPACES:
 # ---------------------------------------------------------------------------
 # pla.decode.kda_mtp_sglang
 # ---------------------------------------------------------------------------
-if "pla.decode.kda_mtp_sglang" in NAMESPACES:
+for kda_namespace in ("pla.decode.kda_mtp_sglang", "pla.decode.kda_mtp_vllm"):
+    if kda_namespace not in NAMESPACES:
+        continue
+    kda_fp64_repair = os.environ.get("PLA_KDA_NATIVE_FP64_REPAIR", "0")
+    if kda_fp64_repair not in ("0", "1"):
+        raise ValueError("PLA_KDA_NATIVE_FP64_REPAIR must be 0 or 1")
+    kda_numerical_flags = ["-DPLA_KDA_NATIVE_FP64_REPAIR=" + kda_fp64_repair]
     kda_mtp_dir = os.path.join(here, "src", "decode", "kda_mtp_sglang")
-    kda_mtp_sources = [
-        os.path.join(kda_mtp_dir, "kda_mtp_sglang.cpp"),
-        os.path.join(kda_mtp_dir, "kda_mtp_verify.cu"),
-        os.path.join(kda_mtp_dir, "kda_mtp_verify_host.cpp"),
-        os.path.join(kda_mtp_dir, "kda_mtp_fold.cu"),
-        os.path.join(kda_mtp_dir, "kda_mtp_fold_host.cpp"),
-    ]
+    kda_mtp_sources = [os.path.join(kda_mtp_dir, name) for name in
+                       ("kda_mtp_verify.cu", "kda_mtp_fold.cu")]
+    if kda_namespace == "pla.decode.kda_mtp_sglang":
+        kda_mtp_sources += [os.path.join(kda_mtp_dir, name) for name in
+                            ("kda_mtp_sglang.cpp", "kda_mtp_verify_host.cpp",
+                             "kda_mtp_fold_host.cpp")]
+    else:
+        native_dir = os.path.join(here, "src", "decode", "kda_mtp_vllm")
+        kda_mtp_sources += [os.path.join(native_dir, name) for name in
+                            ("kda_mtp_vllm.cpp", "commit_plan.cu")]
 
     ext_modules.append(
         Extension(
-            name='pla.decode.kda_mtp_sglang._C',
+            name=kda_namespace + '._C',
             sources=kda_mtp_sources,
             extra_compile_args={
-                'cxx': ['-O3'],
+                'cxx': ['-O3'] + kda_numerical_flags,
                 'hgcc': [
                     '-O3',
                     '-std=c++17',
@@ -292,7 +306,7 @@ if "pla.decode.kda_mtp_sglang" in NAMESPACES:
                     # while hggcDeviceSynchronize() still returns success.
                     # Emit one native image flag per supported PPU generation.
                     '-arch=ppu_10', '-arch=ppu_15'
-                ]
+                ] + kda_numerical_flags
             },
             # Absolute path: ninja does not run from the project root. Only
             # src/ is needed; the device sources use native PPU SDK headers.

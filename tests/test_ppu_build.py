@@ -269,5 +269,34 @@ class PPUBuildExtensionTests(unittest.TestCase):
         self.assertNotIn("-lcudart", command)
 
 
+class ReplayNamespaceTests(unittest.TestCase):
+    def test_native_namespace_builds_without_sglang_binding(self):
+        setuptools = types.ModuleType("setuptools")
+        setuptools.Extension = FakeExtension
+        setuptools.find_packages = lambda **kwargs: []
+        captured = {}
+        setuptools.setup = lambda **kwargs: captured.update(kwargs)
+        backend = types.ModuleType("ppu_build")
+        backend.PPUBuildExtension = FakeBuildExt
+        spec = importlib.util.spec_from_file_location("replay_setup_test", ROOT / "setup.py")
+        setup = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, {"setuptools": setuptools, "ppu_build": backend}), \
+                patch.dict("os.environ", {"PLA_BUILD_NAMESPACE": "pla.decode.kda_mtp_vllm"}), \
+                patch.object(sys, "argv", ["setup.py"]):
+            spec.loader.exec_module(setup)
+        extensions = captured["ext_modules"]
+        self.assertEqual([ext.name for ext in extensions], ["pla.decode.kda_mtp_vllm._C"])
+        names = {Path(source).name for source in extensions[0].sources}
+        self.assertEqual(names, {"kda_mtp_vllm.cpp", "commit_plan.cu",
+                                 "kda_mtp_verify.cu", "kda_mtp_fold.cu"})
+        self.assertTrue(all(Path(source).is_file() for source in extensions[0].sources))
+        spec = importlib.util.spec_from_file_location("replay_build_test", ROOT / "scripts/build.py")
+        build = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(build)
+        self.assertEqual(build.ALL_NAMESPACES, setup.ALL_NAMESPACES)
+        self.assertFalse(build.selects_k_last_decode("pla.decode.kda_mtp_vllm"))
+        self.assertTrue(build.selects_k_last_decode("pla.decode"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -55,6 +55,8 @@ def cases():
         Case("kda-mtp-sglang", "decode", ("tests/test_kda_mtp_sglang.py",
              f"--caselist={kimi}", "--phase=all", "--max-bs-cases=3",
              "--bs-cap=64", "--layers=2,4"), 2400, "markers"),
+        Case("kda-mtp-vllm", "decode", ("tests/test_kda_mtp_vllm.py", "--phase=functional"),
+             1800, "markers"),
         Case("kda-spec-recurrent", "decode", ("scripts/decode/test_kda_decode.py",), 1200),
         Case("kda-pad-slot", "decode", ("scripts/decode/kda_fusion/test_pad_slot.py",), 900),
         Case("kda-commit-layouts", "decode",
