@@ -15,18 +15,27 @@ permissions:
   contents: read
   pull-requests: read
 
-concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+# No workflow-level concurrency block here: a single run-wide group would
+# make a re-run of one failed PPU board cancel or queue behind the other
+# board's in-progress job. Cancellation is scoped per job below; the PPU
+# boards live in their own workflows (pla-ppu-*.yml), each with its own run
+# lifecycle and per-board concurrency group, so one board finishing or
+# re-running never depends on the other board's run state.
 
 jobs:
   precheck:
     name: Pre-check
+    concurrency:
+      group: ci-${{ github.event.pull_request.number || github.ref }}-precheck
+      cancel-in-progress: true
     uses: t-head/.github/.github/workflows/user-precheck.yml@main
 
   static-compliance:
     name: Static Compliance
     needs: precheck
+    concurrency:
+      group: ci-${{ github.event.pull_request.number || github.ref }}-static-compliance
+      cancel-in-progress: true
     uses: ./.github/workflows/static-compliance-scan.yml
     with:
       base: ${{ github.event.pull_request.base.sha || inputs.scan-base }}
@@ -35,17 +44,17 @@ jobs:
   ai-code-review:
     name: AI Code Review (Copilot Gate)
     needs: precheck
+    concurrency:
+      group: ci-${{ github.event.pull_request.number || github.ref }}-ai-code-review
+      cancel-in-progress: true
     uses: t-head/.github/.github/workflows/ai-code-review.yml@main
     secrets: inherit
 
   human-review:
     name: Human Review Gate
     needs: ai-code-review
+    concurrency:
+      group: ci-${{ github.event.pull_request.number || github.ref }}-human-review
+      cancel-in-progress: true
     uses: t-head/.github/.github/workflows/human-review.yml@main
-    secrets: inherit
-
-  ci:
-    name: Full CI (PPU)
-    needs: [human-review, static-compliance]
-    uses: ./.github/workflows/pla-basic-test-ppu.yml
     secrets: inherit

@@ -310,8 +310,16 @@ class StaticComplianceTests(unittest.TestCase):
         self.assertEqual(set(workflow["on"]), {"workflow_call", "workflow_dispatch"})
         self.assertEqual(set(workflow["on"]["workflow_call"]["inputs"]), {"base", "head"})
         self.assertEqual(workflow["permissions"], {"contents": "read"})
-        self.assertEqual(entry["jobs"]["ci"]["needs"], ["human-review", "static-compliance"])
+        self.assertEqual(set(entry["jobs"]),
+                         {"precheck", "static-compliance", "ai-code-review", "human-review"})
         self.assertEqual(entry["jobs"]["static-compliance"]["needs"], "precheck")
+        # The PPU boards live in their own workflows; the serial review gate
+        # is enforced by their wait-review job before any hardware job.
+        for path in ("pla-ppu-810e.yml", "pla-ppu-890p.yml"):
+            board = yaml.load((ROOT / ".github/workflows" / path).read_text(),
+                              Loader=yaml.BaseLoader)
+            self.assertEqual(set(board["jobs"]), {"wait-review", "build-test"})
+            self.assertEqual(board["jobs"]["build-test"]["needs"], "wait-review")
         for step in workflow["jobs"]["scan"]["steps"]:
             if "run" in step:
                 subprocess.run(["bash", "-n"], input=step["run"], text=True, check=True)

@@ -1,7 +1,9 @@
-name: PLA Functional Tests PPU
+name: CI PPU ZW-M890P
 
 on:
-  workflow_call:
+  pull_request:
+    branches: [master]
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
 
 permissions:
@@ -11,31 +13,84 @@ env:
   SAIL_IMAGE: download.t-head.cn/docker_release/pytorch:sdk2.2.0-2.10.0-ubuntu24.04-hggcrt3-py312-20261005
 
 jobs:
+  wait-review:
+    name: Wait for review gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 480
+    permissions:
+      contents: read
+      checks: read
+    # Own run per board: this group keeps push-time cancellation per board
+    # while letting the other board's run finish and re-run independently.
+    concurrency:
+      group: ci-${{ github.event.pull_request.number || github.ref }}-ZW-M890P
+      cancel-in-progress: true
+    steps:
+      - name: Wait for CI Pipeline review gates on this head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, re, subprocess, sys, time
+          if os.environ["EVENT_NAME"] == "workflow_dispatch":
+              print("manual dispatch: skipping the review-gate wait")
+              sys.exit(0)
+          repo = os.environ["GITHUB_REPOSITORY"]
+          sha = os.environ["HEAD_SHA"]
+          if not re.fullmatch(r"[0-9a-f]{40}", sha):
+              sys.exit(f"refusing non-SHA head value: {sha!r}")
+          required = {"Human Review Gate / Human Review Gate",
+                      "Static Compliance / Static Compliance Scan (normal)"}
+          failed = {"failure", "cancelled", "timed_out", "startup_failure",
+                    "action_required"}
+          deadline = time.time() + 7.5 * 3600
+          while True:
+              out = subprocess.run(
+                  ["gh", "api",
+                   f"repos/{repo}/commits/{sha}/check-runs?filter=latest&per_page=100",
+                   "--jq",
+                   ".check_runs[] | [.name, .status, (.conclusion // \"pending\")] | @tsv"],
+                  capture_output=True, text=True, check=True).stdout
+              rows = [line.split("\t") for line in out.splitlines() if line]
+              bad = {name for name, _, concl in rows
+                     if name in required and concl in failed}
+              if bad:
+                  sys.exit(f"review gates not successful: {sorted(bad)}")
+              done = {name for name, _, concl in rows
+                      if name in required and concl == "success"}
+              if required <= done:
+                  print("review gates success:", sorted(done))
+                  break
+              if time.time() > deadline:
+                  sys.exit("timed out waiting for CI Pipeline review gates")
+              time.sleep(60)
+          PY
+
   build-test:
-    name: Build & Test (${{ matrix.board }})
+    name: Build & Test (ZW-M890P)
+    needs: wait-review
     runs-on: k8s-runner-group-cpu-thead
     container:
       image: ghcr.io/actions/actions-runner:latest
     timeout-minutes: 900
-    strategy:
-      fail-fast: false
-      matrix:
-        board: [OAM-810E, ZW-M890P]
+    concurrency:
+      group: ci-${{ github.event.pull_request.number || github.ref }}-ZW-M890P
+      cancel-in-progress: true
     env:
-      REPORT_ROOT: /wl_nas/devops/${{ github.repository_id }}-${{ github.run_id }}-${{ github.run_attempt }}/pla/${{ matrix.board }}
-      WORKER_REPORT_ROOT: /mnt/wl_nas/devops/${{ github.repository_id }}-${{ github.run_id }}-${{ github.run_attempt }}/pla/${{ matrix.board }}
+      REPORT_ROOT: /wl_nas/devops/${{ github.repository_id }}-${{ github.run_id }}-${{ github.run_attempt }}/pla/ZW-M890P
+      WORKER_REPORT_ROOT: /mnt/wl_nas/devops/${{ github.repository_id }}-${{ github.run_id }}-${{ github.run_attempt }}/pla/ZW-M890P
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Checkout ACTLIZE
-        uses: actions/checkout@v4
-        with:
-          repository: t-head/actlize
-          ref: 7c08602a4f4a3ba1ebee7ce16e58eb496e183115
-          path: 3rdparty/actlize
-          submodules: recursive
-          persist-credentials: false
+      - name: Sync PLA submodules
+        # actlize follows the pla gitlink; no yml-pinned checkout ref.
+        run: |
+          git submodule sync --recursive
+          git submodule update --init --recursive
       - name: Validate CI assets
         env:
           PYTHONDONTWRITEBYTECODE: "1"
@@ -47,12 +102,12 @@ jobs:
           image: ${{ env.SAIL_IMAGE }}
           nnodes: 0
           nproc_per_node: 1
-          node_selector: board-type=${{ matrix.board }}
+          node_selector: board-type=ZW-M890P
           namespace: ppu-sched
           timeout_minutes: 840
           cleanup_policy: always
           dmesg_policy: on_failure
-          extra_env: PLA_REPORT_ROOT=${{ env.WORKER_REPORT_ROOT }},PLA_TEST_REVISION=${{ github.sha }},PLA_CI_BOARD=${{ matrix.board }}
+          extra_env: PLA_REPORT_ROOT=${{ env.WORKER_REPORT_ROOT }},PLA_TEST_REVISION=${{ github.sha }},PLA_CI_BOARD=ZW-M890P
           command: |
             set -Eeo pipefail
             # With plain set -e a failing bare check exits with zero output;
@@ -79,7 +134,7 @@ jobs:
             timeout --signal=TERM --kill-after=30s 180m \
               python setup.py bdist_wheel \
                 --bdist-dir "$BUILD_ROOT/wheel" --dist-dir "$BUILD_ROOT/dist" \
-              2>&1 | tee "$PLA_REPORT_ROOT/build.log"
+                2>&1 | tee "$PLA_REPORT_ROOT/build.log"
             wheels=("$BUILD_ROOT"/dist/pla-*.whl)
             if [ "${#wheels[@]}" -ne 1 ] || [ ! -f "${wheels[0]}" ]; then
               echo "::error::expected exactly one pla wheel in $BUILD_ROOT/dist, found: $(ls -1 "$BUILD_ROOT"/dist 2>/dev/null | tr '\n' ' ')" >&2
@@ -99,20 +154,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          destination=".ci-results/${{ matrix.board }}"
+          destination=".ci-results/ZW-M890P"
           mkdir -p "$destination"
           if [ -d "$REPORT_ROOT" ]; then
             cp -a "$REPORT_ROOT/." "$destination/"
           fi
-      - name: Board results (${{ matrix.board }})
+      - name: Board results (ZW-M890P)
         if: always()
         env:
           PLA_TEST_RESULT: ${{ steps.ppu-test.outcome }}
-        run: python3 .github/workflows/scripts/run_functional.py --summary-root .ci-results --board "${{ matrix.board }}"
+        run: python3 .github/workflows/scripts/run_functional.py --summary-root .ci-results --board "ZW-M890P"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: pla-results-${{ matrix.board }}
+          name: pla-results-ZW-M890P
           path: .ci-results/
           include-hidden-files: true
           if-no-files-found: error
