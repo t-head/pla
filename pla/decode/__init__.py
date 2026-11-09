@@ -36,7 +36,8 @@ State is stored natively and written back in place; the recurrence accumulates i
 Related namespaces:
 
     pla.decode.kda              Kimi Delta Attention decode
-    pla.decode.kda_mtp_sglang   SGLang KDA MTP verify + commit kernels
+    pla.decode.kda_replayssm_sglang   SGLang KDA ReplaySSM verify + commit
+    pla.decode.kda_mtp_sglang        Compatibility API for SGLang ReplaySSM
     pla.decode.private          tunable entry points (auto-tune only)
     pla.decode.gdn.v_last       v-last (V-major) GDN layout, separate extension
 

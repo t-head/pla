@@ -54,7 +54,11 @@ jobs:
           dmesg_policy: on_failure
           extra_env: PLA_REPORT_ROOT=${{ env.WORKER_REPORT_ROOT }},PLA_TEST_REVISION=${{ github.sha }},PLA_CI_BOARD=${{ matrix.board }}
           command: |
-            set -eo pipefail
+            set -Eeo pipefail
+            # With plain set -e a failing bare check exits with zero output;
+            # report the failing line (bash >= 4 expands $LINENO in an ERR trap
+            # to the failing command) so the console always names a cause.
+            trap 'rc=$?; echo "::error::worker command failed at line $LINENO with rc=$rc" >&2; exit "$rc"' ERR
             mkdir -p "$PLA_REPORT_ROOT"
             exec > >(tee "$PLA_REPORT_ROOT/worker.log") 2>&1
             cd /workspace/source
@@ -77,7 +81,10 @@ jobs:
                 --bdist-dir "$BUILD_ROOT/wheel" --dist-dir "$BUILD_ROOT/dist" \
               2>&1 | tee "$PLA_REPORT_ROOT/build.log"
             wheels=("$BUILD_ROOT"/dist/pla-*.whl)
-            test "${#wheels[@]}" -eq 1 && test -f "${wheels[0]}"
+            if [ "${#wheels[@]}" -ne 1 ] || [ ! -f "${wheels[0]}" ]; then
+              echo "::error::expected exactly one pla wheel in $BUILD_ROOT/dist, found: $(ls -1 "$BUILD_ROOT"/dist 2>/dev/null | tr '\n' ' ')" >&2
+              exit 1
+            fi
             python -m pip install --force-reinstall --no-deps "${wheels[0]}"
             python .github/workflows/scripts/run_functional.py --stage-wheel "${wheels[0]}"
             result=0

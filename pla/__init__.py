@@ -35,16 +35,17 @@ package. Import the namespace you need:
 
     pla.decode                    fused sigmoid gating delta rule (GDN) decode
     pla.decode.kda                Kimi Delta Attention decode
-    pla.decode.kda_mtp_sglang     SGLang KDA MTP verify + commit kernels
+    pla.decode.kda_replayssm_sglang     SGLang KDA ReplaySSM verify + commit
+    pla.decode.kda_mtp_sglang          Compatibility API for SGLang ReplaySSM
+    pla.decode.kda_replayssm_vllm       Native paged KDA replay verify + commit
     pla.decode.private            tunable entry points (auto-tune only)
     pla.prefill.flashqla          FlashQLA prefill forward
     pla.prefill.flashqla.private  FlashQLA prefill building blocks
     pla.prefill.flashkdapro        FlashKDA (Kimi Delta Attention) prefill forward
     pla.prefill.flashkdapro.private  FlashKDA prefill building blocks
 
-Each namespace maps onto one compiled extension: the decode families and the two
-prefill families all live in separate shared objects, so a build restricted to
-one namespace still yields an importable package for that namespace.
+The decode and prefill families have separate compiled extensions. The SGLang
+compatibility namespace forwards to the ReplaySSM extension.
 """
 
 __version__ = "1.0.0"

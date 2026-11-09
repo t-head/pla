@@ -101,6 +101,19 @@ DEFAULT_CASELIST = ("caselist/decode/"
                     "Kimi-Linear-48B-A3B_decode_tp1_kvlimit_200GB_model_len_128K_kda_op.list")
 K3_TYPICAL_HEADS = 12       # Kimi-K3 dspark heads per card
 NUM_SPEC = 7                # gamma=7 -> draft_token_num=8, same as production
+ONORM_EPS = 1e-5            # Kimi-K3.1 rms_norm_eps
+# (batch, heads, num_spec) for the fused output norm. Under the norm split
+# heuristic these cover every launch the verify host picks: the stepwise kernel
+# with its value rows split over 8/4/2 CTAs (fp32 staging + norm epilogue) and
+# unsplit (in-CTA norm), and the generic kernel (windows > 8) split in two and
+# unsplit (always staged).
+ONORM_CASES = (
+    (1, 12, 7), (4, 12, 7), (16, 12, 7), (64, 12, 7),
+    (1, 12, 4), (2, 12, 4), (8, 12, 4),
+    (2, 12, 5),
+    (4, 12, 9), (32, 12, 9),
+    (2, 96, 7),
+)
 
 
 def collect_bs(caselist_path, k, cap):
@@ -148,16 +161,22 @@ def _judge_equal(rep, got, want, name, failures):
 # ---------------------------------------------------------------------------
 # verify
 # ---------------------------------------------------------------------------
-def case_verify(rep, bs, heads):
-    cfg = Cfg(bs=bs, num_spec=NUM_SPEC, heads=heads, onorm=False)
+def case_verify(rep, bs, heads, num_spec=NUM_SPEC, index_dtype=torch.int32,
+                onorm_eps=None):
+    cfg = Cfg(bs=bs, num_spec=num_spec, heads=heads, onorm=onorm_eps is not None)
     vi = build_verify_inputs(cfg)
+    if onorm_eps is not None:
+        vi["onorm_eps"] = onorm_eps
+    for key in ("ssm_state_indices", "intermediate_state_indices", "cu_seqlens"):
+        vi[key] = vi[key].to(index_dtype)
     out = ref.run_cuda(vi, cfg)
     torch.cuda.synchronize()
     expect = verify_reference(vi, cfg)
     n, b = cfg.bs, cfg.draft_token_num
 
-    rep.info(f"batch_size:{bs}, num_heads:{heads}, num_spec:{NUM_SPEC}, "
-             f"draft_token_num:{b}, T:{cfg.T}")
+    rep.info(f"batch_size:{bs}, num_heads:{heads}, num_spec:{num_spec}, "
+             f"draft_token_num:{b}, T:{cfg.T}, index_dtype:{index_dtype}, "
+             f"onorm_eps:{onorm_eps}")
     failures = []
     _judge(rep, out, expect["out"], "out (bf16)", ref.TOL_BF16, failures)
     _judge(rep, vi["replayssm_rawv"][:n, :, :b], expect["ring_rawv"][:n, :, :b],
@@ -170,6 +189,8 @@ def case_verify(rep, bs, heads):
            "ring_beta", ref.TOL_FP32, failures)
     _judge(rep, vi["intermediate_conv_q"][:n, :b], expect["ic_q"][:n, :b],
            "conv_win_q", ref.TOL_BF16, failures)
+    _judge(rep, vi["intermediate_conv_k"][:n, :b], expect["ic_k"][:n, :b],
+           "conv_win_k", ref.TOL_BF16, failures)
     _judge(rep, vi["intermediate_conv_v"][:n, :b], expect["ic_v"][:n, :b],
            "conv_win_v", ref.TOL_BF16, failures)
 
@@ -180,13 +201,29 @@ def case_verify(rep, bs, heads):
     ref.run_cuda(vi, cfg)
     torch.cuda.synchronize()
     _judge_equal(rep, rs, before, "recurrent_state read-only", failures)
+    conv_before = {key: vi[key].clone() for key in ("cs_q", "cs_k", "cs_v")}
+    graph_out = torch.empty_like(out)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        ref.run_cuda(vi, cfg, graph_out)
+    graph.replay()
+    torch.cuda.synchronize()
+    _judge_equal(rep, graph_out, out, "graph output matches eager", failures)
+    _judge_equal(rep, rs, before, "graph recurrent_state read-only", failures)
+    for key, saved in conv_before.items():
+        _judge_equal(rep, vi[key], saved, f"graph {key} read-only", failures)
     return failures
 
 
-def case_verify_padding(rep, heads):
+def case_verify_padding(rep, heads, num_spec=NUM_SPEC, index_dtype=torch.int32,
+                        onorm_eps=None):
     """Padding requests with slot=-1: their rows must be all zero and must not read/write wild addresses."""
-    cfg = Cfg(bs=4, num_spec=NUM_SPEC, heads=heads, onorm=False)
+    cfg = Cfg(bs=4, num_spec=num_spec, heads=heads, onorm=onorm_eps is not None)
     vi = build_verify_inputs(cfg)
+    if onorm_eps is not None:
+        vi["onorm_eps"] = onorm_eps
+    for key in ("ssm_state_indices", "intermediate_state_indices", "cu_seqlens"):
+        vi[key] = vi[key].to(index_dtype)
     vi["ssm_state_indices"] = vi["ssm_state_indices"].clone()
     vi["ssm_state_indices"][-1] = -1
     pb = int(vi["cu_seqlens"][cfg.bs - 1])
@@ -249,6 +286,10 @@ def main():
     ap.add_argument("--caselist", default=DEFAULT_CASELIST,
                     help="decode KDA caselist used for the batch/head distribution (relative to the repo root)")
     ap.add_argument("--phase", choices=["all", "verify", "fold"], default="all")
+    ap.add_argument("--num-specs", default="7",
+                    help="comma-separated verify draft counts; 0..7 exercise every fast-path window")
+    ap.add_argument("--index-dtypes", default="int32",
+                    help="comma-separated verify index dtypes: int32,int64")
     ap.add_argument("--max-bs-cases", type=int, default=3,
                     help="how many batch representative values to take from the caselist (default 3)")
     ap.add_argument("--bs-cap", type=int, default=64,
@@ -267,15 +308,34 @@ def main():
     bs_list = collect_bs(caselist_path, args.max_bs_cases, args.bs_cap)
     heads_list = collect_heads(caselist_path)
     layers_list = [int(x) for x in args.layers.split(",") if x.strip()]
+    num_specs = [int(x) for x in args.num_specs.split(",") if x.strip()]
+    dtype_names = [x.strip() for x in args.index_dtypes.split(",") if x.strip()]
+    if not num_specs or any(x < 0 for x in num_specs):
+        ap.error("--num-specs must contain non-negative integers")
+    if not dtype_names or any(x not in ("int32", "int64") for x in dtype_names):
+        ap.error("--index-dtypes must contain int32 and/or int64")
 
     # List all cases first so the reporter can print the correct i/N
     plan = []
     if args.phase in ("all", "verify"):
-        for h in heads_list:
-            for bs in bs_list:
-                plan.append(("verify", f"verify_H{h}_B{bs}", case_verify, (bs, h)))
-        plan.append(("verify", f"verify_padding_H{heads_list[-1]}",
-                     case_verify_padding, (heads_list[-1],)))
+        for num_spec in num_specs:
+            for dtype_name in dtype_names:
+                dtype = getattr(torch, dtype_name)
+                suffix = ("" if num_specs == [NUM_SPEC] and dtype_names == ["int32"]
+                          else f"_S{num_spec + 1}_{dtype_name}")
+                for h in heads_list:
+                    for bs in bs_list:
+                        plan.append(("verify", f"verify_H{h}_B{bs}{suffix}",
+                                     case_verify, (bs, h, num_spec, dtype)))
+                plan.append(("verify", f"verify_padding_H{heads_list[-1]}{suffix}",
+                             case_verify_padding, (heads_list[-1], num_spec, dtype)))
+        for bs, h, num_spec in ONORM_CASES:
+            plan.append(("verify", f"verify_onorm_H{h}_B{bs}_S{num_spec + 1}",
+                         case_verify, (bs, h, num_spec, torch.int32, ONORM_EPS)))
+        for num_spec in (NUM_SPEC, 9):
+            plan.append(("verify", f"verify_onorm_padding_S{num_spec + 1}",
+                         case_verify_padding,
+                         (K3_TYPICAL_HEADS, num_spec, torch.int32, ONORM_EPS)))
     if args.phase in ("all", "fold"):
         for h in heads_list:
             for bs in bs_list:

@@ -105,6 +105,8 @@ def run_cuda(vi, cfg, out=None):
         scale=float(vi["scale"]),
         replayssm_rawv=vi["replayssm_rawv"], replayssm_rawk=vi["replayssm_rawk"],
         replayssm_g=vi["replayssm_g"], replayssm_beta=vi["replayssm_beta"],
+        onorm_gate=vi.get("onorm_gate"), onorm_weight=vi.get("onorm_weight"),
+        onorm_eps=vi.get("onorm_eps"),
         out=out,
     )
 

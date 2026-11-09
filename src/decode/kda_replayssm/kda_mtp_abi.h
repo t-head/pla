@@ -46,6 +46,17 @@
 namespace pla {
 namespace kda_mtp {
 
+// Default native replay uses FP32 arithmetic without conditioning scans or
+// FP64 repair. Define this consistently in host/device translation units to
+// enable the diagnostic robust build; metadata/ownership checks are independent.
+#ifndef PLA_KDA_NATIVE_FP64_REPAIR
+#define PLA_KDA_NATIVE_FP64_REPAIR 0
+#endif
+#if PLA_KDA_NATIVE_FP64_REPAIR != 0 && PLA_KDA_NATIVE_FP64_REPAIR != 1
+#error "PLA_KDA_NATIVE_FP64_REPAIR must be 0 or 1"
+#endif
+inline constexpr bool kNativeNumericalProtection = PLA_KDA_NATIVE_FP64_REPAIR != 0;
+
 enum class ConvDType : int {
   kBFloat16 = 0,
   kFloat32,
@@ -68,6 +79,21 @@ struct VerifyStrides {
   WindowStrides ic_q, ic_k, ic_v;
 };
 
+// Optional fused gated output RMSNorm (Kimi-K3 o_norm), applied per (token,
+// head) over the 128 value rows of the fp32 attention output:
+//   out = o * rsqrt(mean(o^2) + eps) * weight * sigmoid(gate)
+// gate == nullptr disables it. Only an unsplit stepwise launch sees a whole
+// head row; split stepwise launches and the generic kernel stage fp32 o in
+// `staging` ([T, H, 128], contiguous) and a separate epilogue kernel
+// normalises it.
+struct OnormArgs {
+  const void* gate;     // bf16 [T, H, 128], token stride gate_stride
+  const float* weight;  // fp32 [128], shared by every head
+  float* staging;
+  int64_t gate_stride;
+  float eps;
+};
+
 // A 1-D index tensor exactly as the caller passed it, int32 or int64 elements.
 // Kernels widen it in place, so int64 indices (the commit's
 // last_correct_step_indices arrive as int64) no longer cost a cast kernel per
@@ -75,7 +101,53 @@ struct VerifyStrides {
 struct IndexArg {
   const void* data;
   bool wide;
+  int64_t stride = 1;
 };
+
+// Native replay consumes paged checkpoints and request-row records.
+struct NativeVerify {
+  int64_t state_slot_stride;
+  int slots, tokens, null_block_id;
+  int* precision_flags = nullptr;  // [request, head, value_tile=4], private scratch
+};
+
+// Columns in the persistent device table, one row per layer.
+enum ReplayColumn {
+  kState = 0, kStateStride, kConv, kConvSlot, kConvChannel, kConvWindow,
+  kRawV, kRawK, kGate, kBeta, kWindows, kReplayColumns
+};
+
+struct NativeFold {
+  const int64_t* layers;
+  IndexArg final_indices;
+  int slots;
+  int* precision_flags = nullptr;  // [request, head_and_layer, value_tile=4]
+};
+
+void launch_verify_native(
+    const void* x_q, const void* x_k, const void* x_v,
+    const void* g_in, const void* beta_in,
+    const float* w_q, const float* w_k, const float* w_v,
+    const void* cs_q, const void* cs_k, const void* cs_v,
+    const float* a_log, const float* dt_bias, const float* h0,
+    void* out, void* ic_q, void* ic_k, void* ic_v,
+    void* rawv, void* rawk, float* gate, float* beta,
+    IndexArg slots, IndexArg cu, int H, int N, int Q,
+    float scale, float lower_bound, VerifyStrides strides,
+    NativeVerify native, hggcStream_t stream);
+
+void launch_fold_native(const int64_t* layers, IndexArg source,
+                        IndexArg lengths, IndexArg final_indices,
+                        IndexArg boundary, IndexArg boundary_lengths,
+                        int nlayers, int batch, int heads, int Q, int slots,
+                        int null_block_id, bool has_align, int* precision_flags,
+                        hggcStream_t stream);
+
+void launch_conv_native(const int64_t* layers, IndexArg lengths,
+                        IndexArg final_indices, IndexArg boundary,
+                        IndexArg boundary_lengths, int nlayers, int batch,
+                        int heads, int Q, int slots, int null_block_id,
+                        hggcStream_t stream);
 
 void launch_fold(
     float* h0, const void* rawv, const void* rawk,
@@ -203,6 +275,22 @@ inline int verify_steps_split(int H, int N, int steps) {
              ? 2 : 1;
 }
 
+// The same split with the fused output norm. A split launch needs the
+// separate norm epilogue (one more kernel, ~2.7us) while VS=1 normalises in
+// the CTA, so splitting only pays on much smaller grids. Measured on ZW-M890P
+// over steps 1-6/8 x H*N=4..192 with CUDA-graph replay: max regret 1.6% against
+// the best split per shape (reusing verify_steps_split: 36%, at steps=1).
+inline int verify_steps_split_norm(int H, int N, int steps) {
+  const int64_t forced = verify_split_override();
+  if (forced == 1 || forced == 2 || forced == 4 || forced == 8)
+    return static_cast<int>(forced);
+  const int64_t ctas = static_cast<int64_t>(H) * N;
+  if (steps <= 1) return 1;
+  if (ctas <= (steps <= 2 ? 8 : 12)) return 8;
+  if (ctas < 48 && steps >= 4 && steps <= 6) return steps == 6 ? 2 : 4;
+  return 1;
+}
+
 // Whether a VS=1 launch keeps two passes of state rows in flight (EAGER). It
 // shortens every CTA but, past steps=1, costs registers: on ZW-M890P (39 CUs)
 // 72 -> 104-120 at steps 3/4, i.e. 14 -> 8 blocks/CU, so it only pays where it
@@ -238,7 +326,8 @@ void launch_verify(
     void* ring_rawv, void* ring_rawk, float* ring_g, float* ring_beta,
     IndexArg slot_idx, IndexArg scratch_idx, IndexArg cu_seqlens,
     int H, int N, int t_loop, int ring_len,
-    float scale, float lower_bound, VerifyStrides strides, hggcStream_t stream);
+    float scale, float lower_bound, VerifyStrides strides,
+    const OnormArgs& onorm, hggcStream_t stream);
 
 }  // namespace kda_mtp
 }  // namespace pla

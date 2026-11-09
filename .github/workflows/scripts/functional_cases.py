@@ -55,6 +55,8 @@ def cases():
         Case("kda-mtp-sglang", "decode", ("tests/test_kda_mtp_sglang.py",
              f"--caselist={kimi}", "--phase=all", "--max-bs-cases=3",
              "--bs-cap=64", "--layers=2,4"), 2400, "markers"),
+        Case("kda-replayssm-vllm", "decode", ("tests/test_kda_replayssm_vllm.py", "--phase=functional"),
+             1800, "markers"),
         Case("kda-spec-recurrent", "decode", ("scripts/decode/test_kda_decode.py",), 1200),
         Case("kda-pad-slot", "decode", ("scripts/decode/kda_fusion/test_pad_slot.py",), 900),
         Case("kda-commit-layouts", "decode",
@@ -108,4 +110,11 @@ def cases():
         Case("flashqla-cp-planner-contract", "prefill",
              ("scripts/prefill/flashqla/private/test_cp_planner_cpu.py",), 600),
     ])
+    # Real-model gating accuracy gate plus the synthetic CP/state/scheduling
+    # regressions in the same files: full-script pytest run per dev request;
+    # tc01-only cases skip by design on non-tc01 boards.
+    result.append(Case(
+        "real-gate-prefill", "prefill",
+        ("test_kimi_k3_real_gate_prefill.py", "test_qwen38_real_gate_prefill.py"),
+        1800, "pytest"))
     return result

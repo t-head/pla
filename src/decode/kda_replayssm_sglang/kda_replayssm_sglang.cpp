@@ -31,12 +31,10 @@
  */
 
 /*
- * pla.decode.kda_mtp_sglang -- pybind hub for the two SGLang KDA MTP kernels.
+ * pla.decode.kda_replayssm_sglang -- Python binding for SGLang KDA ReplaySSM.
  *
- * One namespace = one compiled extension = one PYBIND11_MODULE. The device
- * launchers are defined in the sibling .cu files (kda_mtp_verify.cu,
- * kda_mtp_fold.cu) and only forward-declared here, mirroring how
- * fused_sigmoid_gating.cpp fronts the k-last decode extension.
+ * The host functions below call the shared device launchers in
+ * src/decode/kda_replayssm.
  *
  * Ported from SGLang's Kimi-K3 KDA MTP-verify / commit path:
  *   verify_dspark        <- fused_kda_decode_mtp_dspark
@@ -60,7 +58,8 @@
 #include "../../op_forge_case.h"
 
 // ---- verify: fused_kda_decode_mtp_dspark (CACHE_RING, read-only state) ------
-// Defined in kda_mtp_verify.cu.
+// Defined in kda_mtp_verify_host.cpp. The three onorm_* arguments enable the
+// fused gated output RMSNorm and must be passed together.
 void kda_verify_dspark(torch::Tensor x_q, torch::Tensor x_k, torch::Tensor x_v,
                        torch::Tensor g_in, torch::Tensor beta_in,
                        torch::Tensor w_q, torch::Tensor w_k, torch::Tensor w_v,
@@ -72,10 +71,13 @@ void kda_verify_dspark(torch::Tensor x_q, torch::Tensor x_k, torch::Tensor x_v,
                        torch::Tensor ring_g, torch::Tensor ring_beta,
                        torch::Tensor slot_idx, torch::Tensor scratch_idx,
                        torch::Tensor cu_seqlens, double scale,
-                       double lower_bound);
+                       double lower_bound,
+                       std::optional<torch::Tensor> onorm_gate,
+                       std::optional<torch::Tensor> onorm_weight,
+                       std::optional<double> onorm_eps);
 
 // ---- commit: exact fold + conv rollback -------------------------------------
-// Defined in kda_mtp_fold.cu.
+// Defined in kda_mtp_fold_host.cpp.
 void kda_fold_all_layers(torch::Tensor h0, torch::Tensor rawv,
                          torch::Tensor rawk, torch::Tensor gk,
                          torch::Tensor beta, torch::Tensor slot_idx,
@@ -92,9 +94,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     (void)pla::instrument::show_params();
 
 
+  namespace py = pybind11;
   m.def("verify_dspark", &kda_verify_dspark,
         "SGLang KDA MTP verify (fused_kda_decode_mtp_dspark), CACHE_RING mode; "
-        "recurrent/conv state read-only, per-step raw inputs written to rings");
+        "recurrent/conv state read-only, per-step raw inputs written to rings, "
+        "optional fused gated output RMSNorm",
+        py::arg("x_q"), py::arg("x_k"), py::arg("x_v"), py::arg("g"),
+        py::arg("beta"), py::arg("w_q"), py::arg("w_k"), py::arg("w_v"),
+        py::arg("cs_q"), py::arg("cs_k"), py::arg("cs_v"), py::arg("A_log"),
+        py::arg("dt_bias"), py::arg("h0"), py::arg("out"), py::arg("ic_q"),
+        py::arg("ic_k"), py::arg("ic_v"), py::arg("ring_rawv"),
+        py::arg("ring_rawk"), py::arg("ring_g"), py::arg("ring_beta"),
+        py::arg("slot_idx"), py::arg("scratch_idx"), py::arg("cu_seqlens"),
+        py::arg("scale"), py::arg("lower_bound"),
+        py::arg("onorm_gate") = py::none(), py::arg("onorm_weight") = py::none(),
+        py::arg("onorm_eps") = py::none());
   m.def("fold_all_layers", &kda_fold_all_layers,
         "KDA ReplaySSM exact fold: replay the accepted prefix of the rings into "
         "the fp32 checkpoint in place (all layers in one launch)");

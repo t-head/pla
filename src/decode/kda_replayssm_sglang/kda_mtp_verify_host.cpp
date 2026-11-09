@@ -31,19 +31,21 @@
  */
 
 // Torch-facing wrapper for the KDA MTP verify kernel.
-// The .cu sibling is device-only and is reached through kda_mtp_abi.h.
+// The shared device implementation is reached through kda_mtp_abi.h.
 
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/extension.h>
 
+#include <cmath>
+#include <optional>
 #include <string>
 
 #include "sanity_checks.h"
 #include "../../bypass_exec.h"
 #include "../../op_forge_case.h"
 #include "../../ppu_torch_stream.h"
-#include "kda_mtp_abi.h"
+#include "../kda_replayssm/kda_mtp_abi.h"
 
 void kda_verify_dspark(torch::Tensor x_q, torch::Tensor x_k, torch::Tensor x_v,
                        torch::Tensor g_in, torch::Tensor beta_in,
@@ -56,7 +58,14 @@ void kda_verify_dspark(torch::Tensor x_q, torch::Tensor x_k, torch::Tensor x_v,
                        torch::Tensor ring_g, torch::Tensor ring_beta,
                        torch::Tensor slot_idx, torch::Tensor scratch_idx,
                        torch::Tensor cu_seqlens, double scale,
-                       double lower_bound) {
+                       double lower_bound,
+                       std::optional<torch::Tensor> onorm_gate,
+                       std::optional<torch::Tensor> onorm_weight,
+                       std::optional<double> onorm_eps) {
+  const bool apply_onorm = onorm_gate.has_value();
+  TORCH_CHECK(onorm_weight.has_value() == apply_onorm &&
+                  onorm_eps.has_value() == apply_onorm,
+              "fused output norm requires onorm_gate, onorm_weight and onorm_eps");
   if (pla::bypass::enabled()) {
     const int batch = cu_seqlens.numel() > 0 ? cu_seqlens.numel() - 1 : 0;
     const int tokens = x_q.dim() >= 2 ? x_q.size(1) : 0;
@@ -78,14 +87,19 @@ void kda_verify_dspark(torch::Tensor x_q, torch::Tensor x_k, torch::Tensor x_v,
         {"ring_rawv", &ring_rawv}, {"ring_rawk", &ring_rawk},
         {"ring_g", &ring_g}, {"ring_beta", &ring_beta},
         {"slot_idx", &slot_idx}, {"scratch_idx", &scratch_idx},
-        {"cu_seqlens", &cu_seqlens}}, "scale=" + std::to_string(scale));
+        {"cu_seqlens", &cu_seqlens},
+        {"onorm_gate", apply_onorm ? &*onorm_gate : nullptr},
+        {"onorm_weight", apply_onorm ? &*onorm_weight : nullptr}},
+        "scale=" + std::to_string(scale) +
+            (apply_onorm ? " onorm_eps=" + std::to_string(*onorm_eps) : ""));
     return;
   }
   sanity_verify_dspark_inputs(x_q, x_k, x_v, g_in, beta_in, w_q, w_k, w_v,
                               cs_q, cs_k, cs_v, A_log, dt_bias, h0, out,
                               ic_q, ic_k, ic_v, ring_rawv, ring_rawk, ring_g,
                               ring_beta, slot_idx, scratch_idx, cu_seqlens,
-                              scale, lower_bound);
+                              scale, lower_bound, onorm_gate, onorm_weight,
+                              onorm_eps);
   // Layout constants shared with the device TU.
   constexpr int DIM = 128;
   constexpr int CONV_W = 4;
@@ -179,9 +193,33 @@ void kda_verify_dspark(torch::Tensor x_q, torch::Tensor x_k, torch::Tensor x_v,
       conv_strides(cs_q), conv_strides(cs_k), conv_strides(cs_v),
       window_strides(ic_q), window_strides(ic_k), window_strides(ic_v)};
 
+  pla::kda_mtp::OnormArgs onorm{nullptr, nullptr, nullptr, 0, 0.f};
+  torch::Tensor onorm_staging;
+  if (apply_onorm) {
+    const auto& gate = *onorm_gate;
+    const auto& weight = *onorm_weight;
+    TORCH_CHECK(gate.device() == x_q.device() && weight.device() == x_q.device(),
+                "output-norm tensors must share the verify device");
+    TORCH_CHECK(gate.sizes() == x_q.sizes() && gate.scalar_type() == torch::kBFloat16 &&
+                    gate.stride(3) == 1 && gate.stride(2) == DIM &&
+                    gate.stride(1) >= H * DIM,
+                "output-norm gate must be bf16 [1, T, H, 128] with contiguous "
+                "head/channel dimensions");
+    TORCH_CHECK(weight.dim() == 1 && weight.size(0) == DIM && weight.is_contiguous() &&
+                    weight.scalar_type() == torch::kFloat32,
+                "output-norm weight must be contiguous fp32 [128]");
+    TORCH_CHECK(std::isfinite(*onorm_eps) && *onorm_eps >= 0.0,
+                "output-norm eps must be finite and non-negative");
+    // Only launches that split the value rows of a head read this.
+    onorm_staging = torch::empty({T, H, DIM}, x_q.options().dtype(torch::kFloat32));
+    onorm = {gate.data_ptr(), weight.data_ptr<float>(),
+             onorm_staging.data_ptr<float>(), gate.stride(1),
+             static_cast<float>(*onorm_eps)};
+  }
+
   sanity_verify_dspark_values(x_q, x_k, x_v, w_q, w_k, w_v, cs_q, cs_k, cs_v,
                               h0, ic_q, ic_k, ic_v, slot_idx, scratch_idx,
-                              cu_seqlens, N, T, T_LOOP, slots);
+                              cu_seqlens, N, T, T_LOOP, slots, onorm_weight);
 
   // int32 and int64 indices go to the kernel as they are (no cast kernel).
   auto si = slot_idx.contiguous();
@@ -201,7 +239,7 @@ void kda_verify_dspark(torch::Tensor x_q, torch::Tensor x_k, torch::Tensor x_v,
       ring_rawv.data_ptr(), ring_rawk.data_ptr(),
       ring_g.data_ptr<float>(), ring_beta.data_ptr<float>(),
       index(si), index(sc), index(cu),
-      H, N, T_LOOP, L, (float)scale, (float)lower_bound, strides,
+      H, N, T_LOOP, L, (float)scale, (float)lower_bound, strides, onorm,
       pla::current_stream());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
