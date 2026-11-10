@@ -241,6 +241,61 @@ def test_gva_history(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a PPU device")
+@pytest.mark.parametrize("heads,segments", [(6, 12), (12, 6)])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("offset", range(9))
+@pytest.mark.parametrize("raw_mode", ["none", "legacy", "indexed"])
+@pytest.mark.parametrize("fallback", [False, True])
+@pytest.mark.parametrize("capture", [False, True])
+def test_correct_h0_unaligned_ht(heads, segments, dtype, offset, raw_mode, fallback, capture):
+    from pla.prefill.flashqla import ops
+
+    shape = (segments, heads, D, D)
+    size = segments * heads * D * D
+    storage = torch.full((size + offset + 8,), -123.0, device="cuda", dtype=dtype)
+    ht = storage[offset:offset + size].view(shape)
+    values = torch.arange(size, device="cuda").remainder(17).view(shape).float() / 128
+    ht.copy_(values)
+    assert ht.is_contiguous() and ht.storage_offset() == offset
+    mt = torch.eye(D, device="cuda", dtype=dtype).expand(shape).contiguous() * 0.5
+    mask = torch.full((segments, heads), int(fallback), dtype=torch.int8, device="cuda")
+    mapping = torch.tensor([0, segments], dtype=torch.int32, device="cuda")
+    raw = torch.ones((3, heads, D, D), device="cuda") if raw_mode != "none" else None
+    indices = torch.tensor([2], dtype=torch.int32, device="cuda") if raw_mode == "indexed" else None
+    kwargs = dict(raw_h0=raw, raw_h0_indices=indices, raw_h0_k_last=raw_mode == "indexed")
+    expected = []
+    state = torch.zeros((heads, D, D), device="cuda") if raw is None else raw[0].clone()
+    for i in range(segments):
+        expected.append(state.clone())
+        state = ht[i].float() + (state.to(dtype).float() * 0.5 if fallback else 0)
+    expected = torch.stack(expected)
+
+    def run():
+        return ops.flashqla_cute.correct_h0(ht, mt, mask, mapping, 1, **kwargs)
+
+    actual = run()
+    if capture:
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            run()
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            actual = run()
+        torch.cuda.current_stream().wait_stream(stream)
+        for _ in range(3):
+            graph.replay()
+        torch.cuda.synchronize()
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+    assert torch.equal(ht, values.to(dtype))
+    assert bool((storage[:offset] == -123).all())
+    assert bool((storage[offset + size:] == -123).all())
+    if raw is not None:
+        assert bool((raw == 1).all())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a PPU device")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("indexed", [True, False])

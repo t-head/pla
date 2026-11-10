@@ -884,11 +884,12 @@ class FatBinaryKernelContractTest(unittest.TestCase):
     IMAGE_TOKENS = ("FLASHQLA_ARCH_150", "FLASHQLA_ARCH_100", "PH_XY_FACTOR",
                     "__HGGC_ARCH__")
     OPEN = re.compile(r"^\s*#\s*(?:if|ifdef|ifndef)\b(.*)$")
-    BRANCH = re.compile(r"^\s*#\s*(?:elif|else)\b")
+    BRANCH = re.compile(r"^\s*#\s*(elif|else)\b(.*)$")
     ENDIF = re.compile(r"^\s*#\s*endif\b")
     KERNEL = re.compile(r"\b__global__.*?\b(\w+)\s*\(", re.S)
-    LAUNCH = re.compile(r"\b([A-Za-z_]\w*)\s*(?:<[^;{}]*?>\s*)?<<<")
-    LAUNCHED_NAME = re.compile(r"\b([A-Za-z_]\w*)\s*(?:<[^;{}]*?>)?\s*$")
+    # The callee closes the text before "<<<": a name plus optional template
+    # arguments, which may span several lines.
+    CALLEE = re.compile(r"\b([A-Za-z_]\w*)\s*(?:<[^;{}]*?>\s*)?$")
     LAUNCH_BOUNDS = re.compile(r"__launch_bounds__\s*\([^()]*\)")
     WINDOW = 6
 
@@ -900,30 +901,41 @@ class FatBinaryKernelContractTest(unittest.TestCase):
                       text, flags=re.S)
         return [line.split("//", 1)[0] for line in text.splitlines()]
 
-    @staticmethod
-    def _missing(closed):
-        """Names only the first branch of a conditional provides."""
+    def _missing(self, closed):
+        """Names some branch of an image conditional provides and another lacks.
+
+        Every branch counts, including empty ones and the implicit empty
+        ``#else`` of a conditional that has none, so a name found only under
+        ``#else`` or absent from one of three branches is reported as well.
+        """
         missing = []
         for frame in closed:
-            alternatives = set()
-            for branch, names in frame["names"].items():
-                if branch:
-                    alternatives |= names
-            for name in sorted(frame["names"].get(0, set()) - alternatives):
-                missing.append(f"{name} under #if{frame['cond']}")
+            if not any(token in cond for cond in frame["conds"]
+                       for token in self.IMAGE_TOKENS):
+                continue
+            branches = [frame["names"].get(branch, set())
+                        for branch in range(len(frame["conds"]))]
+            if not frame["has_else"]:
+                branches.append(set())
+            provided = set().union(*branches)
+            for name in sorted(provided - set.intersection(*branches)):
+                missing.append(f"{name} under #if{frame['conds'][0]}")
         return missing
 
     def _walk(self, lines, name_of):
-        """Attribute what ``name_of`` finds to the enclosing image conditions."""
+        """Attribute what ``name_of`` finds to the enclosing conditionals."""
         frames, closed = [], []
         for index, line in enumerate(lines):
             opened = self.OPEN.match(line)
             if opened:
-                frames.append({"cond": opened.group(1), "branch": 0, "names": {}})
+                frames.append({"conds": [opened.group(1)], "has_else": False,
+                               "names": {}})
                 continue
-            if self.BRANCH.match(line):
+            branch = self.BRANCH.match(line)
+            if branch:
                 if frames:
-                    frames[-1]["branch"] += 1
+                    frames[-1]["conds"].append(branch.group(2))
+                    frames[-1]["has_else"] |= branch.group(1) == "else"
                 continue
             if self.ENDIF.match(line):
                 if frames:
@@ -933,8 +945,7 @@ class FatBinaryKernelContractTest(unittest.TestCase):
             if not name:
                 continue
             for frame in frames:
-                if any(token in frame["cond"] for token in self.IMAGE_TOKENS):
-                    frame["names"].setdefault(frame["branch"], set()).add(name)
+                frame["names"].setdefault(len(frame["conds"]) - 1, set()).add(name)
         return self._missing(closed)
 
     def _one_image_only(self, lines):
@@ -948,43 +959,56 @@ class FatBinaryKernelContractTest(unittest.TestCase):
 
         return self._walk(lines, defined)
 
-    def _launched_in_one_image_only(self, lines):
-        def launched(lines, index):
-            if "<<<" not in lines[index]:
-                return None
-            # A launch may wrap, as the PH_LAUNCH_COMBINED_T macros do, so keep
-            # walking back until the callee name shows up.
-            for back in range(self.WINDOW):
-                if index - back < 0:
-                    return None
-                found = (self.LAUNCH.search(lines[index])
-                         if back == 0 else self.LAUNCHED_NAME.search(lines[index - back]))
-                if found:
-                    return found.group(1)
+    def _callee(self, lines, index):
+        """Name launched by the first ``<<<`` on ``lines[index]``, if any.
+
+        A launch may wrap: its template arguments can span lines, and the
+        PH_LAUNCH_COMBINED_T-style macros end every line with ``\\``. Join the
+        preceding lines without their continuations before matching.
+        """
+        line = lines[index]
+        if "<<<" not in line:
             return None
+        start = max(0, index - self.WINDOW + 1)
+        head = [text.rstrip().removesuffix("\\") for text in lines[start:index]]
+        found = self.CALLEE.search(" ".join(head + [line[:line.index("<<<")]]))
+        return found.group(1) if found else None
 
-        return self._walk(lines, launched)
+    def _launched_in_one_image_only(self, lines):
+        return self._walk(lines, self._callee)
 
-    def test_every_kernel_exists_in_every_image(self):
+    def _sources(self):
         root = Path(__file__).resolve().parents[4] / "src"
         sources = sorted(path for path in root.rglob("*")
                          if path.suffix in (".cu", ".cuh", ".inc"))
         self.assertTrue(sources, root)
+        return root, sources
+
+    def test_every_kernel_exists_in_every_image(self):
+        root, sources = self._sources()
         for path in sources:
             with self.subTest(source=str(path.relative_to(root))):
                 self.assertEqual(
                     self._one_image_only(self._uncommented(path.read_text())), [])
 
     def test_every_launch_is_visible_to_every_image(self):
-        root = Path(__file__).resolve().parents[4] / "src"
-        sources = sorted(path for path in root.rglob("*")
-                         if path.suffix in (".cu", ".cuh", ".inc"))
-        self.assertTrue(sources, root)
+        root, sources = self._sources()
         for path in sources:
             with self.subTest(source=str(path.relative_to(root))):
                 self.assertEqual(
                     self._launched_in_one_image_only(
                         self._uncommented(path.read_text())), [])
+
+    def test_every_launch_site_names_its_callee(self):
+        # A launch the scanner cannot name is silently skipped, so it must not
+        # exist: either the callee pattern or the source layout has to change.
+        root, sources = self._sources()
+        for path in sources:
+            lines = self._uncommented(path.read_text())
+            unnamed = [index + 1 for index, line in enumerate(lines)
+                       if "<<<" in line and not self._callee(lines, index)]
+            with self.subTest(source=str(path.relative_to(root))):
+                self.assertEqual(unnamed, [])
 
     def test_scanner_flags_a_missing_else_and_accepts_a_stub(self):
         guarded = """
@@ -1015,6 +1039,79 @@ __global__ void only_tc02(float*, int, int) {}
             ["only_tc02 under #if defined(FLASHQLA_ARCH_150) && PH_XY_FACTOR"])
         self.assertEqual(
             self._launched_in_one_image_only(self._uncommented(body_guarded)), [])
+
+    def test_scanner_checks_every_branch(self):
+        else_only = """
+#if defined(FLASHQLA_ARCH_150)
+#else
+__global__ void only_tc01(float* x) {}
+#endif
+"""
+        one_of_three = """
+#if defined(FLASHQLA_ARCH_150)
+__global__ void k(float* x) {}
+#elif defined(FLASHQLA_ARCH_100)
+#else
+__global__ void k(float* x) {}
+#endif
+"""
+        elif_without_else = """
+#if defined(FLASHQLA_ARCH_150)
+__global__ void k(float* x) {}
+#elif defined(FLASHQLA_ARCH_100)
+__global__ void k(float* x) {}
+#endif
+"""
+        image_elif = """
+#if defined(PLA_SOMETHING_ELSE)
+#elif defined(FLASHQLA_ARCH_150)
+__global__ void k(float* x) {}
+#else
+__global__ void k(float* x) {}
+#endif
+"""
+        launch_else_only = """
+#if defined(FLASHQLA_ARCH_150) && PH_XY_FACTOR
+#else
+  only_tc01<__half><<<grid, 128>>>(x);
+#endif
+"""
+        self.assertEqual(self._one_image_only(self._uncommented(else_only)),
+                         ["only_tc01 under #if defined(FLASHQLA_ARCH_150)"])
+        self.assertEqual(self._one_image_only(self._uncommented(one_of_three)),
+                         ["k under #if defined(FLASHQLA_ARCH_150)"])
+        self.assertEqual(self._one_image_only(self._uncommented(elif_without_else)),
+                         ["k under #if defined(FLASHQLA_ARCH_150)"])
+        self.assertEqual(self._one_image_only(self._uncommented(image_elif)),
+                         ["k under #if defined(PLA_SOMETHING_ELSE)"])
+        self.assertEqual(
+            self._launched_in_one_image_only(self._uncommented(launch_else_only)),
+            ["only_tc01 under #if defined(FLASHQLA_ARCH_150) && PH_XY_FACTOR"])
+
+    def test_scanner_names_wrapped_launches(self):
+        macro = """
+#if defined(FLASHQLA_ARCH_150)
+#define LAUNCH_T(ElementType) \\
+    flashqla_cute::wrapped_kernel<ElementType, 4, true> \\
+        <<<grid, dim3(512), smem, stream>>>( \\
+            x, y)
+#endif
+"""
+        template = """
+#if PH_XY_FACTOR
+    flashqla_cute::split_kernel<
+        ElementType, (HV), (NG)>
+        <<<grid, (BLOCK), smem_bytes, stream>>>(x);
+#endif
+"""
+        self.assertEqual(self._callee(self._uncommented(macro), 4), "wrapped_kernel")
+        self.assertEqual(self._callee(self._uncommented(template), 4), "split_kernel")
+        self.assertEqual(
+            self._launched_in_one_image_only(self._uncommented(macro)),
+            ["wrapped_kernel under #if defined(FLASHQLA_ARCH_150)"])
+        self.assertEqual(
+            self._launched_in_one_image_only(self._uncommented(template)),
+            ["split_kernel under #if PH_XY_FACTOR"])
 
 
 if __name__ == "__main__":

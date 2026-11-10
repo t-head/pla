@@ -36,6 +36,7 @@ Checks against the checked-in template combinations, compatible with full/defaul
 
 import ast
 import csv
+import glob
 import importlib.util
 import json
 import os
@@ -226,7 +227,6 @@ class TunedTableTest(unittest.TestCase):
     def assert_tuned_header(self, text, generated_dir=GEN_DIR):
         default = codegen.generate_default_tuned_dispatch()
         if text == default:
-            self.assertEqual(text, default)
             return
         prefix = "// PLA_TUNED_CSV: "
         marker = ""
@@ -286,17 +286,30 @@ class TunedTableTest(unittest.TestCase):
                      {"os": os, "here": str(ROOT)})
         self.assertIn(str(GEN_DIR / "tuned_dispatch.h"), paths)
 
-    def test_prefill_build_tracks_kkt_header(self):
+    def test_prefill_build_tracks_kernel_headers(self):
         tree = ast.parse((ROOT / "setup.py").read_text())
         extension = next(n for n in ast.walk(tree) if isinstance(n, ast.Call)
             and isinstance(n.func, ast.Name) and n.func.id == "Extension" and any(
                 k.arg == "name" and isinstance(k.value, ast.Constant)
                 and k.value.value == "pla.prefill.flashqla._C" for k in n.keywords))
         depends = next(k.value for k in extension.keywords if k.arg == "depends")
+        if isinstance(depends, ast.Name):
+            depends = next(n.value for n in ast.walk(tree) if isinstance(n, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == depends.id
+                        for t in n.targets))
         prefill = ROOT / "src/prefill/flashqla"
         paths = eval(compile(ast.Expression(depends), "<depends>", "eval"),
-                     {"os": os, "prefill_dir": str(prefill)})
-        self.assertIn(str(prefill / "kernels/kkt_solve_cute_impl.cuh"), paths)
+                     {"os": os, "glob": glob, "prefill_dir": str(prefill)})
+        # Every header or .inc a kernel source includes has to be tracked.
+        included = set()
+        for source in (prefill / "kernels").glob("*.cu"):
+            included.update(re.findall(r'^\s*#\s*include\s+"([^"/]+)"',
+                                       source.read_text(), re.M))
+        local = {name for name in included if (prefill / "kernels" / name).is_file()}
+        self.assertIn("kkt_solve_cute_impl.cuh", local)
+        self.assertIn("fused_fwd_cute_body.inc", local)
+        for name in sorted(local):
+            self.assertIn(str(prefill / "kernels" / name), paths)
 
     def test_generator_retains_chain_tree_tables(self):
         header = codegen.generate_tuned_dispatch([

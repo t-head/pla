@@ -523,12 +523,17 @@ if "pla.prefill.flashqla" in NAMESPACES:
 
     prefill_sources = [os.path.join(prefill_dir, "host", "torch_extension_cute.cc")] + \
         sorted(glob.glob(os.path.join(prefill_dir, "kernels", "*.cu")))
+    # PPUBuildExtension emits no compiler depfiles, so every header and .inc
+    # the kernels include must be listed for header-only edits to rebuild.
+    prefill_kernel_headers = sorted(
+        path for pattern in ("*.cuh", "*.inc", "*.h")
+        for path in glob.glob(os.path.join(prefill_dir, "kernels", pattern)))
 
     ext_modules.append(
         Extension(
             name="pla.prefill.flashqla._C",
             sources=prefill_sources,
-            depends=[os.path.join(prefill_dir, "kernels", "kkt_solve_cute_impl.cuh")],
+            depends=prefill_kernel_headers,
             include_dirs=[
                 os.path.join(prefill_dir, "kernels"),  # flashqla_cute_traits.cuh
                 os.path.join(here, "src"),

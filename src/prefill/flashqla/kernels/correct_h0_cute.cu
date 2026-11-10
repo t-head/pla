@@ -648,8 +648,11 @@ static void ch0_launch(
     const bool raw_aligned = !has_raw ||
         reinterpret_cast<std::uintptr_t>(raw_h0) %
             (raw_h0_is_bf16 ? alignof(uint2) : alignof(float4)) == 0;
-    const bool pipe = raw_aligned && compute_capability == 89 && num_cu == 39 &&
-        raw_batch_size == 1 &&
+    // load_ht reads ht_buffer as int4; offset views keep the scalar path.
+    const bool ht_aligned =
+        reinterpret_cast<std::uintptr_t>(ht_buffer) % alignof(int4) == 0;
+    const bool pipe = raw_aligned && ht_aligned &&
+        compute_capability == 89 && num_cu == 39 && raw_batch_size == 1 &&
         ((H == 12 && cp_batch_size == 6) || (H == 6 && cp_batch_size == 12));
     const int ngrp = (use_one_group || pipe) ? 1 : 2;
     const int gw = pipe ? 8 : 4;
