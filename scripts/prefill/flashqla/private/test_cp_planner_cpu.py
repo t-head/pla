@@ -861,5 +861,161 @@ class FusedFwdContractTest(unittest.TestCase):
                 self.assertEqual(arguments, self._parameters(kernel))
 
 
+class FatBinaryKernelContractTest(unittest.TestCase):
+    """No __global__ may be missing from one image of the fat binary.
+
+    The prefill extensions are compiled once with ``-arch=ppu_10 -arch=ppu_15``.
+    A kernel defined only inside an image-varying ``#if`` -- an architecture
+    macro, or PH_XY_FACTOR which prepare_h_cute.cu forces to 0 for ppu_10 -- has
+    no symbol in the other image, and hgcc then rejects the launch at run time
+    with "empty kernel launch" / invalid device function, even on the board
+    whose image does define it. Every branch of such a conditional therefore has
+    to provide the kernel, the shape kkt_solve_cute_impl.cuh already uses for
+    its tc01/tc02 pairs.
+
+    The launch site matters just as much as the definition: hgcc only emits a
+    template ``__global__`` for the images whose host code references it, so an
+    ``<<<>>>`` placed inside the same conditional leaves the other image without
+    a symbol even when the definition is unconditional. That is what broke
+    every ``ph_precompute_x_*`` launch on ZW-M890P. Keeping the guard inside the
+    kernel body and testing it with a run-time ``if`` keeps both images whole.
+    """
+
+    IMAGE_TOKENS = ("FLASHQLA_ARCH_150", "FLASHQLA_ARCH_100", "PH_XY_FACTOR",
+                    "__HGGC_ARCH__")
+    OPEN = re.compile(r"^\s*#\s*(?:if|ifdef|ifndef)\b(.*)$")
+    BRANCH = re.compile(r"^\s*#\s*(?:elif|else)\b")
+    ENDIF = re.compile(r"^\s*#\s*endif\b")
+    KERNEL = re.compile(r"\b__global__.*?\b(\w+)\s*\(", re.S)
+    LAUNCH = re.compile(r"\b([A-Za-z_]\w*)\s*(?:<[^;{}]*?>\s*)?<<<")
+    LAUNCHED_NAME = re.compile(r"\b([A-Za-z_]\w*)\s*(?:<[^;{}]*?>)?\s*$")
+    LAUNCH_BOUNDS = re.compile(r"__launch_bounds__\s*\([^()]*\)")
+    WINDOW = 6
+
+    @staticmethod
+    def _uncommented(text):
+        """Drop comments, keeping line numbers aligned for the window scan."""
+        text = re.sub(r"/\*.*?\*/",
+                      lambda match: "\n" * match.group(0).count("\n"),
+                      text, flags=re.S)
+        return [line.split("//", 1)[0] for line in text.splitlines()]
+
+    @staticmethod
+    def _missing(closed):
+        """Names only the first branch of a conditional provides."""
+        missing = []
+        for frame in closed:
+            alternatives = set()
+            for branch, names in frame["names"].items():
+                if branch:
+                    alternatives |= names
+            for name in sorted(frame["names"].get(0, set()) - alternatives):
+                missing.append(f"{name} under #if{frame['cond']}")
+        return missing
+
+    def _walk(self, lines, name_of):
+        """Attribute what ``name_of`` finds to the enclosing image conditions."""
+        frames, closed = [], []
+        for index, line in enumerate(lines):
+            opened = self.OPEN.match(line)
+            if opened:
+                frames.append({"cond": opened.group(1), "branch": 0, "names": {}})
+                continue
+            if self.BRANCH.match(line):
+                if frames:
+                    frames[-1]["branch"] += 1
+                continue
+            if self.ENDIF.match(line):
+                if frames:
+                    closed.append(frames.pop())
+                continue
+            name = name_of(lines, index)
+            if not name:
+                continue
+            for frame in frames:
+                if any(token in frame["cond"] for token in self.IMAGE_TOKENS):
+                    frame["names"].setdefault(frame["branch"], set()).add(name)
+        return self._missing(closed)
+
+    def _one_image_only(self, lines):
+        def defined(lines, index):
+            if "__global__" not in lines[index]:
+                return None
+            window = self.LAUNCH_BOUNDS.sub(
+                " ", "\n".join(lines[index:index + self.WINDOW]))
+            kernel = self.KERNEL.search(window)
+            return kernel.group(1) if kernel else None
+
+        return self._walk(lines, defined)
+
+    def _launched_in_one_image_only(self, lines):
+        def launched(lines, index):
+            if "<<<" not in lines[index]:
+                return None
+            # A launch may wrap, as the PH_LAUNCH_COMBINED_T macros do, so keep
+            # walking back until the callee name shows up.
+            for back in range(self.WINDOW):
+                if index - back < 0:
+                    return None
+                found = (self.LAUNCH.search(lines[index])
+                         if back == 0 else self.LAUNCHED_NAME.search(lines[index - back]))
+                if found:
+                    return found.group(1)
+            return None
+
+        return self._walk(lines, launched)
+
+    def test_every_kernel_exists_in_every_image(self):
+        root = Path(__file__).resolve().parents[4] / "src"
+        sources = sorted(path for path in root.rglob("*")
+                         if path.suffix in (".cu", ".cuh", ".inc"))
+        self.assertTrue(sources, root)
+        for path in sources:
+            with self.subTest(source=str(path.relative_to(root))):
+                self.assertEqual(
+                    self._one_image_only(self._uncommented(path.read_text())), [])
+
+    def test_every_launch_is_visible_to_every_image(self):
+        root = Path(__file__).resolve().parents[4] / "src"
+        sources = sorted(path for path in root.rglob("*")
+                         if path.suffix in (".cu", ".cuh", ".inc"))
+        self.assertTrue(sources, root)
+        for path in sources:
+            with self.subTest(source=str(path.relative_to(root))):
+                self.assertEqual(
+                    self._launched_in_one_image_only(
+                        self._uncommented(path.read_text())), [])
+
+    def test_scanner_flags_a_missing_else_and_accepts_a_stub(self):
+        guarded = """
+#if defined(FLASHQLA_ARCH_150)
+__global__ void only_tc02(float* x) {}
+#endif
+"""
+        stubbed = guarded[:-len("#endif\n")] + """#else
+__global__ void only_tc02(float*, int, int) {}
+#endif
+"""
+        self.assertEqual(self._one_image_only(self._uncommented(guarded)),
+                         ["only_tc02 under #if defined(FLASHQLA_ARCH_150)"])
+        self.assertEqual(self._one_image_only(self._uncommented(stubbed)), [])
+
+    def test_scanner_flags_a_launch_inside_an_image_condition(self):
+        guarded = """
+#if defined(FLASHQLA_ARCH_150) && PH_XY_FACTOR
+  only_tc02<__half><<<grid, 128>>>(x);
+#endif
+"""
+        body_guarded = """
+  const int mode = PH_XY_FACTOR ? 3 : 0;
+  if (PH_XY_FACTOR && mode >= 3) only_tc02<__half><<<grid, 128>>>(x);
+"""
+        self.assertEqual(
+            self._launched_in_one_image_only(self._uncommented(guarded)),
+            ["only_tc02 under #if defined(FLASHQLA_ARCH_150) && PH_XY_FACTOR"])
+        self.assertEqual(
+            self._launched_in_one_image_only(self._uncommented(body_guarded)), [])
+
+
 if __name__ == "__main__":
     unittest.main()

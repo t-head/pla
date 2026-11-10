@@ -697,7 +697,12 @@ __device__ __forceinline__ void ph_gemm_xt_swzl_regB_n4_acc(
 }
 #endif
 
-#if defined(FLASHQLA_ARCH_150) && PH_XY_FACTOR
+// Group width and padded staging stride of the grouped precompute variant.
+// Declared outside the architecture guard: __launch_bounds__ and the host
+// launcher reference them on every image of the fat binary.
+constexpr int PH_X_GROUP = 3;
+constexpr int PH_X_STAGE_LD = PH_CS + 8;
+
 // Construct the state-independent product on a chunk-parallel grid. Scratch
 // slots reserve one extra chunk per segment so unaligned boundaries cannot
 // alias the preceding segment's final padded tile.
@@ -705,6 +710,7 @@ template <typename Element>
 __global__ void __launch_bounds__(128, 6) ph_precompute_x_kernel(
     const Element* k, const Element* a, const float* beta, Element* x,
     const int* cu_seqlens, int batch_size, int H, int Hg) {
+#if defined(FLASHQLA_ARCH_150) && PH_XY_FACTOR
   int chunk = blockIdx.x;
   const int head = blockIdx.y;
   int seq = 0, start = 0, end = 0;
@@ -766,6 +772,15 @@ __global__ void __launch_bounds__(128, 6) ph_precompute_x_kernel(
       }
     }
   }
+#else
+  // PPU1.0/1.1 never take this path (see launch_prepare_h_cp_cute). The
+  // definition itself stays in every image on purpose: a fat binary whose
+  // non-tc02 image lacks a __global__ that the host launches fails at run
+  // time with "empty kernel launch" / invalid device function, even on the
+  // board that runs the tc02 image.
+  (void)k; (void)a; (void)beta; (void)x; (void)cu_seqlens;
+  (void)batch_size; (void)H; (void)Hg;
+#endif
 }
 
 // Grouped variant: one CTA per (chunk, key head) runs PH_X_GROUP 128-thread
@@ -774,14 +789,13 @@ __global__ void __launch_bounds__(128, 6) ph_precompute_x_kernel(
 // its rounded X tile in padded smem so the global write is a contiguous
 // 16B-vector copy instead of scattered 2B stores. Arithmetic, accumulation
 // order and rounding match ph_precompute_x_kernel element for element.
-constexpr int PH_X_GROUP = 3;
-constexpr int PH_X_STAGE_LD = PH_CS + 8;
 
 template <typename Element>
 __global__ void __launch_bounds__(PH_WG * PH_X_GROUP, 4)
 ph_precompute_x_group_kernel(
     const Element* k, const Element* a, const float* beta, Element* x,
     const int* cu_seqlens, int batch_size, int H, int Hg) {
+#if defined(FLASHQLA_ARCH_150) && PH_XY_FACTOR
   using CE = typename fq::ElementTraits<Element>::CuteType;
   int chunk = blockIdx.x;
   const int key_head = blockIdx.y;
@@ -904,8 +918,18 @@ ph_precompute_x_group_kernel(
     const int col = (i % ROW_VECS) * VEC;
     dst[i] = *reinterpret_cast<const uint4*>(tile + row * PH_X_STAGE_LD + col);
   }
+#else
+  // PPU1.0/1.1 never take this path (see launch_prepare_h_cp_cute). The
+  // definition itself stays in every image on purpose: a fat binary whose
+  // non-tc02 image lacks a __global__ that the host launches fails at run
+  // time with "empty kernel launch" / invalid device function, even on the
+  // board that runs the tc02 image.
+  (void)k; (void)a; (void)beta; (void)x; (void)cu_seqlens;
+  (void)batch_size; (void)H; (void)Hg;
+#endif
 }
 
+#if defined(FLASHQLA_ARCH_150) && PH_XY_FACTOR
 template <typename Element>
 __device__ __forceinline__ void ph_load_precomputed_x(
     Element* smem, const Element* gmem) {
@@ -1873,8 +1897,15 @@ void launch_prepare_h_cp_cute(
       num_tokens == 8192 && ((H == 12 && Hg == 4 && batch_size == 6) ||
                              (H == 6 && Hg == 2 && batch_size == 12));
   const int stream_mode = stream_target ? 3 : 0;
-#if defined(FLASHQLA_ARCH_150) && PH_XY_FACTOR
-  if (stream_mode >= 3 && H == flashqla_cute::PH_X_GROUP * Hg) {
+  // PH_XY_FACTOR is a compile-time 0 for the tc01 image, but it stays in this
+  // condition instead of becoming an #if: a preprocessor guard would leave the
+  // two precompute kernels unreferenced there, hgcc only emits a template
+  // __global__ for the images that reference it, and a fat binary whose ppu001
+  // image lacks a kernel the host launches fails at run time with "empty
+  // kernel launch" / invalid device function -- even though ZW-M890P executes
+  // the ppu0015 image. stream_target already excludes tc01 at run time.
+  if (PH_XY_FACTOR && stream_mode >= 3 &&
+      H == flashqla_cute::PH_X_GROUP * Hg) {
     dim3 x_grid((num_tokens + 31) / 32 + batch_size, Hg);
     constexpr int x_threads = flashqla_cute::PH_WG * flashqla_cute::PH_X_GROUP;
     if (dtype_tag == 0) {
@@ -1886,7 +1917,7 @@ void launch_prepare_h_cp_cute(
           reinterpret_cast<const __ppu_bfloat16*>(k), reinterpret_cast<const __ppu_bfloat16*>(a), beta,
           reinterpret_cast<__ppu_bfloat16*>(precomputed_x), cu_seqlens, batch_size, H, Hg);
     }
-  } else if (stream_mode >= 3) {
+  } else if (PH_XY_FACTOR && stream_mode >= 3) {
     dim3 x_grid((num_tokens + 31) / 32 + batch_size, H);
     if (dtype_tag == 0) {
       flashqla_cute::ph_precompute_x_kernel<__half><<<x_grid, 128, 0, stream>>>(
@@ -1898,7 +1929,6 @@ void launch_prepare_h_cp_cute(
           reinterpret_cast<__ppu_bfloat16*>(precomputed_x), cu_seqlens, batch_size, H, Hg);
     }
   }
-#endif
 
 #define PH_LAUNCH_TC01(ElementType, MinBlocks, ComputeMT) \
   do { \
