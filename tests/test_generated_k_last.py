@@ -293,23 +293,43 @@ class TunedTableTest(unittest.TestCase):
                 k.arg == "name" and isinstance(k.value, ast.Constant)
                 and k.value.value == "pla.prefill.flashqla._C" for k in n.keywords))
         depends = next(k.value for k in extension.keywords if k.arg == "depends")
+
+        def assigned(name):
+            return next(n.value for n in ast.walk(tree) if isinstance(n, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == name for t in n.targets))
+
         if isinstance(depends, ast.Name):
-            depends = next(n.value for n in ast.walk(tree) if isinstance(n, ast.Assign)
-                and any(isinstance(t, ast.Name) and t.id == depends.id
-                        for t in n.targets))
+            depends = assigned(depends.id)
         prefill = ROOT / "src/prefill/flashqla"
-        paths = eval(compile(ast.Expression(depends), "<depends>", "eval"),
-                     {"os": os, "glob": glob, "prefill_dir": str(prefill)})
-        # Every header or .inc a kernel source includes has to be tracked.
-        included = set()
-        for source in (prefill / "kernels").glob("*.cu"):
-            included.update(re.findall(r'^\s*#\s*include\s+"([^"/]+)"',
-                                       source.read_text(), re.M))
-        local = {name for name in included if (prefill / "kernels" / name).is_file()}
-        self.assertIn("kkt_solve_cute_impl.cuh", local)
-        self.assertIn("fused_fwd_cute_body.inc", local)
-        for name in sorted(local):
-            self.assertIn(str(prefill / "kernels" / name), paths)
+        scope = {"os": os, "glob": glob, "re": re, "here": str(ROOT),
+                 "prefill_dir": str(prefill)}
+        helper = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                      and n.name == "local_headers")
+        exec(compile(ast.Module([helper], []), "<setup.py>", "exec"), scope)
+        for name in ("prefill_sources", "prefill_include_dirs"):
+            scope[name] = eval(compile(ast.Expression(assigned(name)), name, "eval"),
+                               scope)
+        paths = eval(compile(ast.Expression(depends), "<depends>", "eval"), scope)
+        tracked = {os.path.relpath(path, ROOT) for path in paths}
+        # Host-side headers outside kernels/ relink _C as well.
+        for header in ("src/prefill/flashqla/kernels/kkt_solve_cute_impl.cuh",
+                       "src/prefill/flashqla/kernels/fused_fwd_cute_body.inc",
+                       "src/prefill/flashqla/host/sanity_checks.h",
+                       "src/prefill/sanity_check.h", "src/prefill/instrument.h",
+                       "src/sanity_check.h", "src/op_forge_case.h",
+                       "src/bypass_exec.h", "src/ppu_torch_stream.h"):
+            self.assertIn(header, tracked)
+        # Every repository file a source or tracked header includes is tracked.
+        for path in scope["prefill_sources"] + list(paths):
+            path = Path(path)
+            for name in re.findall(r'^\s*#\s*include\s*"([^"]+)"',
+                                   path.read_text(), re.M):
+                for base in [path.parent] + [Path(d) for d in scope["prefill_include_dirs"]]:
+                    if (base / name).is_file():
+                        self.assertIn(os.path.relpath((base / name).resolve(), ROOT),
+                                      tracked, f"{path.name} includes {name}")
+                        break
+        self.assertTrue(all(path.startswith("src" + os.sep) for path in tracked))
 
     def test_generator_retains_chain_tree_tables(self):
         header = codegen.generate_tuned_dispatch([

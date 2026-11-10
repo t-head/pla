@@ -240,14 +240,30 @@ def test_gva_history(
         assert result[4] is None
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a PPU device")
-@pytest.mark.parametrize("heads,segments", [(6, 12), (12, 6)])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("offset", range(9))
-@pytest.mark.parametrize("raw_mode", ["none", "legacy", "indexed"])
-@pytest.mark.parametrize("fallback", [False, True])
-@pytest.mark.parametrize("capture", [False, True])
-def test_correct_h0_unaligned_ht(heads, segments, dtype, offset, raw_mode, fallback, capture):
+def _fallback_mask(pattern, segments, heads):
+    def both_transitions(mask):
+        steps = mask[1:] - mask[:-1]
+        return bool((steps == 1).any(0).all()) and bool((steps == -1).any(0).all())
+
+    seg = torch.arange(segments)[:, None]
+    head = torch.arange(heads)[None, :]
+    if pattern == "alternate":
+        mask = (seg + head) % 2
+    elif pattern == "runs":
+        mask = (seg // 2 + head) % 2
+    elif pattern == "random":
+        generator = torch.Generator().manual_seed(0)
+        mask = torch.randint(0, 2, (segments, heads), generator=generator)
+        while not both_transitions(mask):
+            mask = torch.randint(0, 2, (segments, heads), generator=generator)
+    else:
+        mask = torch.full((segments, heads), int(pattern == "ones"))
+    # Every head of a mixed pattern sees both a 0->1 and a 1->0 transition.
+    assert pattern in ("zeros", "ones") or both_transitions(mask)
+    return mask.to(device="cuda", dtype=torch.int8)
+
+
+def _check_correct_h0(heads, segments, dtype, offset, raw_mode, pattern, capture):
     from pla.prefill.flashqla import ops
 
     shape = (segments, heads, D, D)
@@ -257,17 +273,23 @@ def test_correct_h0_unaligned_ht(heads, segments, dtype, offset, raw_mode, fallb
     values = torch.arange(size, device="cuda").remainder(17).view(shape).float() / 128
     ht.copy_(values)
     assert ht.is_contiguous() and ht.storage_offset() == offset
-    mt = torch.eye(D, device="cuda", dtype=dtype).expand(shape).contiguous() * 0.5
-    mask = torch.full((segments, heads), int(fallback), dtype=torch.int8, device="cuda")
+    # Power-of-two diagonals keep the recurrence exact; neighbouring segments
+    # differ so a transition read from the wrong mt buffer is caught.
+    seg = torch.arange(segments, device="cuda")[:, None]
+    head = torch.arange(heads, device="cuda")[None, :]
+    scale = 2.0 ** -(1 + (seg + 2 * head) % 3).float()
+    mt = (torch.eye(D, device="cuda") * scale[..., None, None]).to(dtype)
+    mask = _fallback_mask(pattern, segments, heads)
     mapping = torch.tensor([0, segments], dtype=torch.int32, device="cuda")
     raw = torch.ones((3, heads, D, D), device="cuda") if raw_mode != "none" else None
     indices = torch.tensor([2], dtype=torch.int32, device="cuda") if raw_mode == "indexed" else None
     kwargs = dict(raw_h0=raw, raw_h0_indices=indices, raw_h0_k_last=raw_mode == "indexed")
     expected = []
     state = torch.zeros((heads, D, D), device="cuda") if raw is None else raw[0].clone()
+    decay = (mask.float() * scale)[..., None, None]
     for i in range(segments):
         expected.append(state.clone())
-        state = ht[i].float() + (state.to(dtype).float() * 0.5 if fallback else 0)
+        state = ht[i].float() + decay[i] * state.to(dtype).float()
     expected = torch.stack(expected)
 
     def run():
@@ -293,6 +315,31 @@ def test_correct_h0_unaligned_ht(heads, segments, dtype, offset, raw_mode, fallb
     assert bool((storage[offset + size:] == -123).all())
     if raw is not None:
         assert bool((raw == 1).all())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a PPU device")
+@pytest.mark.parametrize("heads,segments", [(6, 12), (12, 6)])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("offset", range(9))
+@pytest.mark.parametrize("raw_mode", ["none", "legacy", "indexed"])
+@pytest.mark.parametrize("fallback", [False, True])
+@pytest.mark.parametrize("capture", [False, True])
+def test_correct_h0_unaligned_ht(heads, segments, dtype, offset, raw_mode, fallback, capture):
+    _check_correct_h0(heads, segments, dtype, offset, raw_mode,
+                      "ones" if fallback else "zeros", capture)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a PPU device")
+@pytest.mark.parametrize("heads,segments", [(6, 12), (12, 6)])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("offset", [0, 1])
+@pytest.mark.parametrize("raw_mode", ["none", "legacy", "indexed"])
+@pytest.mark.parametrize("pattern", ["alternate", "runs", "random"])
+@pytest.mark.parametrize("capture", [False, True])
+def test_correct_h0_mixed_fallback(heads, segments, dtype, offset, raw_mode, pattern, capture):
+    # Offset 0 takes the 890P pipeline, whose mt prefetch and wait depend on
+    # the current and next masks; offset 1 takes the scalar path.
+    _check_correct_h0(heads, segments, dtype, offset, raw_mode, pattern, capture)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a PPU device")
