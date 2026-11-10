@@ -579,6 +579,68 @@ __device__ __forceinline__ void ff_gemm_regA_qkB_m4(
 #endif
 }
 
+#if defined(FLASHQLA_ARCH_150)
+// Convert only the current state K tile, preserving each Q/K reduction order.
+// The other state tiles stay FP32 rather than extending a 32-register A snapshot.
+template <typename Element, typename TS, typename TC0, typename TC1>
+__device__ __forceinline__ void ff_gemm_state_qkB_m4(
+    TS const& state, const Element* Qswz, const Element* Kswz, int tidx,
+    TC0& hq_acc, TC1& hk_acc) {
+  using TsmB = cute::PPU0015_TSM_LD_SWZL<
+      typename fq::ElementTraits<Element>::CuteType, 32, 32,
+      /*Swap=*/true, /*Trans=*/false, /*InstNum=*/FF_DK / 32>;
+  cute::clear(hq_acc);
+  cute::clear(hk_acc);
+  auto rState = cute::recast<float>(state);
+  auto rHq = cute::recast<float>(hq_acc);
+  auto rHk = cute::recast<float>(hk_acc);
+  CUTE_UNROLL
+  for (int kt = 0; kt < FF_DK / 16; ++kt) {
+    uint32_t qfrag[FF_CS / 16][4];
+    uint32_t kfrag[FF_CS / 16][4];
+    CUTE_UNROLL
+    for (int n = 0; n < FF_CS / 16; ++n) {
+      TsmB::copy(reinterpret_cast<int*>(qfrag[n]),
+          reinterpret_cast<void*>(fq::ff_swzl_read_base<Element>(Qswz)),
+          (kt % 2) * 16, n * 16, kt / 2, 0);
+      TsmB::copy(reinterpret_cast<int*>(kfrag[n]),
+          reinterpret_cast<void*>(fq::ff_swzl_read_base<Element>(Kswz)),
+          (kt % 2) * 16, n * 16, kt / 2, 0);
+    }
+    CUTE_UNROLL
+    for (int m = 0; m < cute::size<1>(hq_acc); ++m) {
+      uint32_t c_regs[4], a_regs[4];
+      CUTE_UNROLL
+      for (int i = 0; i < 4; ++i) {
+        const uint32_t lo = fq::element_bits16<Element>(
+            fq::float_to_element<Element>(rState(2 * i, m, kt)));
+        const uint32_t hi = fq::element_bits16<Element>(
+            fq::float_to_element<Element>(rState(2 * i + 1, m, kt)));
+        c_regs[i] = fq::pack_b16x2_u32(lo, hi);
+      }
+      fq::cfrag_to_afrag_mma_u32<Element>(c_regs, a_regs, tidx & 31);
+      CUTE_UNROLL
+      for (int n = 0; n < FF_CS / 16; ++n) {
+        fq::ppu_mma_impl<Element>(
+            rHq(0,m,n), rHq(1,m,n), rHq(2,m,n), rHq(3,m,n),
+            rHq(4,m,n), rHq(5,m,n), rHq(6,m,n), rHq(7,m,n),
+            a_regs[0], a_regs[1], a_regs[2], a_regs[3],
+            qfrag[n][0], qfrag[n][1], qfrag[n][2], qfrag[n][3],
+            rHq(0,m,n), rHq(1,m,n), rHq(2,m,n), rHq(3,m,n),
+            rHq(4,m,n), rHq(5,m,n), rHq(6,m,n), rHq(7,m,n));
+        fq::ppu_mma_impl<Element>(
+            rHk(0,m,n), rHk(1,m,n), rHk(2,m,n), rHk(3,m,n),
+            rHk(4,m,n), rHk(5,m,n), rHk(6,m,n), rHk(7,m,n),
+            a_regs[0], a_regs[1], a_regs[2], a_regs[3],
+            kfrag[n][0], kfrag[n][1], kfrag[n][2], kfrag[n][3],
+            rHk(0,m,n), rHk(1,m,n), rHk(2,m,n), rHk(3,m,n),
+            rHk(4,m,n), rHk(5,m,n), rHk(6,m,n), rHk(7,m,n));
+      }
+    }
+  }
+}
+#endif
+
 template <int N, int K, typename Element, typename TC>
 __device__ __forceinline__ void ff_gemm_regA_swzlB_m4(
     const uint32_t a_regs[K / 16][1][4], const Element* Bswz, int tidx,
@@ -1433,7 +1495,7 @@ fused_fwd_cp_cute_indexed_kernel(
 
 template <typename Element, int H_TPL, int Hg_TPL, int NGRP,
           int DVH_TPL = FF_DVH, bool AUX_P_TPL = false,
-          bool STATE_BF16 = false>
+          bool STATE_BF16 = false, bool TC02_REUSE_VD = false>
 __global__ void __launch_bounds__(FF_WG * (AUX_P_TPL ? 2 : NGRP), FF_MIN_BLOCKS)
 fused_fwd_cp_cute_indexed_vd_inplace_kernel(
     Element* __restrict__ o,
@@ -1532,7 +1594,7 @@ constexpr int kFusedMaxCachedDevices = 64;
 
 template <flashqla_cute::FfStateMode StateMode,
           typename Element, int H, int Hg, int NGRP, int DVH, bool AUX_P,
-          bool SBF16, bool VD_INPLACE = false>
+          bool SBF16, bool VD_INPLACE = false, bool TC02_REUSE_VD = false>
 void configure_fused_kernel_smem_once(int device_index, int smem_cap) {
   auto configure = [smem_cap]() {
     if constexpr (StateMode == flashqla_cute::FfStateMode::Legacy) {
@@ -1544,7 +1606,7 @@ void configure_fused_kernel_smem_once(int device_index, int smem_cap) {
       if constexpr (VD_INPLACE) {
         hggcFuncSetAttribute(
             flashqla_cute::fused_fwd_cp_cute_indexed_vd_inplace_kernel<
-                Element, H, Hg, NGRP, DVH, AUX_P, SBF16>,
+                Element, H, Hg, NGRP, DVH, AUX_P, SBF16, TC02_REUSE_VD>,
             hggcFuncAttributeMaxDynamicSharedMemorySize, smem_cap);
       } else {
         hggcFuncSetAttribute(
@@ -1686,6 +1748,11 @@ void launch_fused_fwd_cp_cute(
   const bool use_tc02_h24_indexed_state =
       !is_tc01 && H == 24 && raw_batch_size <= 3 && num_tokens >= 6144 &&
       raw_state != nullptr;
+  const bool use_tc02_gva_stream_state =
+      !is_tc01 && num_cu == 39 && raw_batch_size == 1 && num_tokens == 8192 &&
+      ((H == 12 && Hg == 4 && batch_size == 6) ||
+       (H == 6 && Hg == 2 && batch_size == 12)) &&
+      cp_seq_map != nullptr && raw_state != nullptr;
   // Head-major launch order reduces variable-length tail waves by distributing
   // adjacent CTA IDs across heads of the same request. Keep the existing long
   // H=32/Hg=8/B=3 specialization and extend it to the full-sweep-safe packed
@@ -1737,15 +1804,15 @@ void launch_fused_fwd_cp_cute(
       }                                                                          \
     } while (0)
 
-#define FF_LAUNCH_INDEXED_VD_INPLACE_S(ElementType, HV, HGV, NG, DVH, AUX, BLOCK, SBF16) \
+#define FF_LAUNCH_INDEXED_VD_INPLACE_S(ElementType, HV, HGV, NG, DVH, AUX, BLOCK, SBF16, REUSEVD) \
     do {                                                                         \
       using SPool = flashqla::StatePool<(SBF16)>;                                \
       configure_fused_kernel_smem_once<                                          \
           flashqla_cute::FfStateMode::Indexed,                                   \
-          ElementType, (HV), (HGV), (NG), (DVH), (AUX), (SBF16), true>(          \
+          ElementType, (HV), (HGV), (NG), (DVH), (AUX), (SBF16), true, (REUSEVD)>( \
               device_index, pad_cap);                                            \
       flashqla_cute::fused_fwd_cp_cute_indexed_vd_inplace_kernel<                \
-          ElementType, (HV), (HGV), (NG), (DVH), (AUX), (SBF16)>                 \
+          ElementType, (HV), (HGV), (NG), (DVH), (AUX), (SBF16), (REUSEVD)>      \
           <<<grid, (BLOCK), smem_bytes, stream>>>(                               \
               reinterpret_cast<ElementType*>(o),                                 \
               reinterpret_cast<const ElementType*>(q),                           \
@@ -1787,14 +1854,16 @@ void launch_fused_fwd_cp_cute(
 
 #define FF_LAUNCH_INDEXED(ElementType, HV, HGV, NG, DVH, AUX, BLOCK)             \
     do {                                                                         \
-      if constexpr ((HV) == 32 && (HGV) == 4) {                                  \
-        if (use_tc01_vd_inplace) {                                               \
+      if constexpr ((((HV) == 32 || (HV) == 12) && (HGV) == 4) ||               \
+                    ((HV) == 6 && (HGV) == 2)) {                                \
+        if (((HV) == 32 && use_tc01_vd_inplace) ||                               \
+            (((HV) == 12 || (HV) == 6) && use_tc02_gva_stream_state)) {          \
           if (state_bf16) {                                                      \
             FF_LAUNCH_INDEXED_VD_INPLACE_S(                                      \
-                ElementType, HV, HGV, NG, DVH, AUX, BLOCK, true);                 \
+                ElementType, HV, HGV, NG, DVH, AUX, BLOCK, true, false);           \
           } else {                                                               \
             FF_LAUNCH_INDEXED_VD_INPLACE_S(                                      \
-                ElementType, HV, HGV, NG, DVH, AUX, BLOCK, false);                \
+                ElementType, HV, HGV, NG, DVH, AUX, BLOCK, false, false);          \
           }                                                                      \
           break;                                                                 \
         }                                                                        \
@@ -1923,6 +1992,13 @@ void launch_fused_fwd_cp_cute(
             FF_LAUNCH_INDEXED(ElementType, HV, HGV, NG, DVH, false, block);     \
           } else {                                                               \
             FF_LAUNCH_RUNTIME(ElementType, HV, HGV, NG, DVH, false, block);     \
+          }                                                                      \
+        } else if constexpr (((HV) == 12 && (HGV) == 4) ||                       \
+                             ((HV) == 6 && (HGV) == 2)) {                        \
+          if (use_tc02_gva_stream_state) {                                       \
+            FF_LAUNCH_INDEXED(ElementType, HV, HGV, NG, DVH, false, block);       \
+          } else {                                                               \
+            FF_LAUNCH_RUNTIME(ElementType, HV, HGV, NG, DVH, false, block);       \
           }                                                                      \
         } else if constexpr ((HV) == 32) {                                       \
           if (use_tc02_head_major) {                                             \

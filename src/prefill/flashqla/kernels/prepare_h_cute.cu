@@ -71,8 +71,10 @@
 #include <hggc_fp16.h>
 #include <hggc_bf16.h>
 #include <cstdint>
+#include <cstdlib>
 #include <mutex>
 #include <stdexcept>
+#include <type_traits>
 
 #include "flashqla_cute_traits.cuh"
 
@@ -131,6 +133,11 @@ using PhMmaN4T = decltype(cute::make_tiled_mma(
     fq::MmaAtom<Element>{},
     cute::Layout<cute::Shape<cute::_1, cute::_4, cute::_1>>{}));
 
+template <typename Element>
+using PhMmaM4T = decltype(cute::make_tiled_mma(
+    fq::MmaAtom<Element>{},
+    cute::Layout<cute::Shape<cute::_4, cute::_1, cute::_1>>{}));
+
 // ---- smem byte layout (single-buffer) --------------------------------------
 constexpr int PH_ELEM_K   = PH_CS * PH_DK;    // K element count       (8KB)
 constexpr int PH_ELEM_V   = PH_CS * PH_DV;    // V element count       (8KB)
@@ -165,13 +172,13 @@ constexpr int PH_A     = PH_V   + PH_ELEM_V * 2;                  // A_buf  [CS,
 constexpr int PH_KT    = PH_A   + PH_ELEM_A * 2;                  // KT_buf [DK,CS] (0 if PH_K_SWZL)
 constexpr int PH_AGSWZ = PH_KT  + PH_KT_BYTES;                    // Ag_swz [CS,CS] (0 if !PH_A_SWZL)
 #endif
-template <bool PH_COMBINED, bool PH_SPLIT_DV = false>
+template <bool PH_COMBINED, bool PH_SPLIT_DV = false, bool PrecomputeX = false>
 struct PhSmemLayout {
   static constexpr int NGRP = PH_SPLIT_DV ? 1 : (PH_COMBINED ? 4 : 2);
   static constexpr int NTHREADS = PH_WG * NGRP;
 #if PH_XY_FACTOR
-  static constexpr int XT = PH_A + PH_NBUF * PH_ELEM_A * 2;
-  static constexpr int GSH = XT + PH_ELEM_XT * 2;
+  static constexpr int XT = PrecomputeX ? PH_A : PH_A + PH_NBUF * PH_ELEM_A * 2;
+  static constexpr int GSH = XT + (PrecomputeX ? PH_NBUF : 1) * PH_ELEM_XT * 2;
   static constexpr int BSH = GSH + PH_NBUF * PH_CS * 4;
   static constexpr int GREV = BSH + PH_NBUF * PH_CS * 4;
   static constexpr int TOTAL = GREV + PH_CS * 4;
@@ -405,6 +412,15 @@ __forceinline__ __device__ void ph_aiu_swzl_write_k_cs32(
 #endif
 }
 
+// Lane i of a full warp holds g[i] of one chunk (0 past `actual`). Returns
+// g_rev[i] = exp2(g_last - g_i) with the tail clamped to g_last, matching the
+// shared-memory formulation element for element.
+__forceinline__ __device__ float ph_g_rev_lane(float gv, int actual, int lane) {
+  const float g_last = __shfl_sync(0xffffffff, gv, actual > 0 ? actual - 1 : 0);
+  const float gi = lane < actual ? gv : g_last;
+  return exp2f((g_last - gi) * PH_LOG2E);
+}
+
 // ---- named group barrier: sync only the PH_WG (128) threads of one DV group.
 //      Uses barrier resource id (gid+1) in {1,2} so the two groups get distinct
 //      hardware barriers (id 0 is what __syncthreads uses). ----
@@ -421,6 +437,112 @@ __forceinline__ __device__ void ph_group_bar(int gid) {
 // Keep them out of every tc01 device pass even if a global build flag tries
 // to enable the optimization.
 #if defined(FLASHQLA_ARCH_150) && PH_XY_FACTOR
+// Round two floats to the 16-bit element type with one paired conversion.
+// Bit-for-bit equal to packing two scalar round-to-nearest conversions with
+// `lo` in the low half, but avoids the separate mask/shift/or sequence.
+template <typename Element>
+__device__ __forceinline__ uint32_t ph_pack_rn_b16x2(float lo, float hi) {
+  if constexpr (std::is_same_v<Element, __ppu_bfloat16>) {
+    union { __ppu_bfloat162 v; uint32_t u; } bits;
+    bits.v = __floats2bfloat162_rn(lo, hi);
+    return bits.u;
+  } else {
+    union { __half2 v; uint32_t u; } bits;
+    bits.v = __floats2half2_rn(lo, hi);
+    return bits.u;
+  }
+}
+
+// Exact widening of a packed b16x2 register (`lo` from the low half).
+template <typename Element>
+__device__ __forceinline__ void ph_unpack_b16x2(uint32_t u, float& lo, float& hi) {
+  if constexpr (std::is_same_v<Element, __ppu_bfloat16>) {
+    lo = __uint_as_float(u << 16);
+    hi = __uint_as_float(u & 0xffff0000u);
+  } else {
+    union { uint32_t u; __half2 v; } bits;
+    bits.u = u;
+    const float2 f = __half22float2(bits.v);
+    lo = f.x;
+    hi = f.y;
+  }
+}
+
+// Transposed recurrence: each warp owns DV16 throughout h^T -> U^T -> Y^T.
+// K is the existing physical [CS,DK] swizzled tile. Swap=true reads its
+// natural TN B operand; C->A conversion is lane-local on tc02.
+template <typename Element, typename TH, typename TC>
+__device__ __forceinline__ void ph_gemm_state_kB_m4(
+    TH const& h, const Element* Kswz, int tidx, TC& u) {
+  using TsmB = cute::PPU0015_TSM_LD_SWZL<
+      typename fq::ElementTraits<Element>::CuteType, 32, 32,
+      /*Swap=*/true, /*Trans=*/false, /*InstNum=*/PH_DK / 32>;
+  cute::clear(u);
+  auto rH = cute::recast<float>(h);
+  auto rU = cute::recast<float>(u);
+  CUTE_UNROLL
+  for (int kt = 0; kt < PH_DK / 16; ++kt) {
+    uint32_t b[PH_CS / 16][4];
+    CUTE_UNROLL
+    for (int n = 0; n < PH_CS / 16; ++n) {
+      TsmB::copy(reinterpret_cast<int*>(b[n]),
+          reinterpret_cast<void*>(fq::ff_swzl_read_base<Element>(Kswz)),
+          (kt % 2) * 16, n * 16, kt / 2, 0);
+    }
+    uint32_t c[4], a[4];
+    CUTE_UNROLL
+    for (int i = 0; i < 4; ++i) {
+      c[i] = ph_pack_rn_b16x2<Element>(rH(2 * i, 0, kt), rH(2 * i + 1, 0, kt));
+    }
+    fq::cfrag_to_afrag_mma_u32<Element>(c, a, tidx & 31);
+    CUTE_UNROLL
+    for (int n = 0; n < PH_CS / 16; ++n) {
+      fq::ppu_mma_impl<Element>(
+          rU(0,0,n), rU(1,0,n), rU(2,0,n), rU(3,0,n),
+          rU(4,0,n), rU(5,0,n), rU(6,0,n), rU(7,0,n),
+          a[0], a[1], a[2], a[3], b[n][0], b[n][1], b[n][2], b[n][3],
+          rU(0,0,n), rU(1,0,n), rU(2,0,n), rU(3,0,n),
+          rU(4,0,n), rU(5,0,n), rU(6,0,n), rU(7,0,n));
+    }
+  }
+}
+
+// Scratch remains X^T[DK,CS] with four row cubes. Reading it as a natural
+// TN B operand computes Y^T @ X without changing scratch or precompute order.
+template <typename Element, int PreloadDepth = 4, typename TH>
+__device__ __forceinline__ void ph_gemm_yA_xtB_m4_acc(
+    const uint32_t y[PH_CS / 16][1][4], const Element* XTswz, TH& h) {
+  using TsmB = cute::PPU0015_TSM_LD_SWZL<
+      typename fq::ElementTraits<Element>::CuteType, 32, 32,
+      /*Swap=*/true, /*Trans=*/false, /*InstNum=*/1>;
+  auto rH = cute::recast<float>(h);
+  CUTE_UNROLL
+  for (int kt = 0; kt < PH_CS / 16; ++kt) {
+    CUTE_UNROLL
+    for (int n0 = 0; n0 < PH_DK / 16; n0 += PreloadDepth) {
+      uint32_t b[PreloadDepth][4];
+      CUTE_UNROLL
+      for (int j = 0; j < PreloadDepth; ++j) {
+        const int dk = (n0 + j) * 16;
+        TsmB::copy(reinterpret_cast<int*>(b[j]),
+            reinterpret_cast<void*>(fq::ff_swzl_read_base<Element>(XTswz)),
+            kt * 16, dk % 32, 0, dk / 32);
+      }
+      CUTE_UNROLL
+      for (int j = 0; j < PreloadDepth; ++j) {
+        const int n = n0 + j;
+        fq::ppu_mma_impl<Element>(
+            rH(0,0,n), rH(1,0,n), rH(2,0,n), rH(3,0,n),
+            rH(4,0,n), rH(5,0,n), rH(6,0,n), rH(7,0,n),
+            y[kt][0][0], y[kt][0][1], y[kt][0][2], y[kt][0][3],
+            b[j][0], b[j][1], b[j][2], b[j][3],
+            rH(0,0,n), rH(1,0,n), rH(2,0,n), rH(3,0,n),
+            rH(4,0,n), rH(5,0,n), rH(6,0,n), rH(7,0,n));
+      }
+    }
+  }
+}
+
 // A is a natural [M,K] matrix in the same 32x32 AIU-swizzled format as K.
 // B is already a warp-owned tc02 fragment produced from the state accumulator.
 // The 1x4 warp layout keeps every 16-column DV tile on one warp, so K@h does
@@ -474,6 +596,60 @@ __device__ __forceinline__ void ph_gemm_swzlA_regB_n4(
   }
 }
 
+// Stream one state tile into the B fragment immediately before its MMA use.
+// This preserves the conversion boundary and reduction order while shortening
+// the lifetime of the 32-word packed-state snapshot.
+template <int M, int K, typename Element, bool DecayState,
+          typename TC, typename TH>
+__device__ __forceinline__ void ph_gemm_swzlA_state_n4(
+    const Element* Aswz, int tidx, TC& tC, TH& h, float decay) {
+  using TsmA = cute::PPU0015_TSM_LD_SWZL<
+      typename fq::ElementTraits<Element>::CuteType, 32, 32, false, false, K / 32>;
+  PhMmaN4T<Element> mma;
+  auto thr_mma = mma.get_thread_slice(tidx);
+  auto dummyA = cute::make_tensor(
+      cute::make_smem_ptr(reinterpret_cast<
+          typename fq::ElementTraits<Element>::CuteType*>(0x10)),
+      fq::SmemLayout2D<M, K>{});
+  auto rA_full = thr_mma.partition_fragment_A(dummyA);
+  cute::clear(tC);
+  auto rC = cute::recast<float>(tC);
+  auto rH = cute::recast<float>(h);
+  const int lane = tidx & 31;
+  CUTE_UNROLL
+  for (int kt = 0; kt < cute::size<2>(rA_full); ++kt) {
+    uint32_t packed[4], b[4];
+    CUTE_UNROLL
+    for (int i = 0; i < 4; ++i) {
+      const uint32_t lo = fq::element_bits16<Element>(
+          fq::float_to_element<Element>(rH(2 * i, kt, 0)));
+      const uint32_t hi = fq::element_bits16<Element>(
+          fq::float_to_element<Element>(rH(2 * i + 1, kt, 0)));
+      packed[i] = fq::pack_b16x2_u32(lo, hi);
+    }
+    fq::cfrag_to_bfrag_swizzle_u32(packed, b, lane);
+    if constexpr (DecayState) {
+      CUTE_UNROLL
+      for (int i = 0; i < 8; ++i) rH(i, kt, 0) *= decay;
+    }
+    CUTE_UNROLL
+    for (int m = 0; m < cute::size<1>(tC); ++m) {
+      int a[4] = {0, 0, 0, 0};
+      TsmA::copy(a,
+          reinterpret_cast<void*>(fq::ff_swzl_read_base<Element>(Aswz)),
+          (kt % 2) * 16, m * 16, kt / 2, 0);
+      fq::ppu_mma_impl<Element>(
+          rC(0,m,0), rC(1,m,0), rC(2,m,0), rC(3,m,0),
+          rC(4,m,0), rC(5,m,0), rC(6,m,0), rC(7,m,0),
+          static_cast<uint32_t>(a[0]), static_cast<uint32_t>(a[1]),
+          static_cast<uint32_t>(a[2]), static_cast<uint32_t>(a[3]),
+          b[0], b[1], b[2], b[3],
+          rC(0,m,0), rC(1,m,0), rC(2,m,0), rC(3,m,0),
+          rC(4,m,0), rC(5,m,0), rC(6,m,0), rC(7,m,0));
+    }
+  }
+}
+
 // X^T consists of four independently swizzled 32x32 row cubes. Read those
 // cubes with TSM_LD_SWZL and accumulate X^T@Y directly into the persistent
 // [DK,DVh] state. `stage` selects the DK row cube; no plain shared-memory copy
@@ -521,6 +697,253 @@ __device__ __forceinline__ void ph_gemm_xt_swzl_regB_n4_acc(
 }
 #endif
 
+// Group width and padded staging stride of the grouped precompute variant.
+// Declared outside the architecture guard: __launch_bounds__ and the host
+// launcher reference them on every image of the fat binary.
+constexpr int PH_X_GROUP = 3;
+constexpr int PH_X_STAGE_LD = PH_CS + 8;
+
+// Construct the state-independent product on a chunk-parallel grid. Scratch
+// slots reserve one extra chunk per segment so unaligned boundaries cannot
+// alias the preceding segment's final padded tile.
+template <typename Element>
+__global__ void __launch_bounds__(128, 6) ph_precompute_x_kernel(
+    const Element* k, const Element* a, const float* beta, Element* x,
+    const int* cu_seqlens, int batch_size, int H, int Hg) {
+#if defined(FLASHQLA_ARCH_150) && PH_XY_FACTOR
+  int chunk = blockIdx.x;
+  const int head = blockIdx.y;
+  int seq = 0, start = 0, end = 0;
+  for (; seq < batch_size; ++seq) {
+    start = cu_seqlens[seq];
+    end = cu_seqlens[seq + 1];
+    const int chunks = (end - start + PH_CS - 1) / PH_CS;
+    if (chunk < chunks) break;
+    chunk -= chunks;
+  }
+  if (seq == batch_size) return;
+  const int cts = start + chunk * PH_CS;
+  const int actual = min(PH_CS, end - cts);
+  const int tx = threadIdx.x;
+  __shared__ Element K_buf[PH_ELEM_K];
+  __shared__ Element A_buf[PH_ELEM_A];
+  __shared__ float b[PH_CS];
+  if (tx == 0) {
+    ph_aiu_swzl_write_k_cs32<Element>(K_buf,
+        k + (int64_t)cts * Hg * PH_DK + (head / (H / Hg)) * PH_DK,
+        Hg * PH_DK, actual);
+    ph_aiu_load_2d_b16(A_buf,
+        a + (int64_t)cts * H * PH_CS + head * PH_CS,
+        PH_CS, actual, (int64_t)H * PH_CS * sizeof(Element), PH_CS);
+    ph_aiu_commit();
+  }
+  if (tx < PH_CS) b[tx] = tx < actual
+      ? beta[(int64_t)(cts + tx) * H + head] : 0.0f;
+  ph_aiu_wait_all();
+  __syncthreads();
+  fq::TiledMmaM32T<Element> mma;
+  auto thr = mma.get_thread_slice(tx);
+  auto id = cute::make_identity_tensor(cute::make_shape(
+      cute::Int<PH_CS>{}, cute::Int<PH_CS>{}));
+  auto coords = thr.partition_C(id);
+  auto sA = fq::make_smem_tensor_h<PH_CS, PH_CS>(A_buf);
+  auto sAT = fq::transpose_tensor(sA);
+  const int64_t base = ((int64_t)(cts / PH_CS + seq) * H + head) * PH_DK * PH_CS;
+  CUTE_UNROLL
+  for (int cube = 0; cube < PH_DK / PH_CS; ++cube) {
+    auto acc = fq::make_acc<PH_CS, PH_CS, fq::TiledMmaM32T<Element>, Element>(tx);
+    cute::clear(acc);
+    fq::flashqla_gemm_ss_swzlA_trans_acc_m32<PH_CS, PH_CS,
+        decltype(sAT), decltype(acc), Element>(
+            K_buf + cube * PH_ELEM_A, sAT, tx, acc);
+    auto r = cute::recast<float>(acc);
+    CUTE_UNROLL
+    for (int m = 0; m < cute::size<1>(coords); ++m) {
+      CUTE_UNROLL
+      for (int n = 0; n < cute::size<2>(coords); ++n) {
+        CUTE_UNROLL
+        for (int vv = 0; vv < cute::size<0>(coords); ++vv) {
+          auto crd = coords(vv, m, n);
+          const int dk = cube * PH_CS + cute::get<0>(crd);
+          const int cs = cute::get<1>(crd);
+          x[base + dk * PH_CS + cs] = fq::float_to_element<Element>(
+              -b[cs] * r(vv, m, n));
+        }
+      }
+    }
+  }
+#else
+  // PPU1.0/1.1 never take this path (see launch_prepare_h_cp_cute). The
+  // definition itself stays in every image on purpose: a fat binary whose
+  // non-tc02 image lacks a __global__ that the host launches fails at run
+  // time with "empty kernel launch" / invalid device function, even on the
+  // board that runs the tc02 image.
+  (void)k; (void)a; (void)beta; (void)x; (void)cu_seqlens;
+  (void)batch_size; (void)H; (void)Hg;
+#endif
+}
+
+// Grouped variant: one CTA per (chunk, key head) runs PH_X_GROUP 128-thread
+// groups, one per value head sharing the key head. K is loaded once, the
+// A^T operand is fetched into registers once per group, and each group stages
+// its rounded X tile in padded smem so the global write is a contiguous
+// 16B-vector copy instead of scattered 2B stores. Arithmetic, accumulation
+// order and rounding match ph_precompute_x_kernel element for element.
+
+template <typename Element>
+__global__ void __launch_bounds__(PH_WG * PH_X_GROUP, 4)
+ph_precompute_x_group_kernel(
+    const Element* k, const Element* a, const float* beta, Element* x,
+    const int* cu_seqlens, int batch_size, int H, int Hg) {
+#if defined(FLASHQLA_ARCH_150) && PH_XY_FACTOR
+  using CE = typename fq::ElementTraits<Element>::CuteType;
+  int chunk = blockIdx.x;
+  const int key_head = blockIdx.y;
+  int seq = 0, start = 0, end = 0;
+  for (; seq < batch_size; ++seq) {
+    start = cu_seqlens[seq];
+    end = cu_seqlens[seq + 1];
+    const int chunks = (end - start + PH_CS - 1) / PH_CS;
+    if (chunk < chunks) break;
+    chunk -= chunks;
+  }
+  if (seq == batch_size) return;
+  const int cts = start + chunk * PH_CS;
+  const int actual = min(PH_CS, end - cts);
+  const int group = threadIdx.x / PH_WG;
+  const int tx = threadIdx.x % PH_WG;
+  const int head = key_head * PH_X_GROUP + group;
+  __shared__ Element K_buf[PH_ELEM_K];
+  __shared__ Element A_buf[PH_X_GROUP][PH_ELEM_A];
+  __shared__ float b[PH_X_GROUP][PH_CS];
+  __shared__ __align__(16) Element stage[PH_X_GROUP][PH_DK * PH_X_STAGE_LD];
+  if (threadIdx.x == 0) {
+    ph_aiu_swzl_write_k_cs32<Element>(K_buf,
+        k + (int64_t)cts * Hg * PH_DK + key_head * PH_DK, Hg * PH_DK, actual);
+    CUTE_UNROLL
+    for (int g = 0; g < PH_X_GROUP; ++g) {
+      ph_aiu_load_2d_b16(A_buf[g],
+          a + (int64_t)cts * H * PH_CS + (key_head * PH_X_GROUP + g) * PH_CS,
+          PH_CS, actual, (int64_t)H * PH_CS * sizeof(Element), PH_CS);
+    }
+    ph_aiu_commit();
+  }
+  if (tx < PH_CS) b[group][tx] = tx < actual
+      ? beta[(int64_t)(cts + tx) * H + head] : 0.0f;
+  ph_aiu_wait_all();
+  __syncthreads();
+
+  using TsmTrans = fq::PpuTsmLdSwzl<CE, 32, 32, /*Swap=*/false, /*Trans=*/true, /*InstNum=*/1>;
+  fq::TiledMmaM32T<Element> mma;
+  auto thr = mma.get_thread_slice(tx);
+  auto id = cute::make_identity_tensor(cute::make_shape(
+      cute::Int<PH_CS>{}, cute::Int<PH_CS>{}));
+  auto coords = thr.partition_C(id);
+  auto sA = fq::make_smem_tensor_h<PH_CS, PH_CS>(A_buf[group]);
+  auto sAT = fq::transpose_tensor(sA);
+  auto rB_full = thr.partition_fragment_B(sAT);
+  {
+    auto copy_B = cute::make_tiled_copy_B(fq::SmemCopyAtomT<Element>{}, mma);
+    auto thr_copy_B = copy_B.get_thread_slice(tx);
+    auto sB_part = thr_copy_B.partition_S(sAT);
+    auto rB_retile = thr_copy_B.retile_D(rB_full);
+    CUTE_UNROLL
+    for (int kk = 0; kk < cute::size<2>(rB_full); ++kk)
+      cute::copy(copy_B, sB_part(cute::_, cute::_, kk), rB_retile(cute::_, cute::_, kk));
+  }
+  auto dummyA = cute::make_tensor(
+      cute::make_smem_ptr(reinterpret_cast<CE*>(0x10)),
+      fq::SmemLayout2D<PH_CS, PH_CS>{});
+  auto rA_full = thr.partition_fragment_A(dummyA);
+  const int dk_in_cube = (tx / 32) % 2 * 16;
+  Element* tile = stage[group];
+  CUTE_UNROLL
+  for (int cube = 0; cube < PH_DK / PH_CS; ++cube) {
+    auto acc = fq::make_acc<PH_CS, PH_CS, fq::TiledMmaM32T<Element>, Element>(tx);
+    cute::clear(acc);
+    auto r = cute::recast<float>(acc);
+    CUTE_UNROLL
+    for (int kk = 0; kk < cute::size<2>(rA_full); ++kk) {
+      int afrag[4] = {0, 0, 0, 0};
+      TsmTrans::copy(afrag, reinterpret_cast<void*>(
+                         fq::ff_swzl_read_base<Element>(K_buf + cube * PH_ELEM_A)),
+                     kk * 16, dk_in_cube, 0, 0);
+      auto rA = cute::recast<uint32_t>(rA_full(cute::_, 0, kk));
+      rA(0) = static_cast<uint32_t>(afrag[0]);
+      rA(1) = static_cast<uint32_t>(afrag[1]);
+      rA(2) = static_cast<uint32_t>(afrag[2]);
+      rA(3) = static_cast<uint32_t>(afrag[3]);
+    }
+    CUTE_UNROLL
+    for (int kk = 0; kk < cute::size<2>(rB_full); ++kk) {
+      CUTE_UNROLL
+      for (int m = 0; m < cute::size<1>(acc); ++m) {
+        CUTE_UNROLL
+        for (int n = 0; n < cute::size<1>(rB_full); ++n) {
+          auto rA = cute::recast<uint32_t>(rA_full(cute::_, m, kk));
+          auto rB = cute::recast<uint32_t>(rB_full(cute::_, n, kk));
+          fq::ppu_mma_impl<Element>(
+              r(0,m,n), r(1,m,n), r(2,m,n), r(3,m,n),
+              r(4,m,n), r(5,m,n), r(6,m,n), r(7,m,n),
+              rA(0), rA(1), rA(2), rA(3),
+              rB(0), rB(1), rB(2), rB(3),
+              r(0,m,n), r(1,m,n), r(2,m,n), r(3,m,n),
+              r(4,m,n), r(5,m,n), r(6,m,n), r(7,m,n));
+        }
+      }
+    }
+    CUTE_UNROLL
+    for (int m = 0; m < cute::size<1>(coords); ++m) {
+      CUTE_UNROLL
+      for (int n = 0; n < cute::size<2>(coords); ++n) {
+        CUTE_UNROLL
+        for (int vv = 0; vv < cute::size<0>(coords); ++vv) {
+          auto crd = coords(vv, m, n);
+          const int dk = cube * PH_CS + cute::get<0>(crd);
+          const int cs = cute::get<1>(crd);
+          tile[dk * PH_X_STAGE_LD + cs] = fq::float_to_element<Element>(
+              -b[group][cs] * r(vv, m, n));
+        }
+      }
+    }
+  }
+  ph_group_bar(group);
+  constexpr int VEC = 16 / sizeof(Element);
+  constexpr int ROW_VECS = PH_CS / VEC;
+  uint4* dst = reinterpret_cast<uint4*>(
+      x + ((int64_t)(cts / PH_CS + seq) * H + head) * PH_DK * PH_CS);
+  CUTE_UNROLL
+  for (int i = tx; i < PH_DK * ROW_VECS; i += PH_WG) {
+    const int row = i / ROW_VECS;
+    const int col = (i % ROW_VECS) * VEC;
+    dst[i] = *reinterpret_cast<const uint4*>(tile + row * PH_X_STAGE_LD + col);
+  }
+#else
+  // PPU1.0/1.1 never take this path (see launch_prepare_h_cp_cute). The
+  // definition itself stays in every image on purpose: a fat binary whose
+  // non-tc02 image lacks a __global__ that the host launches fails at run
+  // time with "empty kernel launch" / invalid device function, even on the
+  // board that runs the tc02 image.
+  (void)k; (void)a; (void)beta; (void)x; (void)cu_seqlens;
+  (void)batch_size; (void)H; (void)Hg;
+#endif
+}
+
+#if defined(FLASHQLA_ARCH_150) && PH_XY_FACTOR
+template <typename Element>
+__device__ __forceinline__ void ph_load_precomputed_x(
+    Element* smem, const Element* gmem) {
+  using Copy = fq::PpuAiuLoad<32 * 32 * 16,
+      typename fq::ElementTraits<Element>::CuteType, false, 32, 32, true>;
+  cute::AiuDesc desc;
+  desc.init(reinterpret_cast<const uint8_t*>(gmem), PH_DK, PH_CS, PH_CS);
+  CUTE_UNROLL
+  for (int cube = 0; cube < PH_DK / PH_CS; ++cube) {
+    Copy::copy(smem + cube * PH_ELEM_A, gmem, desc, 0, cube * PH_CS);
+  }
+}
+#endif
+
 // PH_MIN_BLOCKS retains the original two-pass kernel's register-pressure
 // tuning. The combined four-group kernel uses one block per CU because its
 // persistent state requires 192 registers per thread.
@@ -533,9 +956,11 @@ __device__ __forceinline__ void ph_gemm_xt_swzl_regB_n4_acc(
 // Verified in numpy (mt_math_check.py): prepare_h's own affine decomposition
 // reproduces the recurrence to rel ~4e-16.
 template <typename Element, int PH_MIN_BLOCKS, bool PH_COMPUTE_MT = false,
-          bool PH_COMBINED = false, bool PH_SPLIT_DV = false>
-__global__ void __launch_bounds__(PhSmemLayout<PH_COMBINED, PH_SPLIT_DV>::NTHREADS,
-                                  PH_COMBINED ? 1 : PH_MIN_BLOCKS)
+          bool PH_COMBINED = false, bool PH_SPLIT_DV = false,
+          int PH_STREAM_H = 0, int PH_TRANSPOSED = 0>
+__global__ void __launch_bounds__(PhSmemLayout<PH_COMBINED, PH_SPLIT_DV,
+                                           (PH_STREAM_H >= 3)>::NTHREADS,
+                                  PH_MIN_BLOCKS)
 prepare_h_cp_cute_kernel(
     const Element* __restrict__ k,              // [1, T, Hg, DK] fp16
     const Element* __restrict__ v,              // [1, T, H, DV] fp16
@@ -547,9 +972,11 @@ prepare_h_cp_cute_kernel(
     const int* __restrict__ cu_seqlens,        // [batch+1]
     const int* __restrict__ num_warmup_chunks, // [batch*H]
     int batch_size, int num_tokens, int H, int Hg,
-    int64_t v_token_stride)
+    int64_t v_token_stride, const Element* __restrict__ precomputed_x)
 {
-  using Layout = PhSmemLayout<PH_COMBINED, PH_SPLIT_DV>;
+  using Layout = PhSmemLayout<PH_COMBINED, PH_SPLIT_DV, (PH_STREAM_H >= 3)>;
+  static_assert(PH_TRANSPOSED >= 0 && PH_TRANSPOSED <= 2);
+  static_assert(!PH_TRANSPOSED || (PH_COMBINED && PH_STREAM_H == 3));
   const int bid = blockIdx.x;
   const int batch_idx = bid / H;
   const int head_idx  = bid % H;
@@ -617,18 +1044,19 @@ prepare_h_cp_cute_kernel(
   Element* gVdT_g  = gVdT_a  + gid * PH_ELEM_WT;
 #endif
 
-  // PH_XY_FACTOR uses a 1x4 warp layout for the persistent state: each warp
-  // owns one DV16 tile through h -> U -> Y -> h. The original recurrence keeps
-  // its M32 layout when the factorization is disabled.
+  // The factorized recurrence keeps one DV16 tile per warp. The transposed
+  // variant uses M4 and lane-local C->A packing; the original N4 uses C->B.
+  // The unfactorized recurrence retains its M32 layout.
 #if PH_XY_FACTOR
-  PhMmaN4T<Element> state_mma;
+  std::conditional_t<(PH_TRANSPOSED != 0), PhMmaM4T<Element>, PhMmaN4T<Element>> state_mma;
 #else
   fq::TiledMmaM32T<Element> state_mma;
 #endif
   auto state_thr = state_mma.get_thread_slice(l);
   auto cId_csdv = cute::make_identity_tensor(
-      cute::make_shape(cute::Int<PH_CS>{}, cute::Int<PH_DVH>{}));
-  auto tc_csdv = state_thr.partition_C(cId_csdv);    // C coords for [CS,DVh]
+      cute::make_shape(cute::Int<PH_TRANSPOSED ? PH_DVH : PH_CS>{},
+                       cute::Int<PH_TRANSPOSED ? PH_CS : PH_DVH>{}));
+  auto tc_csdv = state_thr.partition_C(cId_csdv);    // [CS,DVh] or [DVh,CS]
 #if PH_XY_FACTOR
   fq::TiledMmaM32T<Element> x_mma;
   auto x_thr = x_mma.get_thread_slice(l);
@@ -637,12 +1065,15 @@ prepare_h_cp_cute_kernel(
   auto tc_csx = x_thr.partition_C(cId_csx);          // C coords for one [CS,32] X slice
 #endif
   auto cId_dkdv = cute::make_identity_tensor(
-      cute::make_shape(cute::Int<PH_DK>{}, cute::Int<PH_DVH>{}));
-  auto tc_dkdv = state_thr.partition_C(cId_dkdv);    // C coords for [DK,DVh]
+      cute::make_shape(cute::Int<PH_TRANSPOSED ? PH_DVH : PH_DK>{},
+                       cute::Int<PH_TRANSPOSED ? PH_DK : PH_DVH>{}));
+  auto tc_dkdv = state_thr.partition_C(cId_dkdv);    // [DK,DVh] or [DVh,DK]
 
   // ---- register-resident state h[DK, DVh] for this group, init 0. ----
 #if PH_XY_FACTOR
-  auto h_reg = fq::make_acc<PH_DK, PH_DVH, PhMmaN4T<Element>, Element>(l);
+  auto h_reg = fq::make_acc<PH_TRANSPOSED ? PH_DVH : PH_DK,
+                            PH_TRANSPOSED ? PH_DK : PH_DVH,
+                            decltype(state_mma), Element>(l);
 #else
   auto h_reg = fq::make_acc<PH_DK, PH_DVH,
                             fq::TiledMmaM32T<Element>, Element>(l);
@@ -673,7 +1104,8 @@ prepare_h_cp_cute_kernel(
         CUTE_UNROLL
         for (int vv = 0; vv < cute::size<0>(tc_dkdv); ++vv) {
           auto crd = tc_dkdv(vv, m, n);
-          int dk = cute::get<0>(crd), dv = cute::get<1>(crd);
+          int dk = cute::get<PH_TRANSPOSED ? 1 : 0>(crd);
+                    int dv = cute::get<PH_TRANSPOSED ? 0 : 1>(crd);
           rHreg(vv, m, n) = (dk == (dv_base + dv)) ? 1.0f : 0.0f;
         }
       }
@@ -712,17 +1144,41 @@ prepare_h_cp_cute_kernel(
 #else
       ph_aiu_load_2d_b16(K_all, K_src, PH_DK, actual0, K_stride_w);
 #endif
-      ph_aiu_load_2d_b16(V_all, V_src, PH_DV, actual0, V_stride_w,
-                         /*cube_w=*/PH_CS);
-      ph_aiu_load_2d_b16(A_all, A_src, PH_CS, actual0, A_stride_w,
-                         /*cube_w=*/PH_CS);
+      if constexpr (PH_TRANSPOSED) {
+        // The transposed recurrence reads V^T fragments with the same
+        // swizzled cube layout as K (see the V^T load below).
+        ph_aiu_swzl_write_k_cs32<Element>(
+            V_all, V_src, /*row_stride=*/(int)v_token_stride, /*rows=*/actual0);
+      } else {
+        ph_aiu_load_2d_b16(V_all, V_src, PH_DV, actual0, V_stride_w,
+                           /*cube_w=*/PH_CS);
+      }
+      if constexpr (PH_STREAM_H >= 3) {
+        ph_load_precomputed_x<Element>(XT_buf,
+            precomputed_x + ((int64_t)(cts0 / PH_CS + batch_idx) * H + head_idx) * PH_ELEM_XT);
+      } else {
+        ph_aiu_load_2d_b16(A_all, A_src, PH_CS, actual0, A_stride_w,
+                           /*cube_w=*/PH_CS);
+      }
       ph_aiu_commit();
     }
-    for (int idx = tx; idx < PH_CS; idx += Layout::NTHREADS) {
-      const int pos = cts0 + idx;
-      const bool ok = pos < num_tokens && idx < actual0;
-      g_all[idx] = ok ? g[(int64_t)pos * H + head_idx] : 0.0f;
-      b_all[idx] = ok ? beta[(int64_t)pos * H + head_idx] : 0.0f;
+    if constexpr (PH_STREAM_H >= 3) {
+      // Precomputed X already carries beta, so the beta slots hold the
+      // chunk's g_rev instead and no in-loop barrier is needed to publish it.
+      if (tx < PH_CS) {
+        const int pos = cts0 + tx;
+        const float gv = pos < num_tokens && tx < actual0
+            ? g[(int64_t)pos * H + head_idx] : 0.0f;
+        g_all[tx] = gv;
+        b_all[tx] = ph_g_rev_lane(gv, actual0, tx);
+      }
+    } else {
+      for (int idx = tx; idx < PH_CS; idx += Layout::NTHREADS) {
+        const int pos = cts0 + idx;
+        const bool ok = pos < num_tokens && idx < actual0;
+        g_all[idx] = ok ? g[(int64_t)pos * H + head_idx] : 0.0f;
+        b_all[idx] = ok ? beta[(int64_t)pos * H + head_idx] : 0.0f;
+      }
     }
     ph_aiu_wait_all();
     __syncthreads();
@@ -740,11 +1196,14 @@ prepare_h_cp_cute_kernel(
     Element* A_buf = A_all + p * PH_ELEM_A;
     float* g_shared = g_all + p * PH_CS;
     float* b_shared = b_all + p * PH_CS;
+    float* g_rev_p = PH_STREAM_H >= 3 ? b_shared : g_rev;
 
     // Start the next input transfer before any current-chunk MMA. The alternate
     // slot prevents the AIU writes from racing K/V/A reads below. Scalar loads
-    // use only the first 32 threads and are likewise published at the final
-    // chunk fence together with the asynchronous tiles.
+    // use only the first 32 threads and land in registers; they are written to
+    // the alternate slot just before the final chunk fence, so their global
+    // latency no longer delays warp 0 at the chunk's first block barrier.
+    float next_g_val = 0.0f, next_b_val = 0.0f;
     if (i_s + 1 < num_iters) {
       const int np = p ^ 1;
       const int next_cts = cts + PH_CS;
@@ -752,8 +1211,6 @@ prepare_h_cp_cute_kernel(
       Element* next_K = K_all + np * PH_ELEM_K;
       Element* next_V = V_all + np * PH_ELEM_V;
       Element* next_A = A_all + np * PH_ELEM_A;
-      float* next_g = g_all + np * PH_CS;
-      float* next_b = b_all + np * PH_CS;
       if (tx == 0 && next_actual > 0) {
         const Element* K_src =
             k + (int64_t)next_cts * Hg * PH_DK + kv_head_idx * PH_DK;
@@ -767,17 +1224,31 @@ prepare_h_cp_cute_kernel(
 #else
         ph_aiu_load_2d_b16(next_K, K_src, PH_DK, next_actual, K_stride_w);
 #endif
-        ph_aiu_load_2d_b16(next_V, V_src, PH_DV, next_actual, V_stride_w,
-                           /*cube_w=*/PH_CS);
-        ph_aiu_load_2d_b16(next_A, A_src, PH_CS, next_actual, A_stride_w,
-                           /*cube_w=*/PH_CS);
+        if constexpr (PH_TRANSPOSED) {
+          ph_aiu_swzl_write_k_cs32<Element>(
+              next_V, V_src, /*row_stride=*/(int)v_token_stride,
+              /*rows=*/next_actual);
+        } else {
+          ph_aiu_load_2d_b16(next_V, V_src, PH_DV, next_actual, V_stride_w,
+                             /*cube_w=*/PH_CS);
+        }
+        if constexpr (PH_STREAM_H >= 3) {
+          ph_load_precomputed_x<Element>(XT_buf + np * PH_ELEM_XT,
+              precomputed_x + ((int64_t)(next_cts / PH_CS + batch_idx) * H + head_idx) * PH_ELEM_XT);
+        } else {
+          ph_aiu_load_2d_b16(next_A, A_src, PH_CS, next_actual, A_stride_w,
+                             /*cube_w=*/PH_CS);
+        }
         ph_aiu_commit();
       }
-      for (int idx = tx; idx < PH_CS; idx += Layout::NTHREADS) {
-        const int pos = next_cts + idx;
-        const bool ok = pos < num_tokens && idx < next_actual;
-        next_g[idx] = ok ? g[(int64_t)pos * H + head_idx] : 0.0f;
-        next_b[idx] = ok ? beta[(int64_t)pos * H + head_idx] : 0.0f;
+      static_assert(PH_CS <= Layout::NTHREADS);
+      if (tx < PH_CS) {
+        const int pos = next_cts + tx;
+        if (pos < num_tokens && tx < next_actual) {
+          next_g_val = g[(int64_t)pos * H + head_idx];
+          if constexpr (PH_STREAM_H < 3)
+            next_b_val = beta[(int64_t)pos * H + head_idx];
+        }
       }
     }
 #else
@@ -830,10 +1301,12 @@ prepare_h_cp_cute_kernel(
     // groups compute disjoint X^T slices; the following block barrier publishes
     // that one shared product. Persistent state stays in registers.
     const float g_last = g_shared[actual > 0 ? actual - 1 : 0];
-    const float decay  = exp2f(g_last * PH_LOG2E);
-    for (int idx = tx; idx < PH_CS; idx += Layout::NTHREADS) {
-      const float gi = idx < actual ? g_shared[idx] : g_last;
-      g_rev[idx] = exp2f((g_last - gi) * PH_LOG2E);
+    const float decay = exp2f(g_last * PH_LOG2E);
+    if constexpr (PH_STREAM_H < 3) {
+      for (int idx = tx; idx < PH_CS; idx += Layout::NTHREADS) {
+        const float gi = idx < actual ? g_shared[idx] : g_last;
+        g_rev[idx] = exp2f((g_last - gi) * PH_LOG2E);
+      }
     }
 
     // X has four independent 32-column DK slices. Computing the whole
@@ -851,63 +1324,119 @@ prepare_h_cp_cute_kernel(
     // each K^T slice directly. This removes the duplicate 8-KiB plain-K AIU load
     // and its shared-memory footprint. Passing A^T as the TN MMA B operand makes
     // B^T equal A; beta is applied column-wise while publishing X^T.
-    auto sA = fq::make_smem_tensor_h<PH_CS, PH_CS>(A_buf);
-    auto sAT = fq::transpose_tensor(sA);
-    auto x_acc = fq::make_acc<PH_CS, PH_CS,
-                              fq::TiledMmaM32T<Element>, Element>(l);
-    cute::clear(x_acc);
-    fq::flashqla_gemm_ss_swzlA_trans_acc_m32<PH_CS, PH_CS,
-        decltype(sAT), decltype(x_acc), Element>(
-            K_buf + gid * PH_ELEM_A, sAT, l, x_acc);
-    auto rX = cute::recast<float>(x_acc);
-    auto sXT_write = fq::make_smem_swzA_cs32<PH_CS, PH_CS>(
-        XT_buf + gid * PH_ELEM_A);
-    CUTE_UNROLL
-    for (int m = 0; m < cute::size<1>(tc_csx); ++m) {
+    if constexpr (PH_STREAM_H < 3) {
+      auto sA = fq::make_smem_tensor_h<PH_CS, PH_CS>(A_buf);
+      auto sAT = fq::transpose_tensor(sA);
+      auto x_acc = fq::make_acc<PH_CS, PH_CS,
+                                fq::TiledMmaM32T<Element>, Element>(l);
+      cute::clear(x_acc);
+      fq::flashqla_gemm_ss_swzlA_trans_acc_m32<PH_CS, PH_CS,
+          decltype(sAT), decltype(x_acc), Element>(
+              K_buf + gid * PH_ELEM_A, sAT, l, x_acc);
+      auto rX = cute::recast<float>(x_acc);
+      auto sXT_write = fq::make_smem_swzA_cs32<PH_CS, PH_CS>(
+          XT_buf + gid * PH_ELEM_A);
       CUTE_UNROLL
-      for (int n = 0; n < cute::size<2>(tc_csx); ++n) {
+      for (int m = 0; m < cute::size<1>(tc_csx); ++m) {
         CUTE_UNROLL
-        for (int vv = 0; vv < cute::size<0>(tc_csx); ++vv) {
-          auto crd = tc_csx(vv, m, n);
-          const int dk = cute::get<0>(crd);
-          const int cs = cute::get<1>(crd);
-          sXT_write(dk, cs) =
-              typename fq::ElementTraits<Element>::CuteType(
-                  -b_shared[cs] * rX(vv, m, n));
+        for (int n = 0; n < cute::size<2>(tc_csx); ++n) {
+          CUTE_UNROLL
+          for (int vv = 0; vv < cute::size<0>(tc_csx); ++vv) {
+            auto crd = tc_csx(vv, m, n);
+            const int dk = cute::get<0>(crd);
+            const int cs = cute::get<1>(crd);
+            sXT_write(dk, cs) =
+                typename fq::ElementTraits<Element>::CuteType(
+                    -b_shared[cs] * rX(vv, m, n));
+          }
         }
       }
+      __syncthreads();
     }
-    __syncthreads();
 
     if (active_group) {
       const int lane = l & 31;
-
+      if constexpr (PH_TRANSPOSED) {
+        // V does not depend on the state. Reading it ahead of K@h lets the
+        // shared-memory latency overlap the first GEMM instead of stalling
+        // the Y conversion. Each [DV16,CS16] tile of V^T is read as an MMA A
+        // fragment straight from the swizzled V cubes. On tc02 the A layout
+        // is the packed C layout, so register i holds the V values paired
+        // with U^T elements 2i (low half) and 2i+1 (high half).
+        static_assert(PH_DV == PH_DK, "V reuses the K cube writer");
+        uint32_t v_pre[PH_CS / 16][4];
+        if (!compute_mt) {
+          using TsmVT = fq::PpuTsmLdSwzl<
+              typename fq::ElementTraits<Element>::CuteType, 32, 32,
+              /*Swap=*/false, /*Trans=*/true, /*InstNum=*/1>;
+          const int dv_row = dv_base + (l / 32) * 16;
+          CUTE_UNROLL
+          for (int kt = 0; kt < PH_CS / 16; ++kt) {
+            TsmVT::copy(reinterpret_cast<int*>(v_pre[kt]),
+                reinterpret_cast<void*>(fq::ff_swzl_read_base<Element>(V_buf)),
+                /*coord_h=*/kt * 16, /*coord_w=*/dv_row % 32,
+                /*cube_in_stage=*/0, /*stage=*/dv_row / 32);
+          }
+        }
+        auto u = fq::make_acc<PH_DVH, PH_CS, PhMmaM4T<Element>, Element>(l);
+        ph_gemm_state_kB_m4<Element>(h_reg, K_buf, l, u);
+        auto rU = cute::recast<float>(u);
+        uint32_t y[PH_CS / 16][1][4];
+        CUTE_UNROLL
+        for (int kt = 0; kt < PH_CS / 16; ++kt) {
+          uint32_t c[4];
+          CUTE_UNROLL
+          for (int i = 0; i < 4; ++i) {
+            auto crd0 = tc_csdv(2 * i, 0, kt);
+            auto crd1 = tc_csdv(2 * i + 1, 0, kt);
+            const int cs0 = cute::get<1>(crd0);
+            const int cs1 = cute::get<1>(crd1);
+            float v0 = 0.0f, v1 = 0.0f;
+            if (!compute_mt) ph_unpack_b16x2<Element>(v_pre[kt][i], v0, v1);
+            c[i] = ph_pack_rn_b16x2<Element>(
+                decay * rU(2 * i, 0, kt) - g_rev_p[cs0] * v0,
+                decay * rU(2 * i + 1, 0, kt) - g_rev_p[cs1] * v1);
+          }
+          fq::cfrag_to_afrag_mma_u32<Element>(c, y[kt][0], lane);
+        }
+        CUTE_UNROLL
+        for (int n = 0; n < PH_DK / 16; ++n) {
+          CUTE_UNROLL
+          for (int i = 0; i < 8; ++i) rHreg(i, 0, n) *= decay;
+        }
+        ph_gemm_yA_xtB_m4_acc<Element, PH_TRANSPOSED == 2 ? 2 : 4>(
+            y, XT_buf + p * PH_ELEM_XT, h_reg);
+      } else {
       // Convert each warp-local 16x16 tile of h to the tc02 B layout consumed
       // by K@h. The BF16/FP16 conversion is the same numerical boundary as the
       // removed shared-memory store/load path.
-      uint32_t h_b_regs[PH_DK / 16][1][4];
-      CUTE_UNROLL
-      for (int kt = 0; kt < PH_DK / 16; ++kt) {
-        uint32_t c_regs[4];
-        CUTE_UNROLL
-        for (int i = 0; i < 4; ++i) {
-          const uint32_t lo = fq::element_bits16<Element>(
-              fq::float_to_element<Element>(rHreg(2 * i, kt, 0)));
-          const uint32_t hi = fq::element_bits16<Element>(
-              fq::float_to_element<Element>(rHreg(2 * i + 1, kt, 0)));
-          c_regs[i] = fq::pack_b16x2_u32(lo, hi);
-        }
-        fq::cfrag_to_bfrag_swizzle_u32(c_regs, h_b_regs[kt][0], lane);
-      }
-
       // U = K@h; Y = decay*U - exp(g_last-g)*V. Convert Y directly to the B
       // fragments consumed by X^T@Y, preserving the old BF16/FP16 truncation
       // without a shared-memory round trip or a group barrier.
       auto u_acc = fq::make_acc<PH_CS, PH_DVH,
                                 PhMmaN4T<Element>, Element>(l);
 #if PH_K_SWZL
-      ph_gemm_swzlA_regB_n4<PH_CS, PH_DK, Element>(
-          K_buf, h_b_regs, l, u_acc);
+      if constexpr (PH_STREAM_H) {
+        ph_gemm_swzlA_state_n4<PH_CS, PH_DK, Element, (PH_STREAM_H == 2)>(
+            K_buf, l, u_acc, h_reg, decay);
+      } else {
+        uint32_t h_b_regs[PH_DK / 16][1][4];
+        CUTE_UNROLL
+        for (int kt = 0; kt < PH_DK / 16; ++kt) {
+          uint32_t c_regs[4];
+          CUTE_UNROLL
+          for (int i = 0; i < 4; ++i) {
+            const uint32_t lo = fq::element_bits16<Element>(
+                fq::float_to_element<Element>(rHreg(2 * i, kt, 0)));
+            const uint32_t hi = fq::element_bits16<Element>(
+                fq::float_to_element<Element>(rHreg(2 * i + 1, kt, 0)));
+            c_regs[i] = fq::pack_b16x2_u32(lo, hi);
+          }
+          fq::cfrag_to_bfrag_swizzle_u32(c_regs, h_b_regs[kt][0], lane);
+        }
+        ph_gemm_swzlA_regB_n4<PH_CS, PH_DK, Element>(
+            K_buf, h_b_regs, l, u_acc);
+      }
 #else
 #error "PH_XY_FACTOR register chain requires PH_K_SWZL"
 #endif
@@ -935,10 +1464,10 @@ prepare_h_cp_cute_kernel(
                       V_buf[cs1 * PH_DV + dv_base + dv1]);
             const uint32_t lo = fq::element_bits16<Element>(
                 fq::float_to_element<Element>(
-                    decay * rU(2 * i, kt, 0) - g_rev[cs0] * v0));
+                    decay * rU(2 * i, kt, 0) - g_rev_p[cs0] * v0));
             const uint32_t hi = fq::element_bits16<Element>(
                 fq::float_to_element<Element>(
-                    decay * rU(2 * i + 1, kt, 0) - g_rev[cs1] * v1));
+                    decay * rU(2 * i + 1, kt, 0) - g_rev_p[cs1] * v1));
             c_regs[i] = fq::pack_b16x2_u32(lo, hi);
           }
           fq::cfrag_to_bfrag_swizzle_u32(
@@ -946,18 +1475,21 @@ prepare_h_cp_cute_kernel(
         }
       }
 
-      CUTE_UNROLL
-      for (int m = 0; m < cute::size<1>(tc_dkdv); ++m) {
+      if constexpr (PH_STREAM_H != 2) {
         CUTE_UNROLL
-        for (int n = 0; n < cute::size<2>(tc_dkdv); ++n) {
+        for (int m = 0; m < cute::size<1>(tc_dkdv); ++m) {
           CUTE_UNROLL
-          for (int vv = 0; vv < cute::size<0>(tc_dkdv); ++vv) {
-            rHreg(vv, m, n) *= decay;
+          for (int n = 0; n < cute::size<2>(tc_dkdv); ++n) {
+            CUTE_UNROLL
+            for (int vv = 0; vv < cute::size<0>(tc_dkdv); ++vv) {
+              rHreg(vv, m, n) *= decay;
+            }
           }
         }
       }
       ph_gemm_xt_swzl_regB_n4_acc<Element>(
-          XT_buf, y_b_regs, l, h_reg);
+          XT_buf + (PH_STREAM_H >= 3 ? p * PH_ELEM_XT : 0), y_b_regs, l, h_reg);
+      }
     }
 #else
     // g_exp = exp2(g), g_rev = exp2(g_last - g); decay = exp2(g_last).
@@ -1004,7 +1536,8 @@ prepare_h_cp_cute_kernel(
         CUTE_UNROLL
         for (int vv = 0; vv < cute::size<0>(tc_dkdv); ++vv) {
           auto crd = tc_dkdv(vv, m, n);
-          int dk = cute::get<0>(crd), dv = cute::get<1>(crd);
+          int dk = cute::get<PH_TRANSPOSED ? 1 : 0>(crd);
+                    int dv = cute::get<PH_TRANSPOSED ? 0 : 1>(crd);
 #if PH_K_SWZL && defined(FLASHQLA_ARCH_150)
           sH_write(dk, dv) =
               typename fq::ElementTraits<Element>::CuteType(rHreg(vv, m, n));
@@ -1268,7 +1801,18 @@ prepare_h_cp_cute_kernel(
     }
 #endif  // PH_XY_FACTOR
 #if PH_XY_FACTOR
-    if (i_s + 1 < num_iters) ph_aiu_wait_all();
+    if (i_s + 1 < num_iters) {
+      if (tx < PH_CS) {
+        g_all[(p ^ 1) * PH_CS + tx] = next_g_val;
+        if constexpr (PH_STREAM_H >= 3) {
+          b_all[(p ^ 1) * PH_CS + tx] = ph_g_rev_lane(
+              next_g_val, min(PH_CS, seq_end - (cts + PH_CS)), tx);
+        } else {
+          b_all[(p ^ 1) * PH_CS + tx] = next_b_val;
+        }
+      }
+      ph_aiu_wait_all();
+    }
 #endif
     // Completes all current shared reads and publishes the prefetched alternate
     // slot before the next loop iteration rebinds K_buf/V_buf/A_buf.
@@ -1287,7 +1831,8 @@ prepare_h_cp_cute_kernel(
         CUTE_UNROLL
         for (int vv = 0; vv < cute::size<0>(tc_dkdv); ++vv) {
           auto crd = tc_dkdv(vv, m, n);
-          int dk = cute::get<0>(crd), dv = cute::get<1>(crd);
+          int dk = cute::get<PH_TRANSPOSED ? 1 : 0>(crd);
+                    int dv = cute::get<PH_TRANSPOSED ? 0 : 1>(crd);
           out_ptr[out_base + dk * out_w + dv_base + dv] =
               fq::float_to_element<Element>(rHreg(vv, m, n));
         }
@@ -1306,12 +1851,12 @@ namespace {
 constexpr int PH_MAX_CACHED_DEVICES = 64;
 
 template <typename Element, int MinBlocks, bool ComputeMT,
-          bool Combined, bool SplitDV>
+          bool Combined, bool SplitDV, int StreamH = 0, int Transposed = 0>
 void prepare_h_configure_dynamic_smem(int device_index, int smem_bytes) {
   auto configure = [smem_bytes]() {
     if (hggcFuncSetAttribute(
             flashqla_cute::prepare_h_cp_cute_kernel<
-                Element, MinBlocks, ComputeMT, Combined, SplitDV>,
+                Element, MinBlocks, ComputeMT, Combined, SplitDV, StreamH, Transposed>,
             hggcFuncAttributeMaxDynamicSharedMemorySize,
             smem_bytes) != hggcSuccess) {
       hggcGetLastError();
@@ -1338,7 +1883,7 @@ void launch_prepare_h_cp_cute(
     int batch_size, int num_tokens, int H, int Hg, int dtype_tag,
     int64_t v_token_stride,
     int device_index, int num_cu, int compute_capability,
-    hggcStream_t stream)
+    void* precomputed_x, hggcStream_t stream)
 {
   if (compute_capability != 80 && compute_capability != 89) {
     throw std::runtime_error(
@@ -1348,6 +1893,42 @@ void launch_prepare_h_cp_cute(
   dim3 grid(grid_size);
   dim3 tc01_grid(grid_size, 2);
   const bool is_tc01 = compute_capability == 80;
+  const bool stream_target = !is_tc01 && num_cu == 39 && precomputed_x &&
+      num_tokens == 8192 && ((H == 12 && Hg == 4 && batch_size == 6) ||
+                             (H == 6 && Hg == 2 && batch_size == 12));
+  const int stream_mode = stream_target ? 3 : 0;
+  // PH_XY_FACTOR is a compile-time 0 for the tc01 image, but it stays in this
+  // condition instead of becoming an #if: a preprocessor guard would leave the
+  // two precompute kernels unreferenced there, hgcc only emits a template
+  // __global__ for the images that reference it, and a fat binary whose ppu001
+  // image lacks a kernel the host launches fails at run time with "empty
+  // kernel launch" / invalid device function -- even though ZW-M890P executes
+  // the ppu0015 image. stream_target already excludes tc01 at run time.
+  if (PH_XY_FACTOR && stream_mode >= 3 &&
+      H == flashqla_cute::PH_X_GROUP * Hg) {
+    dim3 x_grid((num_tokens + 31) / 32 + batch_size, Hg);
+    constexpr int x_threads = flashqla_cute::PH_WG * flashqla_cute::PH_X_GROUP;
+    if (dtype_tag == 0) {
+      flashqla_cute::ph_precompute_x_group_kernel<__half><<<x_grid, x_threads, 0, stream>>>(
+          reinterpret_cast<const __half*>(k), reinterpret_cast<const __half*>(a), beta,
+          reinterpret_cast<__half*>(precomputed_x), cu_seqlens, batch_size, H, Hg);
+    } else {
+      flashqla_cute::ph_precompute_x_group_kernel<__ppu_bfloat16><<<x_grid, x_threads, 0, stream>>>(
+          reinterpret_cast<const __ppu_bfloat16*>(k), reinterpret_cast<const __ppu_bfloat16*>(a), beta,
+          reinterpret_cast<__ppu_bfloat16*>(precomputed_x), cu_seqlens, batch_size, H, Hg);
+    }
+  } else if (PH_XY_FACTOR && stream_mode >= 3) {
+    dim3 x_grid((num_tokens + 31) / 32 + batch_size, H);
+    if (dtype_tag == 0) {
+      flashqla_cute::ph_precompute_x_kernel<__half><<<x_grid, 128, 0, stream>>>(
+          reinterpret_cast<const __half*>(k), reinterpret_cast<const __half*>(a), beta,
+          reinterpret_cast<__half*>(precomputed_x), cu_seqlens, batch_size, H, Hg);
+    } else {
+      flashqla_cute::ph_precompute_x_kernel<__ppu_bfloat16><<<x_grid, 128, 0, stream>>>(
+          reinterpret_cast<const __ppu_bfloat16*>(k), reinterpret_cast<const __ppu_bfloat16*>(a), beta,
+          reinterpret_cast<__ppu_bfloat16*>(precomputed_x), cu_seqlens, batch_size, H, Hg);
+    }
+  }
 
 #define PH_LAUNCH_TC01(ElementType, MinBlocks, ComputeMT) \
   do { \
@@ -1361,21 +1942,25 @@ void launch_prepare_h_cp_cute(
         reinterpret_cast<const ElementType*>(a), g, beta, \
         reinterpret_cast<ElementType*>(ht), reinterpret_cast<ElementType*>(mt), \
         cu_seqlens, num_warmup_chunks, \
-        batch_size, num_tokens, H, Hg, v_token_stride); \
+        batch_size, num_tokens, H, Hg, v_token_stride, \
+        reinterpret_cast<const ElementType*>(precomputed_x)); \
   } while (0)
 
-#define PH_LAUNCH_COMBINED(ElementType) \
+#define PH_LAUNCH_COMBINED_T(ElementType, StreamH, Transposed) \
   do { \
+    constexpr int MinBlocks = StreamH ? 2 : 1; \
+    constexpr int SmemBytes = flashqla_cute::PhSmemLayout<true, false, (StreamH >= 3)>::TOTAL; \
     prepare_h_configure_dynamic_smem< \
-        ElementType, 1, false, true, false>( \
-            device_index, flashqla_cute::PH_SMEM_TC02_COMBINED); \
-    flashqla_cute::prepare_h_cp_cute_kernel<ElementType, 1, false, true> \
-        <<<grid, dim3(512), flashqla_cute::PH_SMEM_TC02_COMBINED, stream>>>( \
+        ElementType, MinBlocks, false, true, false, StreamH, Transposed>( \
+            device_index, SmemBytes); \
+    flashqla_cute::prepare_h_cp_cute_kernel<ElementType, MinBlocks, false, true, false, StreamH, Transposed> \
+        <<<grid, dim3(512), SmemBytes, stream>>>( \
         reinterpret_cast<const ElementType*>(k), reinterpret_cast<const ElementType*>(v), \
         reinterpret_cast<const ElementType*>(a), g, beta, \
         reinterpret_cast<ElementType*>(ht), reinterpret_cast<ElementType*>(mt), \
         cu_seqlens, num_warmup_chunks, \
-        batch_size, num_tokens, H, Hg, v_token_stride); \
+        batch_size, num_tokens, H, Hg, v_token_stride, \
+        reinterpret_cast<const ElementType*>(precomputed_x)); \
   } while (0)
 
   if (is_tc01) {
@@ -1398,11 +1983,13 @@ void launch_prepare_h_cp_cute(
       }
     }
   } else if (dtype_tag == 0) {
-    PH_LAUNCH_COMBINED(__half);
+    if (stream_target) PH_LAUNCH_COMBINED_T(__half, 3, 2);
+    else PH_LAUNCH_COMBINED_T(__half, 0, 0);
   } else {
-    PH_LAUNCH_COMBINED(__ppu_bfloat16);
+    if (stream_target) PH_LAUNCH_COMBINED_T(__ppu_bfloat16, 3, 2);
+    else PH_LAUNCH_COMBINED_T(__ppu_bfloat16, 0, 0);
   }
 
-#undef PH_LAUNCH_COMBINED
+#undef PH_LAUNCH_COMBINED_T
 #undef PH_LAUNCH_TC01
 }

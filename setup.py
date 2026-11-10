@@ -80,6 +80,7 @@ import glob
 import importlib.util
 import multiprocessing
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -178,6 +179,8 @@ if "pla.decode" in NAMESPACES:
         Extension(
             name='pla.decode._C',
             sources=decode_sources,
+            depends=[os.path.join(here, 'src', 'decode', 'k-last',
+                                  'generated', 'tuned_dispatch.h')],
             extra_compile_args={
                 'cxx': ['-O3'],
                 'hgcc': [
@@ -516,20 +519,48 @@ if any(ns.startswith("pla.prefill.") for ns in NAMESPACES):
     actlize_includes = get_actlize_includes()
 
 
+def local_headers(sources, include_dirs):
+    """Repository headers reachable from sources through quoted includes."""
+    src_root = os.path.join(here, "src") + os.sep
+    found, pending = set(), list(sources)
+    while pending:
+        path = pending.pop()
+        with open(path, encoding="utf-8") as f:
+            names = re.findall(r'^\s*#\s*include\s*"([^"]+)"', f.read(), re.M)
+        for name in names:
+            # Quoted includes search the including file's directory first.
+            for base in [os.path.dirname(path)] + include_dirs:
+                header = os.path.normpath(os.path.join(base, name))
+                if os.path.isfile(header):
+                    break
+            else:
+                continue
+            if header.startswith(src_root) and header not in found:
+                found.add(header)
+                pending.append(header)
+    return sorted(found)
+
+
 if "pla.prefill.flashqla" in NAMESPACES:
     prefill_dir = os.path.join(here, "src", "prefill", "flashqla")
 
     prefill_sources = [os.path.join(prefill_dir, "host", "torch_extension_cute.cc")] + \
         sorted(glob.glob(os.path.join(prefill_dir, "kernels", "*.cu")))
+    prefill_include_dirs = [
+        os.path.join(prefill_dir, "kernels"),  # flashqla_cute_traits.cuh
+        os.path.join(here, "src"),
+    ]
+    # PPUBuildExtension emits no compiler depfiles, so every repository header
+    # the host and kernel sources include must be listed for header-only edits
+    # to rebuild.
+    prefill_headers = local_headers(prefill_sources, prefill_include_dirs)
 
     ext_modules.append(
         Extension(
             name="pla.prefill.flashqla._C",
             sources=prefill_sources,
-            include_dirs=[
-                os.path.join(prefill_dir, "kernels"),  # flashqla_cute_traits.cuh
-                os.path.join(here, "src"),
-            ] + actlize_includes,
+            depends=prefill_headers,
+            include_dirs=prefill_include_dirs + actlize_includes,
             extra_link_args=[],
             extra_compile_args={
                 "cxx": PREFILL_CXX_FLAGS,

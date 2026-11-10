@@ -64,16 +64,28 @@ def _install_torch_stub_if_needed():
             self.is_cuda = False
 
         def numel(self):
-            return len(self)
+            return sum(len(row) for row in self) if self and isinstance(self[0], list) else len(self)
+
+        def view(self, rows, columns):
+            if rows * columns != self.numel():
+                raise ValueError("incompatible view shape")
+            values = self.tolist()
+            if values and isinstance(values[0], list):
+                values = [value for row in values for value in row]
+            return _FakeTensor(
+                [values[i * columns:(i + 1) * columns] for i in range(rows)],
+                dtype=self.dtype)
 
         def tolist(self):
-            return list(self)
+            return [list(row) if isinstance(row, list) else row for row in self]
 
     torch_stub = types.ModuleType("torch")
     torch_stub.Tensor = _FakeTensor
     torch_stub.int8 = "int8"
     torch_stub.int32 = "int32"
     torch_stub.tensor = _FakeTensor
+    torch_stub.ones = lambda shape, dtype=None, device=None: _FakeTensor(
+        [[1] * shape[1] for _ in range(shape[0])], dtype=dtype, device=device)
     torch_stub.cuda = types.SimpleNamespace(current_device=lambda: 0)
     sys.modules["torch"] = torch_stub
 
@@ -675,6 +687,64 @@ class Tc02RealGatePlannerTest(unittest.TestCase):
     def _tc02_device_model(_raw_cu_seqlens):
         return cp._planner_execution_model_from_properties(8, 9, 39)
 
+    def test_tc02_h12_target_restores_full_history_cp6(self):
+        with mock.patch.object(
+            cp, "_device_execution_model", side_effect=self._tc02_device_model
+        ):
+            plan = cp.calc_cp_seqs(self._cu(8192), 32, 12, num_k_heads=4)
+            cached = cp.calc_cp_seqs(self._cu(8192), 32, 12, num_k_heads=4)
+        self.assertTrue(plan[0])
+        self.assertIs(plan, cached)
+        self.assertEqual(plan[1].tolist(), [0, 1376, 2752, 4128, 5504, 6848, 8192])
+        self.assertEqual(plan[2].tolist(), [0, 6])
+        self.assertEqual(plan[3].tolist(), [0] * 6)
+        self.assertEqual(plan[4].tolist(), [0] * 5 + [1])
+
+    def test_tc02_h6_target_full_history_cp12(self):
+        with mock.patch.object(
+            cp, "_device_execution_model", side_effect=self._tc02_device_model
+        ):
+            plan = cp.calc_cp_seqs(self._cu(8192), 32, 6, num_k_heads=2)
+            cached = cp.calc_cp_seqs(self._cu(8192), 32, 6, num_k_heads=2)
+        self.assertTrue(plan[0])
+        self.assertIs(plan, cached)
+        self.assertEqual(plan[1].numel(), 13)
+        self.assertEqual(plan[2].tolist(), [0, 12])
+        self.assertEqual(plan[3].tolist(), [0] * 12)
+        self.assertEqual(plan[4].tolist(), [0] * 11 + [1])
+        offsets = plan[1].tolist()
+        chunks = [(end - start) // 32 for start, end in zip(offsets, offsets[1:])]
+        self.assertEqual(sum(chunks), 256)
+        self.assertLessEqual(max(chunks) - min(chunks), 1)
+        warmup, fallback = plan.warmup_metadata
+        self.assertEqual(warmup.numel(), 12 * 6)
+        self.assertEqual(fallback.numel(), 12 * 6)
+        self.assertEqual(warmup.dtype, cp.torch.int32)
+        self.assertEqual(fallback.dtype, cp.torch.int8)
+        self.assertEqual(warmup.tolist(), [[n] * 6 for n in chunks])
+        self.assertEqual(fallback.tolist(), [[1] * 6] * 12)
+
+    def test_tc02_h12_target_does_not_expand_neighbors(self):
+        cases = (
+            ((8191,), 32, 4, (8, 9, 39)),
+            ((8193,), 32, 4, (8, 9, 39)),
+            ((8192, 1), 32, 4, (8, 9, 39)),
+            ((8192,), 32, 2, (8, 9, 39)),
+            ((8192,), 32, None, (8, 9, 39)),
+            ((8192,), 64, 4, (8, 9, 39)),
+            ((8192,), 32, 4, (8, 9, 38)),
+            ((8192,), 32, 4, (8, 0, 64)),
+        )
+        for lengths, chunk_size, key_heads, properties in cases:
+            with self.subTest(lengths=lengths, chunk_size=chunk_size,
+                              key_heads=key_heads, properties=properties):
+                model = cp._planner_execution_model_from_properties(*properties)
+                with mock.patch.object(cp, "_device_execution_model", return_value=model):
+                    plan = cp.calc_cp_seqs(
+                        self._cu(*lengths), chunk_size, 12, num_k_heads=key_heads)
+                self.assertFalse(plan[0])
+                self.assertEqual(plan[1:], (None, None, None, None))
+
     def test_tc02_real_gate_aligned_suffix_boundaries(self):
         for heads, batches in cp._TC02_REAL_GATE_CP_MIN_TOKENS.items():
             for batch, threshold in batches.items():
@@ -789,6 +859,259 @@ class FusedFwdContractTest(unittest.TestCase):
                 arguments = [part.replace("\\", "").strip()
                              for part in arguments.split(",")]
                 self.assertEqual(arguments, self._parameters(kernel))
+
+
+class FatBinaryKernelContractTest(unittest.TestCase):
+    """No __global__ may be missing from one image of the fat binary.
+
+    The prefill extensions are compiled once with ``-arch=ppu_10 -arch=ppu_15``.
+    A kernel defined only inside an image-varying ``#if`` -- an architecture
+    macro, or PH_XY_FACTOR which prepare_h_cute.cu forces to 0 for ppu_10 -- has
+    no symbol in the other image, and hgcc then rejects the launch at run time
+    with "empty kernel launch" / invalid device function, even on the board
+    whose image does define it. Every branch of such a conditional therefore has
+    to provide the kernel, the shape kkt_solve_cute_impl.cuh already uses for
+    its tc01/tc02 pairs.
+
+    The launch site matters just as much as the definition: hgcc only emits a
+    template ``__global__`` for the images whose host code references it, so an
+    ``<<<>>>`` placed inside the same conditional leaves the other image without
+    a symbol even when the definition is unconditional. That is what broke
+    every ``ph_precompute_x_*`` launch on ZW-M890P. Keeping the guard inside the
+    kernel body and testing it with a run-time ``if`` keeps both images whole.
+    """
+
+    IMAGE_TOKENS = ("FLASHQLA_ARCH_150", "FLASHQLA_ARCH_100", "PH_XY_FACTOR",
+                    "__HGGC_ARCH__")
+    OPEN = re.compile(r"^\s*#\s*(?:if|ifdef|ifndef)\b(.*)$")
+    BRANCH = re.compile(r"^\s*#\s*(elif|else)\b(.*)$")
+    ENDIF = re.compile(r"^\s*#\s*endif\b")
+    KERNEL = re.compile(r"\b__global__.*?\b(\w+)\s*\(", re.S)
+    # The callee closes the text before "<<<": a name plus optional template
+    # arguments, which may span several lines.
+    CALLEE = re.compile(r"\b([A-Za-z_]\w*)\s*(?:<[^;{}]*?>\s*)?$")
+    LAUNCH_BOUNDS = re.compile(r"__launch_bounds__\s*\([^()]*\)")
+    WINDOW = 6
+
+    @staticmethod
+    def _uncommented(text):
+        """Drop comments, keeping line numbers aligned for the window scan."""
+        text = re.sub(r"/\*.*?\*/",
+                      lambda match: "\n" * match.group(0).count("\n"),
+                      text, flags=re.S)
+        return [line.split("//", 1)[0] for line in text.splitlines()]
+
+    def _missing(self, closed):
+        """Names some branch of an image conditional provides and another lacks.
+
+        Every branch counts, including empty ones and the implicit empty
+        ``#else`` of a conditional that has none, so a name found only under
+        ``#else`` or absent from one of three branches is reported as well.
+        """
+        missing = []
+        for frame in closed:
+            if not any(token in cond for cond in frame["conds"]
+                       for token in self.IMAGE_TOKENS):
+                continue
+            branches = [frame["names"].get(branch, set())
+                        for branch in range(len(frame["conds"]))]
+            if not frame["has_else"]:
+                branches.append(set())
+            provided = set().union(*branches)
+            for name in sorted(provided - set.intersection(*branches)):
+                missing.append(f"{name} under #if{frame['conds'][0]}")
+        return missing
+
+    def _walk(self, lines, name_of):
+        """Attribute what ``name_of`` finds to the enclosing conditionals."""
+        frames, closed = [], []
+        for index, line in enumerate(lines):
+            opened = self.OPEN.match(line)
+            if opened:
+                frames.append({"conds": [opened.group(1)], "has_else": False,
+                               "names": {}})
+                continue
+            branch = self.BRANCH.match(line)
+            if branch:
+                if frames:
+                    frames[-1]["conds"].append(branch.group(2))
+                    frames[-1]["has_else"] |= branch.group(1) == "else"
+                continue
+            if self.ENDIF.match(line):
+                if frames:
+                    closed.append(frames.pop())
+                continue
+            name = name_of(lines, index)
+            if not name:
+                continue
+            for frame in frames:
+                frame["names"].setdefault(len(frame["conds"]) - 1, set()).add(name)
+        return self._missing(closed)
+
+    def _one_image_only(self, lines):
+        def defined(lines, index):
+            if "__global__" not in lines[index]:
+                return None
+            window = self.LAUNCH_BOUNDS.sub(
+                " ", "\n".join(lines[index:index + self.WINDOW]))
+            kernel = self.KERNEL.search(window)
+            return kernel.group(1) if kernel else None
+
+        return self._walk(lines, defined)
+
+    def _callee(self, lines, index):
+        """Name launched by the first ``<<<`` on ``lines[index]``, if any.
+
+        A launch may wrap: its template arguments can span lines, and the
+        PH_LAUNCH_COMBINED_T-style macros end every line with ``\\``. Join the
+        preceding lines without their continuations before matching.
+        """
+        line = lines[index]
+        if "<<<" not in line:
+            return None
+        start = max(0, index - self.WINDOW + 1)
+        head = [text.rstrip().removesuffix("\\") for text in lines[start:index]]
+        found = self.CALLEE.search(" ".join(head + [line[:line.index("<<<")]]))
+        return found.group(1) if found else None
+
+    def _launched_in_one_image_only(self, lines):
+        return self._walk(lines, self._callee)
+
+    def _sources(self):
+        root = Path(__file__).resolve().parents[4] / "src"
+        sources = sorted(path for path in root.rglob("*")
+                         if path.suffix in (".cu", ".cuh", ".inc"))
+        self.assertTrue(sources, root)
+        return root, sources
+
+    def test_every_kernel_exists_in_every_image(self):
+        root, sources = self._sources()
+        for path in sources:
+            with self.subTest(source=str(path.relative_to(root))):
+                self.assertEqual(
+                    self._one_image_only(self._uncommented(path.read_text())), [])
+
+    def test_every_launch_is_visible_to_every_image(self):
+        root, sources = self._sources()
+        for path in sources:
+            with self.subTest(source=str(path.relative_to(root))):
+                self.assertEqual(
+                    self._launched_in_one_image_only(
+                        self._uncommented(path.read_text())), [])
+
+    def test_every_launch_site_names_its_callee(self):
+        # A launch the scanner cannot name is silently skipped, so it must not
+        # exist: either the callee pattern or the source layout has to change.
+        root, sources = self._sources()
+        for path in sources:
+            lines = self._uncommented(path.read_text())
+            unnamed = [index + 1 for index, line in enumerate(lines)
+                       if "<<<" in line and not self._callee(lines, index)]
+            with self.subTest(source=str(path.relative_to(root))):
+                self.assertEqual(unnamed, [])
+
+    def test_scanner_flags_a_missing_else_and_accepts_a_stub(self):
+        guarded = """
+#if defined(FLASHQLA_ARCH_150)
+__global__ void only_tc02(float* x) {}
+#endif
+"""
+        stubbed = guarded[:-len("#endif\n")] + """#else
+__global__ void only_tc02(float*, int, int) {}
+#endif
+"""
+        self.assertEqual(self._one_image_only(self._uncommented(guarded)),
+                         ["only_tc02 under #if defined(FLASHQLA_ARCH_150)"])
+        self.assertEqual(self._one_image_only(self._uncommented(stubbed)), [])
+
+    def test_scanner_flags_a_launch_inside_an_image_condition(self):
+        guarded = """
+#if defined(FLASHQLA_ARCH_150) && PH_XY_FACTOR
+  only_tc02<__half><<<grid, 128>>>(x);
+#endif
+"""
+        body_guarded = """
+  const int mode = PH_XY_FACTOR ? 3 : 0;
+  if (PH_XY_FACTOR && mode >= 3) only_tc02<__half><<<grid, 128>>>(x);
+"""
+        self.assertEqual(
+            self._launched_in_one_image_only(self._uncommented(guarded)),
+            ["only_tc02 under #if defined(FLASHQLA_ARCH_150) && PH_XY_FACTOR"])
+        self.assertEqual(
+            self._launched_in_one_image_only(self._uncommented(body_guarded)), [])
+
+    def test_scanner_checks_every_branch(self):
+        else_only = """
+#if defined(FLASHQLA_ARCH_150)
+#else
+__global__ void only_tc01(float* x) {}
+#endif
+"""
+        one_of_three = """
+#if defined(FLASHQLA_ARCH_150)
+__global__ void k(float* x) {}
+#elif defined(FLASHQLA_ARCH_100)
+#else
+__global__ void k(float* x) {}
+#endif
+"""
+        elif_without_else = """
+#if defined(FLASHQLA_ARCH_150)
+__global__ void k(float* x) {}
+#elif defined(FLASHQLA_ARCH_100)
+__global__ void k(float* x) {}
+#endif
+"""
+        image_elif = """
+#if defined(PLA_SOMETHING_ELSE)
+#elif defined(FLASHQLA_ARCH_150)
+__global__ void k(float* x) {}
+#else
+__global__ void k(float* x) {}
+#endif
+"""
+        launch_else_only = """
+#if defined(FLASHQLA_ARCH_150) && PH_XY_FACTOR
+#else
+  only_tc01<__half><<<grid, 128>>>(x);
+#endif
+"""
+        self.assertEqual(self._one_image_only(self._uncommented(else_only)),
+                         ["only_tc01 under #if defined(FLASHQLA_ARCH_150)"])
+        self.assertEqual(self._one_image_only(self._uncommented(one_of_three)),
+                         ["k under #if defined(FLASHQLA_ARCH_150)"])
+        self.assertEqual(self._one_image_only(self._uncommented(elif_without_else)),
+                         ["k under #if defined(FLASHQLA_ARCH_150)"])
+        self.assertEqual(self._one_image_only(self._uncommented(image_elif)),
+                         ["k under #if defined(PLA_SOMETHING_ELSE)"])
+        self.assertEqual(
+            self._launched_in_one_image_only(self._uncommented(launch_else_only)),
+            ["only_tc01 under #if defined(FLASHQLA_ARCH_150) && PH_XY_FACTOR"])
+
+    def test_scanner_names_wrapped_launches(self):
+        macro = """
+#if defined(FLASHQLA_ARCH_150)
+#define LAUNCH_T(ElementType) \\
+    flashqla_cute::wrapped_kernel<ElementType, 4, true> \\
+        <<<grid, dim3(512), smem, stream>>>( \\
+            x, y)
+#endif
+"""
+        template = """
+#if PH_XY_FACTOR
+    flashqla_cute::split_kernel<
+        ElementType, (HV), (NG)>
+        <<<grid, (BLOCK), smem_bytes, stream>>>(x);
+#endif
+"""
+        self.assertEqual(self._callee(self._uncommented(macro), 4), "wrapped_kernel")
+        self.assertEqual(self._callee(self._uncommented(template), 4), "split_kernel")
+        self.assertEqual(
+            self._launched_in_one_image_only(self._uncommented(macro)),
+            ["wrapped_kernel under #if defined(FLASHQLA_ARCH_150)"])
+        self.assertEqual(
+            self._launched_in_one_image_only(self._uncommented(template)),
+            ["split_kernel under #if PH_XY_FACTOR"])
 
 
 if __name__ == "__main__":

@@ -39,7 +39,9 @@ Modes:
 
 import argparse
 import csv
+import glob
 import itertools
+import json
 import os
 from collections import defaultdict
 
@@ -647,7 +649,10 @@ def main():
         tuned_combos.add(DEFAULT_COMBO)
         all_valid = get_valid_combinations()
         combos = [c for c in all_valid if c in tuned_combos]
-        tuned_header = generate_tuned_dispatch(records)
+        csv_paths = [os.path.relpath(os.path.realpath(path), os.path.realpath(GENERATED_DIR))
+                     for path in sorted(glob.glob(args.tuned_csv))]
+        tuned_header = ("// PLA_TUNED_CSV: " + json.dumps(csv_paths) + "\n"
+                        + generate_tuned_dispatch(records))
     else:
         combos = get_valid_combinations()
         tuned_header = generate_default_tuned_dispatch()

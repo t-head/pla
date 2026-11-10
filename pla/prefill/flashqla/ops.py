@@ -513,12 +513,16 @@ def chunk_gated_delta_rule_fwd(
             # alone bounds neither that state's magnitude nor relative error.
             # Preserve all prefix updates and incoming-state transitions in
             # both overlap replay and prepare/correct, even without raw h0.
-            segment_chunks = torch.div(
-                cp_cu_i32[1:] - cp_cu_i32[:-1] + CHUNK_SIZE - 1,
-                CHUNK_SIZE, rounding_mode="floor")
-            num_warmup = segment_chunks[:, None].expand(-1, H).contiguous()
-            fallback_mask = torch.ones(
-                (cp_batch, H), dtype=torch.int8, device=q.device)
+            warmup_metadata = getattr(cp_plan, "warmup_metadata", None)
+            if warmup_metadata is not None:
+                num_warmup, fallback_mask = warmup_metadata
+            else:
+                segment_chunks = torch.div(
+                    cp_cu_i32[1:] - cp_cu_i32[:-1] + CHUNK_SIZE - 1,
+                    CHUNK_SIZE, rounding_mode="floor")
+                num_warmup = segment_chunks[:, None].expand(-1, H).contiguous()
+                fallback_mask = torch.ones(
+                    (cp_batch, H), dtype=torch.int8, device=q.device)
             use_overlap_warmup = (
                 effective_overlap_threshold is not None and
                 (indexed_state or initial_state is None)

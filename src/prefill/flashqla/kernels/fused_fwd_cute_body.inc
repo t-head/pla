@@ -38,6 +38,19 @@
   constexpr bool FF_AUX_P = AUX_P_TPL;
   constexpr bool FF_AUX_U = FF_AUX_P && H_TPL == 12;
   constexpr int FF_NThreads = FF_WG * NGRP;
+#if defined(FLASHQLA_ARCH_100) && defined(FF_VD_INPLACE)
+  constexpr bool FF_REUSE_VD = true;
+#elif defined(FLASHQLA_ARCH_150) && defined(FF_VD_INPLACE)
+  constexpr bool FF_REUSE_VD = TC02_REUSE_VD;
+#else
+  constexpr bool FF_REUSE_VD = false;
+#endif
+#if FF_REG_CHAIN && defined(FLASHQLA_ARCH_150) && defined(FF_VD_INPLACE)
+  constexpr bool FF_TC02_GVA_SPEC =
+      (H_TPL == 12 && Hg_TPL == 4) || (H_TPL == 6 && Hg_TPL == 2);
+#else
+  constexpr bool FF_TC02_GVA_SPEC = false;
+#endif
   // H=24 is the validated tc02 specialization: its register chain makes the
   // h/W/Vd/gVd backing tiles redundant, while Ag/Pg/g-expansion are shared.
   using Smem = FfSmemLayout<NGRP, FF_DVH, H_TPL == 24>;
@@ -335,8 +348,10 @@
   if (!is_aux) {
     const int warp = __shfl_sync(0xffffffff, tx >> 5, 0);
     const int lane = tx & 31;
+    // The H12 specialization issues chunk c+1 after chunk c's drain barrier
+    // (see below), so its prologue seeds only the first chunk.
     ff_preload_chunks_split_aiu<Element, H, Hg, NGRP>(
-        FF_NBUF, seq_start, 0, seq_end, warp, lane,
+        FF_TC02_GVA_SPEC ? 1 : FF_NBUF, seq_start, 0, seq_end, warp, lane,
         Q_all, K_all, V_all, A_all, g_all, b_all,
         q, k, v, a, g, beta, kv_head_idx, head_idx, v_token_stride);
   }
@@ -375,7 +390,8 @@
 #else
       // Drain chunk c while retaining the next full chunk in flight.  The
       // last full chunk flushes the FIFO before a possible partial tail.
-      if (c < full_chunks - 1)
+      // The H12 specialization has only chunk c in flight here.
+      if (!FF_TC02_GVA_SPEC && c < full_chunks - 1)
         ff_aiu_wait_group<1>();
       else
         ff_aiu_wait_group<0>();
@@ -398,6 +414,21 @@
 
     // ============ PHASE A-tail: g_exp / g_rev / stable g snapshot =========
     __syncthreads();  // publish AIU-drained chunk data (K/V/Q/A/g/b) to all
+    if constexpr (FF_TC02_GVA_SPEC) {
+      // Every thread has finished chunk c-1 at this barrier, and after the
+      // drain barrier the register chain only reads shared memory.  Slot
+      // (c+1)%2, last read by chunk c-1, and the shared Ag/Pg/g tiles are
+      // therefore free here, so issuing chunk c+1 now replaces the per-chunk
+      // fence barrier with the same one-chunk prefetch distance.
+      if (!is_aux && (c + 1) < num_chunks) {
+        const int warp = tx >> 5;
+        const int lane = tx & 31;
+        ff_preload_chunks_split_aiu<Element, H, Hg, NGRP>(
+            1, chunk_start + FF_CS, (c + 1) % FF_NBUF, seq_end, warp, lane,
+            Q_all, K_all, V_all, A_all, g_all, b_all,
+            q, k, v, a, g, beta, kv_head_idx, head_idx, v_token_stride);
+      }
+    }
     // NOTE (tc01): K^T is materialised into KT_buf (which aliases hstmT) AFTER
     // GEMM1, not here -- hstmT is live from the Phase-C snapshot through GEMM1,
     // so filling KT now would clobber it. See the KT fill just before GEMM6.
@@ -438,7 +469,46 @@
     // block above, which lets a single barrier below publish both. Inside the
     // r >= c2 && r < actual && c2 < actual guard the two hold the same value:
     // g_log[i] is g_buf[i] for i < actual and g_last_w only past it.
-    {
+    if constexpr (FF_TC02_GVA_SPEC) {
+      // The register chain consumes only Ag_swz, so the gated A_buf copy is
+      // not written back.  Each item reads its row of A and the eight column
+      // gates/betas as vectors; the per-element arithmetic is unchanged.
+      // Every value is evaluated unconditionally and then selected: the
+      // operands are always in-bounds TSM words, and a per-element branch
+      // costs a divergent reconvergence with a full pipeline drain.
+      auto sAg_sw = fq::make_smem_swzA_cs32<FF_CS, FF_CS>(Ag_swz);
+      constexpr int GRP_PER_ROW = FF_CS / 8;
+      for (int grp = tx; grp < FF_CS * GRP_PER_ROW; grp += FF_NThreads) {
+        const int r  = grp / GRP_PER_ROW;
+        const int c0 = (grp % GRP_PER_ROW) * 8;
+        Element packed[8];
+        Element a8[8];
+        float gc[8], bc[8];
+        *reinterpret_cast<int4*>(a8) =
+            *reinterpret_cast<const int4*>(&A_buf[r * FF_CS + c0]);
+        *reinterpret_cast<float4*>(&gc[0]) =
+            *reinterpret_cast<const float4*>(&g_buf[c0]);
+        *reinterpret_cast<float4*>(&gc[4]) =
+            *reinterpret_cast<const float4*>(&g_buf[c0 + 4]);
+        *reinterpret_cast<float4*>(&bc[0]) =
+            *reinterpret_cast<const float4*>(&b_buf[c0]);
+        *reinterpret_cast<float4*>(&bc[4]) =
+            *reinterpret_cast<const float4*>(&b_buf[c0 + 4]);
+        const float g_row = g_buf[r];
+        const bool row_ok = r < actual;
+        CUTE_UNROLL
+        for (int j = 0; j < 8; ++j) {
+          // r < actual and c0 + j <= r imply c0 + j < actual.
+          const float av = fq::element_to_float<Element>(a8[j]);
+          const float gij = exp2f((g_row - gc[j]) * FF_LOG2E);
+          const float v = av * gij * bc[j];
+          packed[j] = fq::float_to_element<Element>(
+              row_ok && c0 + j <= r ? v : 0.0f);
+        }
+        *reinterpret_cast<int4*>(&sAg_sw(r, c0)) =
+            *reinterpret_cast<const int4*>(packed);
+      }
+    } else {
 #if !(defined(FLASHQLA_ARCH_100) && FF_VD_REG_B && FF_GVD_REG_B && !FF_REG_CHAIN)
       auto sAg_sw = fq::make_smem_swzA_cs32<FF_CS, FF_CS>(Ag_swz);
 #endif
@@ -555,6 +625,35 @@
           cute::make_shape(cute::Int<FF_CS>{}, cute::Int<FF_CS>{}));
       auto tcP = thrP.partition_C(cP);
       auto rP = cute::recast<float>(p_acc);
+      if constexpr (FF_TC02_GVA_SPEC) {
+        // tc02 C values (2i, 2i+1) are adjacent columns of one row with an
+        // even first column, so each pair is one aligned b32 of the swizzled
+        // tile (the swizzle permutes 8-element groups only).
+        static_assert(cute::size<1>(tcP) == 1 && cute::size<2>(tcP) == 1);
+        CUTE_UNROLL
+        for (int i = 0; i < cute::size<0>(tcP) / 2; ++i) {
+          auto crd = tcP(2 * i, 0, 0);
+          const int row = cute::get<0>(crd), col = cute::get<1>(crd);
+          // As for Ag, the gate is evaluated unconditionally and the causal
+          // mask is a select.
+          const float g_row = g_buf[row];
+          const float2 g_col =
+              *reinterpret_cast<const float2*>(&g_buf[col]);
+          const float e0 = scale * exp2f((g_row - g_col.x) * FF_LOG2E) *
+                           rP(2 * i, 0, 0);
+          const float e1 = scale * exp2f((g_row - g_col.y) * FF_LOG2E) *
+                           rP(2 * i + 1, 0, 0);
+          const bool row_ok = row < actual;
+          const float pg0 = row_ok && row >= col ? e0 : 0.0f;
+          const float pg1 = row_ok && row >= col + 1 ? e1 : 0.0f;
+          const uint32_t lo = fq::element_bits16<Element>(
+              fq::float_to_element<Element>(pg0));
+          const uint32_t hi = fq::element_bits16<Element>(
+              fq::float_to_element<Element>(pg1));
+          *reinterpret_cast<uint32_t*>(&sPg_write(row, col)) =
+              fq::pack_b16x2_u32(lo, hi);
+        }
+      } else {
       CUTE_UNROLL
       for (int m = 0; m < cute::size<1>(tcP); ++m) {
         CUTE_UNROLL
@@ -571,7 +670,20 @@
           }
         }
       }
+      }
     }
+#endif
+
+#if FF_REG_CHAIN && defined(FLASHQLA_ARCH_150) && defined(FF_VD_INPLACE)
+    // GEMM3^T/GEMM1^T read only register h and the Q/K tiles published by the
+    // drain barrier, so the H12 specialization issues them before the Ag/Pg
+    // rendezvous.  Each group then overlaps the other group's asymmetric
+    // Ag or Pg work with tensor-cell work instead of idling at the barrier.
+    constexpr bool ff_early_qk = H_TPL == 12 && Hg_TPL == 4;
+    auto o_acc = fq::make_acc<FF_DVH, FF_CS, MmaO, Element>(l);
+    auto u_acc = fq::make_acc<FF_DVH, FF_CS, MmaO, Element>(l);
+    if constexpr (ff_early_qk)
+      ff_gemm_state_qkB_m4<Element>(h_reg, Q_buf, K_buf, l, o_acc, u_acc);
 #endif
 
 #if FF_REG_CHAIN
@@ -603,6 +715,14 @@
     // layouts are identical, so h^T, W^T and Vd^T become the next GEMM's A
     // fragments with lane-local packing and no cross-lane shuffle.
 
+#if defined(FLASHQLA_ARCH_150) && defined(FF_VD_INPLACE)
+    if constexpr (ff_early_qk) {
+    } else
+#else
+    auto o_acc = fq::make_acc<FF_DVH, FF_CS, MmaO, Element>(l);
+    auto u_acc = fq::make_acc<FF_DVH, FF_CS, MmaO, Element>(l);
+#endif
+    {
     // Register h^T -> architecture-native A fragments, one tile at a time.
     uint32_t h_a_regs[FF_DK / 16][1][4];
     CUTE_UNROLL
@@ -620,10 +740,9 @@
     }
 
     // ---- GEMM3^T/GEMM1^T: O_int^T = h^T@Q^T, U^T = h^T@K^T ----
-    auto o_acc = fq::make_acc<FF_DVH, FF_CS, MmaO, Element>(l);
-    auto u_acc = fq::make_acc<FF_DVH, FF_CS, MmaO, Element>(l);
     ff_gemm_regA_qkB_m4<Element>(
         h_a_regs, Q_buf, K_buf, l, o_acc, u_acc);
+    }
     auto rO = cute::recast<float>(o_acc);
     CUTE_UNROLL
     for (int m = 0; m < cute::size<1>(tc_csdv); ++m) {
@@ -690,9 +809,7 @@
     // Vd^T feeds Vd^T @ Pg^T unchanged and Vd^T*diag(g_rev) @ K after
     // column scaling. Both are direct tc02 A fragments; no shuffle is needed.
     uint32_t vd_a_regs[FF_CS / 16][1][4];
-#if !defined(FLASHQLA_ARCH_100) || !defined(FF_VD_INPLACE)
     uint32_t gvd_a_regs[FF_CS / 16][1][4];
-#endif
     {
       auto rVd = cute::recast<float>(vd_acc);
       CUTE_UNROLL
@@ -709,7 +826,7 @@
           vd_c_regs[i] = fq::pack_b16x2_u32(lo, hi);
         }
         fq::cfrag_to_afrag_mma_u32<Element>(vd_c_regs, vd_a_regs[kt][0], l & 31);
-#if !defined(FLASHQLA_ARCH_100) || !defined(FF_VD_INPLACE)
+        if constexpr (!FF_REUSE_VD) {
         // gVd has the same A-fragment ownership as Vd.  Scale the already
         // converted Vd fragment at its destination CS coordinates instead of
         // building a second C fragment and paying another eight cross-lane
@@ -742,20 +859,23 @@
               fq::float_to_element<Element>(g_rev[cs1] * vd1));
           gvd_a_regs[kt][0][i] = fq::pack_b16x2_u32(lo, hi);
         }
-#endif
+        }
       }
     }
 
-#if defined(FLASHQLA_ARCH_100) && defined(FF_VD_INPLACE)
-    // Consume the unscaled Vd fragment before reusing the same registers for
-    // gVd. This shortens the tc01 live range by one A-fragment array.
+    if constexpr (FF_REUSE_VD) {
+    // Consume the unscaled Vd fragment before reusing its A registers for gVd.
     ff_gemm_regA_swzlB_m4<FF_CS, FF_CS, Element>(
         vd_a_regs, Pg_g, l, o_acc, /*clear_acc=*/false);
     CUTE_UNROLL
     for (int kt = 0; kt < FF_CS / 16; ++kt) {
       CUTE_UNROLL
       for (int i = 0; i < 4; ++i) {
+#if defined(FLASHQLA_ARCH_100)
         const int cs0 = kt * 16 + 2 * (l & 3) + 8 * (i & 1);
+#else
+        const int cs0 = kt * 16 + 2 * (l & 3) + 8 * (i >> 1);
+#endif
         const int cs1 = cs0 + 1;
         const uint32_t vd_pack = vd_a_regs[kt][0][i];
         const float vd0 = fq::element_to_float<Element>(
@@ -771,7 +891,7 @@
         vd_a_regs[kt][0][i] = fq::pack_b16x2_u32(lo, hi);
       }
     }
-#endif
+    }
 
     // ---- decay h^T; GEMM6^T h^T += gVd^T@K; GEMM5^T O^T += Vd^T@Pg^T ----
     CUTE_UNROLL
@@ -783,15 +903,13 @@
           rHreg(vv, m, n) *= decay;
       }
     }
-#if defined(FLASHQLA_ARCH_100) && defined(FF_VD_INPLACE)
-    ff_gemm_regA_ktB_m4_acc<Element>(
-        vd_a_regs, K_buf, l, h_reg);
-#else
-    ff_gemm_regA_ktB_m4_acc<Element>(
-        gvd_a_regs, K_buf, l, h_reg);
-    ff_gemm_regA_swzlB_m4<FF_CS, FF_CS, Element>(
-        vd_a_regs, Pg_g, l, o_acc, /*clear_acc=*/false);
-#endif
+    if constexpr (FF_REUSE_VD) {
+      ff_gemm_regA_ktB_m4_acc<Element>(vd_a_regs, K_buf, l, h_reg);
+    } else {
+      ff_gemm_regA_ktB_m4_acc<Element>(gvd_a_regs, K_buf, l, h_reg);
+      ff_gemm_regA_swzlB_m4<FF_CS, FF_CS, Element>(
+          vd_a_regs, Pg_g, l, o_acc, /*clear_acc=*/false);
+    }
 
     // The DV-major fragment owns a [DV16,CS32] O^T tile per warp.  Transpose it
     // once in registers and publish two aligned int4 vectors per lane.  This
@@ -1219,6 +1337,7 @@
     }
 
     // ---- chunk fence + deferred prefetch ----
+    if constexpr (FF_TC02_GVA_SPEC) continue;
     __syncthreads();   // all input-buffer readers done for this chunk
 #if defined(FLASHQLA_ARCH_100) && !FF_REG_CHAIN
     if (!is_aux && (c + 1) < num_chunks) {
