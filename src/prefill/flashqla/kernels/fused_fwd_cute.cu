@@ -2030,6 +2030,7 @@ void launch_fused_fwd_cp_cute(
   FF_DISPATCH_E(ElementType,  32,  8) \
   FF_DISPATCH_E(ElementType,  32,  4) \
   FF_DISPATCH_E(ElementType,  24,  8) \
+  FF_DISPATCH_E(ElementType,  16, 16) \
   FF_DISPATCH_E(ElementType,  16,  8) \
   FF_DISPATCH_E(ElementType,  16,  4) \
   FF_DISPATCH_E(ElementType,  16,  2) \

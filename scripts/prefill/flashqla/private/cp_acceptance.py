@@ -54,6 +54,8 @@ from pla.prefill.flashqla.private.cp_preprocess import (
     _TC02_SINGLE_SEQ_CP_MIN_TOKENS_BY_TOPOLOGY,
     _cp_plan_cache,
     _head_shards_from_compute_capability,
+    _legacy_single_seq_cp_min_tokens,
+    _single_seq_cp_min_tokens,
     calc_cp_seqs,
 )
 
@@ -352,7 +354,14 @@ def main() -> int:
         _TC02_SINGLE_SEQ_CP_MIN_TOKENS_BY_TOPOLOGY
         if chunk_size == TC02_SINGLE_SEQ_CALIBRATED_CHUNK_SIZE
     )
-    topology_coverage_ok = calibrated_topologies == SUPPORTED_HEAD_CONFIGS
+    topology_coverage_ok = calibrated_topologies <= SUPPORTED_HEAD_CONFIGS
+    # Shapes without a measured floor stay on the H-only legacy policy, so the
+    # whitelist may legitimately exceed the calibrated map. Check that each
+    # remaining shape is uncalibrated instead of requiring exact equality.
+    for heads, key_heads in SUPPORTED_HEAD_CONFIGS - calibrated_topologies:
+        topology_coverage_ok &= (
+            _single_seq_cp_min_tokens(heads, key_heads) ==
+            _legacy_single_seq_cp_min_tokens(heads))
     calibrated_chunk_size_ok = (
         CHUNK_SIZE == TC02_SINGLE_SEQ_CALIBRATED_CHUNK_SIZE and
         OPS_CHUNK_SIZE == TC02_SINGLE_SEQ_CALIBRATED_CHUNK_SIZE
