@@ -109,8 +109,6 @@ def cases():
              ("tests/test_tc01_fla_dispatch.py",), 600),
         Case("flashqla-cp-planner-contract", "prefill",
              ("scripts/prefill/flashqla/private/test_cp_planner_cpu.py",), 600),
-        Case("flashqla-head-config-contract", "prefill",
-             ("tests/test_prefill_head_config_contract.py",), 120),
     ])
     # Real-model gating accuracy gate plus the synthetic CP/state/scheduling
     # regressions in the same files: full-script pytest run per dev request;

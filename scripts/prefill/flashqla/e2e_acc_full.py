@@ -666,7 +666,7 @@ if __name__ == "__main__":
         (8192, 16, 8),
         (16384, 16, 8),
         (32768, 16, 8),
-        (8192, 16, 16),  # GQA ratio 1: (32,16) GDN at TP=2
+        (8192, 16, 16),  # GQA ratio 1: 32 v-heads / 32 qk-heads at TP=2
         (4096, 32, 16),  # Qwen3.7-Max tp4
         (8192, 32, 16),
         (16384, 32, 16),
@@ -739,6 +739,7 @@ if __name__ == "__main__":
         (2047, 32, 16, False),  # 31-token tail (largest partial)
         (2049, 32, 16, False),  # 1-token tail (smallest partial)
         (2049, 16, 8,  True),
+        (5555, 16, 16, False),  # ratio 1 with a 19-token tail
         (33,   16, 8,  False),  # one full chunk + 1-token tail
         (17,   16, 8,  False),  # shorter than one chunk: smem never written before
     ]
@@ -754,6 +755,7 @@ if __name__ == "__main__":
     INDEXED_CASES = [
         ((65, 47), 16, 8, torch.float16, False, 42),
         ((8192, 2048), 16, 8, torch.bfloat16, True, 123),
+        ((8192, 2048), 16, 16, torch.bfloat16, True, 321),  # ratio 1 + CP
     ]
     for lengths, H, Hg, dtype, auto_cp, seed in INDEXED_CASES:
         ok = run_indexed_state_case(

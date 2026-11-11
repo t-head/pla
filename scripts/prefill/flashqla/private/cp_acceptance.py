@@ -54,10 +54,13 @@ from pla.prefill.flashqla.private.cp_preprocess import (
     _TC02_SINGLE_SEQ_CP_MIN_TOKENS_BY_TOPOLOGY,
     _cp_plan_cache,
     _head_shards_from_compute_capability,
-    _legacy_single_seq_cp_min_tokens,
-    _single_seq_cp_min_tokens,
     calc_cp_seqs,
 )
+
+# Shapes allowed to stay on the H-only legacy CP floor. A head config reaching
+# the whitelist without a measured floor must be a deliberate act, otherwise a
+# new shape quietly inherits the (num_v_heads <= 16) 3072-token tier.
+UNCALIBRATED_HEAD_CONFIGS = frozenset({(8, 1), (16, 16)})
 
 
 @contextmanager
@@ -354,14 +357,13 @@ def main() -> int:
         _TC02_SINGLE_SEQ_CP_MIN_TOKENS_BY_TOPOLOGY
         if chunk_size == TC02_SINGLE_SEQ_CALIBRATED_CHUNK_SIZE
     )
-    topology_coverage_ok = calibrated_topologies <= SUPPORTED_HEAD_CONFIGS
-    # Shapes without a measured floor stay on the H-only legacy policy, so the
-    # whitelist may legitimately exceed the calibrated map. Check that each
-    # remaining shape is uncalibrated instead of requiring exact equality.
-    for heads, key_heads in SUPPORTED_HEAD_CONFIGS - calibrated_topologies:
-        topology_coverage_ok &= (
-            _single_seq_cp_min_tokens(heads, key_heads) ==
-            _legacy_single_seq_cp_min_tokens(heads))
+    # The measured map may lag the whitelist by exactly the shapes listed in
+    # UNCALIBRATED_HEAD_CONFIGS; any other difference means a shape gained
+    # support without a floor, or a floor was measured for a supportless shape.
+    topology_coverage_ok = (
+        calibrated_topologies <= SUPPORTED_HEAD_CONFIGS and
+        SUPPORTED_HEAD_CONFIGS - calibrated_topologies ==
+        UNCALIBRATED_HEAD_CONFIGS)
     calibrated_chunk_size_ok = (
         CHUNK_SIZE == TC02_SINGLE_SEQ_CALIBRATED_CHUNK_SIZE and
         OPS_CHUNK_SIZE == TC02_SINGLE_SEQ_CALIBRATED_CHUNK_SIZE
