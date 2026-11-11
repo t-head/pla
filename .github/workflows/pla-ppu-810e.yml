@@ -1,0 +1,174 @@
+name: CI PPU OAM-810E
+
+on:
+  pull_request:
+    branches: [master]
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SAIL_IMAGE: download.t-head.cn/docker_release/pytorch:sdk2.2.0-2.10.0-ubuntu24.04-hggcrt3-py312-20261005
+
+jobs:
+  wait-review:
+    name: Wait for review gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 480
+    permissions:
+      contents: read
+      checks: read
+    # Own run per board: this group keeps push-time cancellation per board
+    # while letting the other board's run finish and re-run independently.
+    concurrency:
+      group: ci-${{ github.event.pull_request.number || github.ref }}-OAM-810E
+      cancel-in-progress: true
+    steps:
+      - name: Wait for CI Pipeline review gates on this head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, re, subprocess, sys, time
+          if os.environ["EVENT_NAME"] == "workflow_dispatch":
+              print("manual dispatch: skipping the review-gate wait")
+              sys.exit(0)
+          repo = os.environ["GITHUB_REPOSITORY"]
+          sha = os.environ["HEAD_SHA"]
+          if not re.fullmatch(r"[0-9a-f]{40}", sha):
+              sys.exit(f"refusing non-SHA head value: {sha!r}")
+          required = {"Human Review Gate / Human Review Gate",
+                      "Static Compliance / Static Compliance Scan (normal)"}
+          failed = {"failure", "cancelled", "timed_out", "startup_failure",
+                    "action_required"}
+          deadline = time.time() + 7.5 * 3600
+          while True:
+              out = subprocess.run(
+                  ["gh", "api",
+                   f"repos/{repo}/commits/{sha}/check-runs?filter=latest&per_page=100",
+                   "--jq",
+                   ".check_runs[] | [.name, .status, (.conclusion // \"pending\")] | @tsv"],
+                  capture_output=True, text=True, check=True).stdout
+              rows = [line.split("\t") for line in out.splitlines() if line]
+              bad = {name for name, _, concl in rows
+                     if name in required and concl in failed}
+              if bad:
+                  sys.exit(f"review gates not successful: {sorted(bad)}")
+              done = {name for name, _, concl in rows
+                      if name in required and concl == "success"}
+              if required <= done:
+                  print("review gates success:", sorted(done))
+                  break
+              if time.time() > deadline:
+                  sys.exit("timed out waiting for CI Pipeline review gates")
+              time.sleep(60)
+          PY
+
+  build-test:
+    name: Build & Test (OAM-810E)
+    needs: wait-review
+    runs-on: k8s-runner-group-cpu-thead
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 900
+    concurrency:
+      group: ci-${{ github.event.pull_request.number || github.ref }}-OAM-810E
+      cancel-in-progress: true
+    env:
+      REPORT_ROOT: /wl_nas/devops/${{ github.repository_id }}-${{ github.run_id }}-${{ github.run_attempt }}/pla/OAM-810E
+      WORKER_REPORT_ROOT: /mnt/wl_nas/devops/${{ github.repository_id }}-${{ github.run_id }}-${{ github.run_attempt }}/pla/OAM-810E
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Sync PLA submodules
+        # actlize follows the pla gitlink; no yml-pinned checkout ref.
+        run: |
+          git submodule sync --recursive
+          git submodule update --init --recursive
+      - name: Validate CI assets
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python3 .github/workflows/scripts/test_ci_functional.py
+      - name: Build and Test on PPU
+        id: ppu-test
+        uses: t-head/ci-infra/cluster-run@main
+        with:
+          image: ${{ env.SAIL_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 1
+          node_selector: board-type=OAM-810E
+          namespace: ppu-sched
+          timeout_minutes: 840
+          cleanup_policy: always
+          dmesg_policy: on_failure
+          extra_env: PLA_REPORT_ROOT=${{ env.WORKER_REPORT_ROOT }},PLA_TEST_REVISION=${{ github.sha }},PLA_CI_BOARD=OAM-810E
+          command: |
+            set -Eeo pipefail
+            # With plain set -e a failing bare check exits with zero output;
+            # report the failing line (bash >= 4 expands $LINENO in an ERR trap
+            # to the failing command) so the console always names a cause.
+            trap 'rc=$?; echo "::error::worker command failed at line $LINENO with rc=$rc" >&2; exit "$rc"' ERR
+            mkdir -p "$PLA_REPORT_ROOT"
+            exec > >(tee "$PLA_REPORT_ROOT/worker.log") 2>&1
+            cd /workspace/source
+            unset PIP_INDEX_URL PYTHONPATH PLA_BUILD_NAMESPACE PPU_ACTLIZE_DIR
+            export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
+            source /usr/local/PPU_SDK/envsetup.sh
+            set -u
+            export PPU_SDK_DIR=/usr/local/PPU_SDK
+            export PPU_ACTLIZE_DIR=/workspace/source/3rdparty/actlize
+            "$PPU_SDK_DIR/bin/hgcc" --version
+            python -m pip install setuptools==69.5.1 setuptools-scm==9.2.2 \
+              packaging==24.2 wheel==0.45.1 pybind11==2.13.6 ninja==1.11.1.4 \
+              numpy==1.26.4 pandas==2.2.3 pytest==8.3.5 einops==0.8.1
+            python -c 'import torch, triton; print(torch.__version__, triton.__version__)'
+            python .github/workflows/scripts/run_functional.py --list
+            export MAX_JOBS=20 HGCC_THREADS=2
+            BUILD_ROOT=$(mktemp -d /tmp/pla-build.XXXXXX)
+            timeout --signal=TERM --kill-after=30s 180m \
+              python setup.py bdist_wheel \
+                --bdist-dir "$BUILD_ROOT/wheel" --dist-dir "$BUILD_ROOT/dist" \
+                2>&1 | tee "$PLA_REPORT_ROOT/build.log"
+            wheels=("$BUILD_ROOT"/dist/pla-*.whl)
+            if [ "${#wheels[@]}" -ne 1 ] || [ ! -f "${wheels[0]}" ]; then
+              echo "::error::expected exactly one pla wheel in $BUILD_ROOT/dist, found: $(ls -1 "$BUILD_ROOT"/dist 2>/dev/null | tr '\n' ' ')" >&2
+              exit 1
+            fi
+            python -m pip install --force-reinstall --no-deps "${wheels[0]}"
+            python .github/workflows/scripts/run_functional.py --stage-wheel "${wheels[0]}"
+            result=0
+            for phase in decode prefill; do
+              python .github/workflows/scripts/run_functional.py \
+                --board "$PLA_CI_BOARD" --phase "$phase" \
+                --output "$PLA_REPORT_ROOT/$phase" --budget-seconds 18000 || result=1
+            done
+            exit "$result"
+      - name: Collect reports from shared NAS
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          destination=".ci-results/OAM-810E"
+          mkdir -p "$destination"
+          if [ -d "$REPORT_ROOT" ]; then
+            cp -a "$REPORT_ROOT/." "$destination/"
+          fi
+      - name: Board results (OAM-810E)
+        if: always()
+        env:
+          PLA_TEST_RESULT: ${{ steps.ppu-test.outcome }}
+        run: python3 .github/workflows/scripts/run_functional.py --summary-root .ci-results --board "OAM-810E"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pla-results-OAM-810E
+          path: .ci-results/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14

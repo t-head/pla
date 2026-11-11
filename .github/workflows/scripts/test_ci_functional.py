@@ -272,38 +272,70 @@ class FunctionalCITests(unittest.TestCase):
             self.assertEqual(runner.summarize(self.root, runner.BOARDS[:1]), 0)
 
     def test_workflow_has_independent_board_pipelines(self):
-        workflow = (runner.ROOT / ".github/workflows/pla-basic-test-ppu.yml").read_text()
-        header = workflow.split("  build-test:\n", 1)[1].split("    steps:\n", 1)[0]
-        self.assertIn("name: Build & Test (${{ matrix.board }})", header)
-        self.assertIn("board: [OAM-810E, ZW-M890P]", header)
-        self.assertIn("fail-fast: false", header)
-        self.assertIn("runs-on: k8s-runner-group-cpu-thead", header)
-        self.assertNotIn("needs:", header)
-        self.assertNotIn("phase:", header)
-        self.assertIn("image: ghcr.io/actions/actions-runner:latest", header)
-        self.assertNotIn("sdk2.2.0", header)
-        self.assertIn("timeout-minutes: 900", header)
-        self.assertEqual(workflow.count("uses: t-head/ci-infra/cluster-run@main"), 1)
-        worker = workflow.split("          command: |\n", 1)[1].split("      - name:", 1)[0]
-        self.assertEqual(worker.count("python setup.py "), 1)
-        self.assertIn("python setup.py bdist_wheel", worker)
-        self.assertNotIn("python setup.py build", worker)
-        self.assertNotIn("--build-base", worker)
-        self.assertNotIn("--skip-build", worker)
-        self.assertIn("--kill-after=30s 180m", worker)
-        self.assertIn("for phase in decode prefill; do", worker)
-        self.assertIn("--budget-seconds 18000 || result=1", worker)
-        self.assertIn('exit "$result"', worker)
-        self.assertIn("timeout_minutes: 840", workflow)
-        self.assertIn("PLA_TEST_RESULT: ${{ steps.ppu-test.outcome }}", workflow)
-        self.assertIn("name: pla-results-${{ matrix.board }}", workflow)
-        self.assertIn("repository: t-head/actlize", workflow)
-        self.assertIn("ref: 7c08602a4f4a3ba1ebee7ce16e58eb496e183115", workflow)
-        self.assertIn("path: 3rdparty/actlize", workflow)
-        self.assertNotIn("scripts/ci/", workflow)
-        self.assertNotIn("tests/test_ci_functional.py", workflow)
-        self.assertNotIn("  summary:", workflow)
-        self.assertNotIn("continue-on-error:", workflow)
+        # Each board owns a whole workflow (and therefore a whole run), so one
+        # board reaching a terminal state and re-running never waits on the
+        # other board's run; the wait-review job keeps the serial review gate.
+        boards = ((".github/workflows/pla-ppu-810e.yml", "OAM-810E"),
+                  (".github/workflows/pla-ppu-890p.yml", "ZW-M890P"))
+        for path, board in boards:
+            workflow = (runner.ROOT / path).read_text()
+            header = workflow.split("  build-test:\n", 1)[1].split("    steps:\n", 1)[0]
+            self.assertIn(f"name: Build & Test ({board})", header)
+            self.assertIn("group: ci-${{ github.event.pull_request.number || github.ref }}-" + board,
+                          header)
+            self.assertIn("cancel-in-progress: true", header)
+            self.assertIn("needs: wait-review", header)
+            self.assertNotIn("matrix:", header)
+            self.assertNotIn("phase:", header)
+            self.assertIn("runs-on: k8s-runner-group-cpu-thead", header)
+            self.assertIn("image: ghcr.io/actions/actions-runner:latest", header)
+            self.assertNotIn("sdk2.2.0", header)
+            self.assertIn("timeout-minutes: 900", header)
+            self.assertEqual(workflow.count("uses: t-head/ci-infra/cluster-run@main"), 1)
+            self.assertEqual(workflow.count("uses: actions/checkout@v4"), 1)
+            # actlize comes from the pla gitlink via submodule sync, not from
+            # a yml-pinned checkout of the actlize repository.
+            self.assertNotIn("repository: t-head/actlize", workflow)
+            self.assertNotIn("ref: 7c08602a4f4a3ba1ebee7ce16e58eb496e183115", workflow)
+            self.assertIn("git submodule sync --recursive", workflow)
+            self.assertIn("git submodule update --init --recursive", workflow)
+            # The gate wait polls the entry pipeline's review checks by head
+            # sha and skips the wait for manual dispatches.
+            self.assertIn("name: Wait for review gates", workflow)
+            self.assertIn("Human Review Gate / Human Review Gate", workflow)
+            self.assertIn("Static Compliance / Static Compliance Scan (normal)", workflow)
+            self.assertIn("checks: read", workflow)
+            self.assertIn("workflow_dispatch:", workflow)
+            self.assertIn("EVENT_NAME: ${{ github.event_name }}", workflow)
+            self.assertIn("HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}", workflow)
+            self.assertIn('re.fullmatch(r"[0-9a-f]{40}", sha)', workflow)
+            worker = workflow.split("          command: |\n", 1)[1].split("      - name:", 1)[0]
+            self.assertEqual(worker.count("python setup.py "), 1)
+            self.assertIn("python setup.py bdist_wheel", worker)
+            self.assertNotIn("python setup.py build", worker)
+            self.assertNotIn("--build-base", worker)
+            self.assertNotIn("--skip-build", worker)
+            self.assertIn("--kill-after=30s 180m", worker)
+            self.assertIn("for phase in decode prefill; do", worker)
+            self.assertIn("--budget-seconds 18000 || result=1", worker)
+            self.assertIn('exit "$result"', worker)
+            self.assertIn("timeout_minutes: 840", workflow)
+            self.assertIn("PLA_TEST_RESULT: ${{ steps.ppu-test.outcome }}", workflow)
+            self.assertIn(f"name: pla-results-{board}", workflow)
+            self.assertIn(f"--board \"{board}\"", workflow)
+            self.assertNotIn("scripts/ci/", workflow)
+            self.assertNotIn("tests/test_ci_functional.py", workflow)
+            self.assertNotIn("  summary:", workflow)
+            self.assertNotIn("continue-on-error:", workflow)
+        entry = (runner.ROOT / ".github/workflows/ci.yml").read_text()
+        # A run-wide concurrency group would serialize whole runs and block
+        # single-board re-runs; cancellation must stay per job / per board.
+        self.assertNotIn("concurrency:", entry.split("jobs:", 1)[0])
+        self.assertEqual(entry.count("cancel-in-progress: true"), 4)
+        # The coupled matrix run is gone: boards no longer share one run.
+        self.assertNotIn("Full CI (PPU)", entry)
+        self.assertNotIn("pla-basic-test-ppu.yml", entry)
+        self.assertFalse((runner.ROOT / ".github/workflows/pla-basic-test-ppu.yml").exists())
 
     def test_entry_requires_serial_review_gates(self):
         workflow = (runner.ROOT / ".github/workflows/ci.yml").read_text()
@@ -311,7 +343,7 @@ class FunctionalCITests(unittest.TestCase):
         self.assertIn("workflow_dispatch:", workflow)
         self.assertIn("github.event.pull_request.number || github.ref", workflow)
         dependencies = {"ai-code-review": "precheck", "human-review": "ai-code-review",
-                        "static-compliance": "precheck", "ci": "[human-review, static-compliance]"}
+                        "static-compliance": "precheck"}
         for name, dependency in dependencies.items():
             job = workflow.split(f"  {name}:\n", 1)[1].split("\n\n", 1)[0]
             self.assertEqual([line.strip() for line in job.splitlines() if "needs:" in line],
