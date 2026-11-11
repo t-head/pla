@@ -649,7 +649,7 @@ print(f"[pla] building namespaces: {', '.join(NAMESPACES)} "
 
 setup(
     name='pla',
-    version='1.0.0',
+    version='1.1.0',
     author='Gino Wu',
     description='PPU Linear Attention kernels (decode + prefill)',
     long_description='',

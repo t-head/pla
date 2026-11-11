@@ -48,6 +48,6 @@ The decode and prefill families have separate compiled extensions. The SGLang
 compatibility namespace forwards to the ReplaySSM extension.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 __all__ = []
