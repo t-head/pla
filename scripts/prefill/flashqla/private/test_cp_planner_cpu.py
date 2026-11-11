@@ -35,6 +35,7 @@ small fallback stub keeps these planner tests runnable on developer hosts that
 do not have a CPU PyTorch wheel; no CUDA runtime or PPU is used.
 """
 
+import ast
 import importlib.util
 import os
 import re
@@ -777,6 +778,44 @@ class Tc02RealGatePlannerTest(unittest.TestCase):
                 self.assertEqual(cp._tc02_real_gate_cp_allowed(
                     self._raw_cu(*lengths), 32, heads, segments
                 ), expected)
+
+    def test_single_seq_calibration_covers_supported_heads(self):
+        root = Path(__file__).resolve().parents[4]
+        tree = ast.parse((root / "pla/prefill/flashqla/ops.py").read_text())
+        assignment = next(
+            node for node in tree.body if isinstance(node, ast.Assign) and
+            any(isinstance(target, ast.Name) and
+                target.id == "SUPPORTED_HEAD_CONFIGS" for target in node.targets))
+        supported = frozenset(ast.literal_eval(assignment.value.args[0]))
+        calibrated = frozenset(
+            (heads, key_heads) for heads, key_heads, chunk_size in
+            cp._TC02_SINGLE_SEQ_CP_MIN_TOKENS_BY_TOPOLOGY
+            if chunk_size == cp.TC02_SINGLE_SEQ_CALIBRATED_CHUNK_SIZE)
+        self.assertEqual(calibrated, supported)
+
+    def test_new_single_seq_floors_and_legacy_fallback(self):
+        for heads, key_heads, floor, legacy in ((8, 1, 1024, 2048),
+                                                (16, 16, 3072, 3072)):
+            with self.subTest(heads=heads, key_heads=key_heads):
+                self.assertEqual(cp._single_seq_cp_min_tokens(heads, key_heads), floor)
+                self.assertEqual(cp._single_seq_cp_min_tokens(heads), legacy)
+                self.assertEqual(cp._single_seq_cp_min_tokens(
+                    heads, key_heads, chunk_size=64), legacy)
+                with mock.patch.object(cp, "_device_execution_model",
+                                       side_effect=self._tc02_device_model):
+                    for length in (floor - 1, floor, floor + 1):
+                        plan = cp.calc_cp_seqs(
+                            self._cu(length), 32, heads, num_k_heads=key_heads)
+                        self.assertEqual(plan[0], length >= floor)
+                        if plan[0]:
+                            self.assertGreater(plan[1].numel(), 2)
+                cp._cp_plan_cache.clear()
+                with mock.patch.object(
+                    cp, "_device_execution_model",
+                    side_effect=Tc01RealGatePlannerTest._tc01_device_model,
+                ):
+                    self.assertFalse(cp.calc_cp_seqs(
+                        self._cu(floor), 32, heads, num_k_heads=key_heads)[0])
 
     def test_tc02_guard_rejects_uncalibrated_topologies(self):
         self.assertFalse(cp._tc02_real_gate_cp_allowed(
