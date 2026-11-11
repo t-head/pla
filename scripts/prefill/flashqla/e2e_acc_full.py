@@ -32,7 +32,7 @@
 all supported dispatch shapes, exercising both non-CP and CP paths.
 
 Tests:
-  1. All 17 (H,Hg) dispatch combos at T=2048 (automatic planner)
+  1. All 18 (H,Hg) dispatch combos at T=2048 (automatic planner)
   2. GVA deployment shapes at T={2048,4096,8192,16384,32768} (exercises CP)
   3. CP-path validation with fast-decay gates (ensures fallback_mask=0)
   4. h0 (initial state) path
@@ -640,13 +640,13 @@ if __name__ == "__main__":
     results = []
     generalized_result = None
 
-    # === Section 1: All 17 dispatch shapes, T=2048, automatic planner ===
+    # === Section 1: All 18 dispatch shapes, T=2048, automatic planner ===
     print("=" * 80)
-    print("SECTION 1: All 17 dispatch combos (T=2048, pipeline E2E)")
+    print("SECTION 1: All 18 dispatch combos (T=2048, pipeline E2E)")
     print("=" * 80)
     DISPATCH_COMBOS = [
         (128, 16), (64, 16), (64, 8), (48, 16), (32, 16),
-        (32, 8), (32, 4), (24, 8), (16, 8), (16, 4),
+        (32, 8), (32, 4), (24, 8), (16, 16), (16, 8), (16, 4),
         (16, 2), (12, 4), (8, 4), (8, 2), (8, 1), (6, 2), (4, 2),
     ]
     for (H, Hg) in DISPATCH_COMBOS:
@@ -666,6 +666,7 @@ if __name__ == "__main__":
         (8192, 16, 8),
         (16384, 16, 8),
         (32768, 16, 8),
+        (8192, 16, 16),  # GQA ratio 1: 32 v-heads / 32 qk-heads at TP=2
         (4096, 32, 16),  # Qwen3.7-Max tp4
         (8192, 32, 16),
         (16384, 32, 16),
@@ -738,6 +739,7 @@ if __name__ == "__main__":
         (2047, 32, 16, False),  # 31-token tail (largest partial)
         (2049, 32, 16, False),  # 1-token tail (smallest partial)
         (2049, 16, 8,  True),
+        (5555, 16, 16, False),  # ratio 1 with a 19-token tail
         (33,   16, 8,  False),  # one full chunk + 1-token tail
         (17,   16, 8,  False),  # shorter than one chunk: smem never written before
     ]
@@ -753,6 +755,7 @@ if __name__ == "__main__":
     INDEXED_CASES = [
         ((65, 47), 16, 8, torch.float16, False, 42),
         ((8192, 2048), 16, 8, torch.bfloat16, True, 123),
+        ((8192, 2048), 16, 16, torch.bfloat16, True, 321),  # ratio 1 + CP
     ]
     for lengths, H, Hg, dtype, auto_cp, seed in INDEXED_CASES:
         ok = run_indexed_state_case(
