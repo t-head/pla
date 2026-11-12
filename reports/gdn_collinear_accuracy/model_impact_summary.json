@@ -1,0 +1,159 @@
+{
+  "measurement_date": "2026-11-12",
+  "source_commit": "6658b13a693cadfe0588cd3797f10a6e0bdea0c0",
+  "binary_sha256": "d17fa34f2b00f5b557327842904aa86856d5bb5071a9593a55b90d9d4b0c73fe",
+  "scope": "Reconstructed layer-0 inputs from pinned public weights, 12 fixed texts, 5110 tokens per model. Not online activation dumps or full-model quality evaluation.",
+  "oracle": "FP64 independent chunk triangular solve; complete token recurrence audits agree within 1e-15.",
+  "tail_reference": "BF16(oracle O), shared FP32 projection without TF32 and explicit BF16 boundaries, attention residual/HC merge before MLP. Not a PPU tail-runtime qualification.",
+  "sources": {
+    "next": {
+      "model": "Qwen/Qwen3.8-Flash-Next",
+      "revision": "21a7c3ca68484a9987d62fd51b78130d9b9a11f8",
+      "corpus_sha256": "d7ea4a543da6b8070f23f41ff6f76329bc4053d1b6251c2421e12bc4cfeff50f",
+      "token_ids_sha256": "83e47e532c5361becab5da359e42e3d1d9b8f1fe5f2c595a3a83d4cfa4aecb22",
+      "inputs_sha256": "3829af2207d9646f4c316916f1a43b8aeba66701238a25e6cc2ba308dce311cd",
+      "tail_sha256": "9ff50ab92ecce7f7755ce35aa47257b69a0db6ad63ba690863707eb70b96cab4"
+    },
+    "max": {
+      "model": "Qwen/Qwen3.8-2.4T-A95B",
+      "revision": "912e40d903bfc891be8fe3c51faa0a09d182ce95",
+      "corpus_sha256": "d7ea4a543da6b8070f23f41ff6f76329bc4053d1b6251c2421e12bc4cfeff50f",
+      "token_ids_sha256": "83e47e532c5361becab5da359e42e3d1d9b8f1fe5f2c595a3a83d4cfa4aecb22",
+      "inputs_sha256": "0205c14dad55e1d650c542e79cc4e91fb16536a0cbfdab274a68c21b12173b40",
+      "tail_sha256": "f8f77dd62cabf699a23dde8bbb4de5bed66c508d13f125f9d5b3420ed36e604c"
+    }
+  },
+  "rows": [
+    {
+      "model": "next",
+      "backend": "810e",
+      "o_global": 0.0019300413464214366,
+      "o_max_sequence_head": 0.0038752265071366728,
+      "h_global": 0.00167688592730066,
+      "h_max_sequence_head": 0.007761852234058542,
+      "h_over_1pct": 0,
+      "state_groups": 576,
+      "attention_residual_global": 0.004511422430646828,
+      "attention_residual_p99": 0.00554460951565385,
+      "attention_residual_max": 0.006861284712375494,
+      "attention_residual_tokens_over_1pct": 0,
+      "carry_global": 0.00032309682120512423,
+      "carry_max_sequence_head": 0.0007648564969710588
+    },
+    {
+      "model": "next",
+      "backend": "890p",
+      "o_global": 0.0019417792842088893,
+      "o_max_sequence_head": 0.003740081141698333,
+      "h_global": 0.001738031101964731,
+      "h_max_sequence_head": 0.004609685855562029,
+      "h_over_1pct": 0,
+      "state_groups": 576,
+      "attention_residual_global": 0.004513697959206676,
+      "attention_residual_p99": 0.00551633931453264,
+      "attention_residual_max": 0.006726913068856191,
+      "attention_residual_tokens_over_1pct": 0,
+      "carry_global": 0.0003446394432786403,
+      "carry_max_sequence_head": 0.0010755375326831906
+    },
+    {
+      "model": "max",
+      "backend": "810e",
+      "o_global": 0.001973442535074205,
+      "o_max_sequence_head": 0.004141834418179452,
+      "h_global": 0.0020705662271446397,
+      "h_max_sequence_head": 0.01188410374739214,
+      "h_over_1pct": 1,
+      "state_groups": 1536,
+      "attention_residual_global": 0.0025272103757242605,
+      "attention_residual_p99": 0.007436254957437245,
+      "attention_residual_max": 0.014425889331273685,
+      "attention_residual_tokens_over_1pct": 12,
+      "carry_global": 0.00021618752475075469,
+      "carry_max_sequence_head": 0.001127086665682893
+    },
+    {
+      "model": "max",
+      "backend": "890p",
+      "o_global": 0.00197234265453858,
+      "o_max_sequence_head": 0.004141834418179452,
+      "h_global": 0.002129816779821701,
+      "h_max_sequence_head": 0.02479829541041516,
+      "h_over_1pct": 4,
+      "state_groups": 1536,
+      "attention_residual_global": 0.0025165618986490433,
+      "attention_residual_p99": 0.0074370975089271185,
+      "attention_residual_max": 0.01442627787886038,
+      "attention_residual_tokens_over_1pct": 13,
+      "carry_global": 0.00022093739513230466,
+      "carry_max_sequence_head": 0.001420028415426218
+    }
+  ],
+  "hybrid_rows": [
+    {
+      "model": "next",
+      "selection": "joint",
+      "backend": "810e",
+      "selected_groups": 273,
+      "denominator": 3744,
+      "attention_global": 0.002279415906015383,
+      "attention_p99": 0.0035318019882097976,
+      "attention_max": 0.00452864359201305
+    },
+    {
+      "model": "next",
+      "selection": "joint",
+      "backend": "890p",
+      "selected_groups": 273,
+      "denominator": 3744,
+      "attention_global": 0.0022796366295639663,
+      "attention_p99": 0.0035267566730364315,
+      "attention_max": 0.0044879713755043345
+    },
+    {
+      "model": "max",
+      "selection": "joint",
+      "backend": "810e",
+      "selected_groups": 7,
+      "denominator": 9984,
+      "attention_global": 0.00012050179081824705,
+      "attention_p99": 0.00021816276883344498,
+      "attention_max": 0.0068800456931101695
+    },
+    {
+      "model": "max",
+      "selection": "joint",
+      "backend": "890p",
+      "selected_groups": 7,
+      "denominator": 9984,
+      "attention_global": 0.00012050912400700988,
+      "attention_p99": 0.00021816276883344498,
+      "attention_max": 0.0068800456931101695
+    },
+    {
+      "model": "max",
+      "selection": "konly",
+      "backend": "810e",
+      "selected_groups": 624,
+      "denominator": 9984,
+      "attention_global": 0.0004692082653870355,
+      "attention_p99": 0.0006758805143838722,
+      "attention_max": 0.00749635919641421
+    },
+    {
+      "model": "max",
+      "selection": "konly",
+      "backend": "890p",
+      "selected_groups": 624,
+      "denominator": 9984,
+      "attention_global": 0.00047946377779595163,
+      "attention_p99": 0.0007008743178968338,
+      "attention_max": 0.007495186777253115
+    }
+  ],
+  "limitations": [
+    "No final logits, NLL, PPL or task accuracy was measured.",
+    "Hybrid selected-region effects are not an additive causal decomposition.",
+    "Continuation fixes subsequent Q/K/beta/g and injects no new arithmetic errors."
+  ]
+}

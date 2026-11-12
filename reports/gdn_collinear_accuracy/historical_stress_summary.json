@@ -1,0 +1,810 @@
+{
+  "measurement_date": "2026-11-11",
+  "source_commit": "6658b13a693cadfe0588cd3797f10a6e0bdea0c0",
+  "actlize_commit": "334d6980a31b40cb97b86480768297bdeacbcba8",
+  "binary_sha256": "d17fa34f2b00f5b557327842904aa86856d5bb5071a9593a55b90d9d4b0c73fe",
+  "torch_version": "2.13.0",
+  "sdk_compiler": "2.2.0-663c22",
+  "fixture_generator": "Original H200 generator, seed 101; CPU-generated portable fixtures are a different dataset.",
+  "metric": "Maximum sequence/value-head relative RMS, FP32 metric reduction, tolerance 0.01. Nonempty state separate from empty-state contract.",
+  "devices": {
+    "810e": {
+      "summary": {
+        "False": {
+          "stress_inputs": 6,
+          "stress_failures": 6,
+          "normal_inputs": 2,
+          "normal_passes": 2,
+          "actual_cp_calls": 0,
+          "output_rms_range": [
+            0.01065922062844038,
+            0.011432632803916931
+          ],
+          "nonempty_state_rms_range": [
+            0.01430866401642561,
+            0.01722615584731102
+          ]
+        },
+        "True": {
+          "stress_inputs": 6,
+          "stress_failures": 6,
+          "normal_inputs": 2,
+          "normal_passes": 2,
+          "actual_cp_calls": 0,
+          "output_rms_range": [
+            0.01065922062844038,
+            0.011432632803916931
+          ],
+          "nonempty_state_rms_range": [
+            0.01430866401642561,
+            0.01722615584731102
+          ]
+        }
+      },
+      "cases": [
+        {
+          "name": "flash-next-collinear-128",
+          "fixture_sha256": "43b60ae7fae564ef2374bf76374fd1fea59ac99ff1f5ef56bd349df268465d7b",
+          "reference_kind": "FP64 token recurrence",
+          "metadata": {
+            "model": "flash-next",
+            "variant": "collinear",
+            "tp": 8,
+            "hq": 2,
+            "hv": 6,
+            "seed": 101
+          },
+          "lengths": [
+            128
+          ],
+          "auto_cp": false,
+          "actual_use_cp": false,
+          "finite": true,
+          "output_relative_rms_max": 0.01065922062844038,
+          "state_relative_rms_max_nonempty": 0.015179207548499107,
+          "empty_state_bitwise_unchanged": true
+        },
+        {
+          "name": "flash-next-collinear-128",
+          "fixture_sha256": "43b60ae7fae564ef2374bf76374fd1fea59ac99ff1f5ef56bd349df268465d7b",
+          "reference_kind": "FP64 token recurrence",
+          "metadata": {
+            "model": "flash-next",
+            "variant": "collinear",
+            "tp": 8,
+            "hq": 2,
+            "hv": 6,
+            "seed": 101
+          },
+          "lengths": [
+            128
+          ],
+          "auto_cp": true,
+          "actual_use_cp": false,
+          "finite": true,
+          "output_relative_rms_max": 0.01065922062844038,
+          "state_relative_rms_max_nonempty": 0.015179207548499107,
+          "empty_state_bitwise_unchanged": true
+        },
+        {
+          "name": "flash-next-collinear-1_65_127_0",
+          "fixture_sha256": "e1598b94b988af0f243a9e552330d0ce6af3579b2f9a70f0260e7dddd6a25806",
+          "reference_kind": "FP64 token recurrence",
+          "metadata": {
+            "model": "flash-next",
+            "variant": "collinear",
+            "tp": 8,
+            "hq": 2,
+            "hv": 6,
+            "seed": 101
+          },
+          "lengths": [
+            1,
+            65,
+            127,
+            0
+          ],
+          "auto_cp": false,
+          "actual_use_cp": false,
+          "finite": true,
+          "output_relative_rms_max": 0.011432632803916931,
+          "state_relative_rms_max_nonempty": 0.015563051216304302,
+          "empty_state_bitwise_unchanged": false
+        },
+        {
+          "name": "flash-next-collinear-1_65_127_0",
+          "fixture_sha256": "e1598b94b988af0f243a9e552330d0ce6af3579b2f9a70f0260e7dddd6a25806",
+          "reference_kind": "FP64 token recurrence",
+          "metadata": {
+            "model": "flash-next",
+            "variant": "collinear",
+            "tp": 8,
+            "hq": 2,
+            "hv": 6,
+            "seed": 101
+          },
+          "lengths": [
+            1,
+            65,
+            127,
+            0
+          ],
+          "auto_cp": true,
+          "actual_use_cp": false,
+          "finite": true,
+          "output_relative_rms_max": 0.011432632803916931,
+          "state_relative_rms_max_nonempty": 0.015563051216304302,
+          "empty_state_bitwise_unchanged": true
+        },
+        {
+          "name": "flash-next-collinear-8192",
+          "fixture_sha256": "f8cd56aca68c23ce4755ed0660af97eb3c672ab3a046a67cccbae4c666e1603c",
+          "reference_kind": "FP32 chunk triangular solve",
+          "metadata": {
+            "model": "flash-next",
+            "variant": "collinear",
+            "tp": 8,
+            "hq": 2,
+            "hv": 6,
+            "seed": 101
+          },
+          "lengths": [
+            8192
+          ],
+          "auto_cp": false,
+          "actual_use_cp": false,
+          "finite": true,
+          "output_relative_rms_max": 0.01090469490736723,
+          "state_relative_rms_max_nonempty": 0.01430866401642561,
+          "empty_state_bitwise_unchanged": true
+        },
+        {
+          "name": "flash-next-collinear-8192",
+          "fixture_sha256": "f8cd56aca68c23ce4755ed0660af97eb3c672ab3a046a67cccbae4c666e1603c",
+          "reference_kind": "FP32 chunk triangular solve",
+          "metadata": {
+            "model": "flash-next",
+            "variant": "collinear",
+            "tp": 8,
+            "hq": 2,
+            "hv": 6,
+            "seed": 101
+          },
+          "lengths": [
+            8192
+          ],
+          "auto_cp": true,
+          "actual_use_cp": false,
+          "finite": true,
+          "output_relative_rms_max": 0.01090469490736723,
+          "state_relative_rms_max_nonempty": 0.01430866401642561,
+          "empty_state_bitwise_unchanged": true
+        },
+        {
+          "name": "flash-next-normal-128",
+          "fixture_sha256": "93bde709d3a1adc46913f07121a0958d21308a39e7416ef168421b31bdfa82b1",
+          "reference_kind": "FP64 token recurrence",
+          "metadata": {
+            "model": "flash-next",
+            "variant": "normal",
+            "tp": 8,
+            "hq": 2,
+            "hv": 6,
+            "seed": 101
+          },
+          "lengths": [
+            128
+          ],
+          "auto_cp": false,
+          "actual_use_cp": false,
+          "finite": true,
+          "output_relative_rms_max": 0.003943637944757938,
+          "state_relative_rms_max_nonempty": 0.0037055511493235826,
+          "empty_state_bitwise_unchanged": true
+        },
+        {
+          "name": "flash-next-normal-128",
+          "fixture_sha256": "93bde709d3a1adc46913f07121a0958d21308a39e7416ef168421b31bdfa82b1",
+          "reference_kind": "FP64 token recurrence",
+          "metadata": {
+            "model": "flash-next",
+            "variant": "normal",
+            "tp": 8,
+            "hq": 2,
+            "hv": 6,
+            "seed": 101
+          },
+          "lengths": [
+            128
+          ],
+          "auto_cp": true,
+          "actual_use_cp": false,
+          "finite": true,
+          "output_relative_rms_max": 0.003943637944757938,
+          "state_relative_rms_max_nonempty": 0.0037055511493235826,
+          "empty_state_bitwise_unchanged": true
+        },
+        {
+          "name": "max-collinear-128",
+          "fixture_sha256": "17162dd50c997fb0f78b86eef62f400e782c3ad72bfbfca01a3c4e00bfc79b96",
+          "reference_kind": "FP64 token recurrence",
+          "metadata": {
+            "model": "max",
+            "variant": "collinear",
+            "tp": 8,
+            "hq": 2,
+            "hv": 16,
+            "seed": 101
+          },
+          "lengths": [
+            128
+          ],
+          "auto_cp": false,
+          "actual_use_cp": false,
+          "finite": true,
+          "output_relative_rms_max": 0.010825366713106632,
+          "state_relative_rms_max_nonempty": 0.014729133807122707,
+          "empty_state_bitwise_unchanged": true
+        },
+        {
+          "name": "max-collinear-128",
+          "fixture_sha256": "17162dd50c997fb0f78b86eef62f400e782c3ad72bfbfca01a3c4e00bfc79b96",
+          "reference_kind": "FP64 token recurrence",
+          "metadata": {
+            "model": "max",
+            "variant": "collinear",
+            "tp": 8,
+            "hq": 2,
+            "hv": 16,
+            "seed": 101
+          },
+          "lengths": [
+            128
+          ],
+          "auto_cp": true,
+          "actual_use_cp": false,
+          "finite": true,
+          "output_relative_rms_max": 0.010825366713106632,
+          "state_relative_rms_max_nonempty": 0.014729133807122707,
+          "empty_state_bitwise_unchanged": true
+        },
+        {
+          "name": "max-collinear-1_65_127_0",
+          "fixture_sha256": "113163ccf008954cd309b4098a687cd193d6d3e1b8013ce2de0e43ddd25edb25",
+          "reference_kind": "FP64 token recurrence",
+          "metadata": {
+            "model": "max",
+            "variant": "collinear",
+            "tp": 8,
+            "hq": 2,
+            "hv": 16,
+            "seed": 101
+          },
+          "lengths": [
+            1,
+            65,
+            127,
+            0
+          ],
+          "auto_cp": false,
+          "actual_use_cp": false,
+          "finite": true,
+          "output_relative_rms_max": 0.011325662955641747,
+          "state_relative_rms_max_nonempty": 0.014747188426554203,
+          "empty_state_bitwise_unchanged": false
+        },
+        {
+          "name": "max-collinear-1_65_127_0",
+          "fixture_sha256": "113163ccf008954cd309b4098a687cd193d6d3e1b8013ce2de0e43ddd25edb25",
+          "reference_kind": "FP64 token recurrence",
+          "metadata": {
+            "model": "max",
+            "variant": "collinear",
+            "tp": 8,
+            "hq": 2,
+            "hv": 16,
+            "seed": 101
+          },
+          "lengths": [
+            1,
+            65,
+            127,
+            0
+          ],
+          "auto_cp": true,
+          "actual_use_cp": false,
+          "finite": true,
+          "output_relative_rms_max": 0.011325662955641747,
+          "state_relative_rms_max_nonempty": 0.014747188426554203,
+          "empty_state_bitwise_unchanged": true
+        },
+        {
+          "name": "max-collinear-8192",
+          "fixture_sha256": "15b349ec29d14f40b535639fe3d297e923f12ba783533825d99f7a741e7eb072",
+          "reference_kind": "FP32 chunk triangular solve",
+          "metadata": {
+            "model": "max",
+            "variant": "collinear",
+            "tp": 8,
+            "hq": 2,
+            "hv": 16,
+            "seed": 101
+          },
+          "lengths": [
+            8192
+          ],
+          "auto_cp": false,
+          "actual_use_cp": false,
+          "finite": true,
+          "output_relative_rms_max": 0.010861801914870739,
+          "state_relative_rms_max_nonempty": 0.01722615584731102,
+          "empty_state_bitwise_unchanged": true
+        },
+        {
+          "name": "max-collinear-8192",
+          "fixture_sha256": "15b349ec29d14f40b535639fe3d297e923f12ba783533825d99f7a741e7eb072",
+          "reference_kind": "FP32 chunk triangular solve",
+          "metadata": {
+            "model": "max",
+            "variant": "collinear",
+            "tp": 8,
+            "hq": 2,
+            "hv": 16,
+            "seed": 101
+          },
+          "lengths": [
+            8192
+          ],
+          "auto_cp": true,
+          "actual_use_cp": false,
+          "finite": true,
+          "output_relative_rms_max": 0.010861801914870739,
+          "state_relative_rms_max_nonempty": 0.01722615584731102,
+          "empty_state_bitwise_unchanged": true
+        },
+        {
+          "name": "max-normal-128",
+          "fixture_sha256": "4956db70b962051b11abd0a4142b3099cf768c469f0d601380a5131c51392f3c",
+          "reference_kind": "FP64 token recurrence",
+          "metadata": {
+            "model": "max",
+            "variant": "normal",
+            "tp": 8,
+            "hq": 2,
+            "hv": 16,
+            "seed": 101
+          },
+          "lengths": [
+            128
+          ],
+          "auto_cp": false,
+          "actual_use_cp": false,
+          "finite": true,
+          "output_relative_rms_max": 0.0039045580197125673,
+          "state_relative_rms_max_nonempty": 0.0035733021795749664,
+          "empty_state_bitwise_unchanged": true
+        },
+        {
+          "name": "max-normal-128",
+          "fixture_sha256": "4956db70b962051b11abd0a4142b3099cf768c469f0d601380a5131c51392f3c",
+          "reference_kind": "FP64 token recurrence",
+          "metadata": {
+            "model": "max",
+            "variant": "normal",
+            "tp": 8,
+            "hq": 2,
+            "hv": 16,
+            "seed": 101
+          },
+          "lengths": [
+            128
+          ],
+          "auto_cp": true,
+          "actual_use_cp": false,
+          "finite": true,
+          "output_relative_rms_max": 0.0039045580197125673,
+          "state_relative_rms_max_nonempty": 0.0035733021795749664,
+          "empty_state_bitwise_unchanged": true
+        }
+      ]
+    },
+    "890p": {
+      "summary": {
+        "False": {
+          "stress_inputs": 6,
+          "stress_failures": 6,
+          "normal_inputs": 2,
+          "normal_passes": 2,
+          "output_rms_range": [
+            0.010406494140625,
+            0.0117004020139575
+          ],
+          "nonempty_state_rms_range": [
+            0.014299686998128891,
+            0.01655951701104641
+          ]
+        },
+        "True": {
+          "stress_inputs": 6,
+          "stress_failures": 6,
+          "normal_inputs": 2,
+          "normal_passes": 2,
+          "output_rms_range": [
+            0.010406494140625,
+            0.0117004020139575
+          ],
+          "nonempty_state_rms_range": [
+            0.013583594001829624,
+            0.016352327540516853
+          ]
+        }
+      },
+      "cases": [
+        {
+          "name": "flash-next-collinear-128",
+          "fixture_sha256": "43b60ae7fae564ef2374bf76374fd1fea59ac99ff1f5ef56bd349df268465d7b",
+          "reference_kind": "FP64 token recurrence",
+          "metadata": {
+            "model": "flash-next",
+            "variant": "collinear",
+            "tp": 8,
+            "hq": 2,
+            "hv": 6,
+            "seed": 101
+          },
+          "lengths": [
+            128
+          ],
+          "auto_cp": false,
+          "actual_use_cp": false,
+          "finite": true,
+          "output_relative_rms_max": 0.010406494140625,
+          "state_relative_rms_max_nonempty": 0.0146781075745821,
+          "empty_state_bitwise_unchanged": true
+        },
+        {
+          "name": "flash-next-collinear-128",
+          "fixture_sha256": "43b60ae7fae564ef2374bf76374fd1fea59ac99ff1f5ef56bd349df268465d7b",
+          "reference_kind": "FP64 token recurrence",
+          "metadata": {
+            "model": "flash-next",
+            "variant": "collinear",
+            "tp": 8,
+            "hq": 2,
+            "hv": 6,
+            "seed": 101
+          },
+          "lengths": [
+            128
+          ],
+          "auto_cp": true,
+          "actual_use_cp": false,
+          "finite": true,
+          "output_relative_rms_max": 0.010406494140625,
+          "state_relative_rms_max_nonempty": 0.0146781075745821,
+          "empty_state_bitwise_unchanged": true
+        },
+        {
+          "name": "flash-next-collinear-1_65_127_0",
+          "fixture_sha256": "e1598b94b988af0f243a9e552330d0ce6af3579b2f9a70f0260e7dddd6a25806",
+          "reference_kind": "FP64 token recurrence",
+          "metadata": {
+            "model": "flash-next",
+            "variant": "collinear",
+            "tp": 8,
+            "hq": 2,
+            "hv": 6,
+            "seed": 101
+          },
+          "lengths": [
+            1,
+            65,
+            127,
+            0
+          ],
+          "auto_cp": false,
+          "actual_use_cp": false,
+          "finite": true,
+          "output_relative_rms_max": 0.010836233384907246,
+          "state_relative_rms_max_nonempty": 0.01589730940759182,
+          "empty_state_bitwise_unchanged": false
+        },
+        {
+          "name": "flash-next-collinear-1_65_127_0",
+          "fixture_sha256": "e1598b94b988af0f243a9e552330d0ce6af3579b2f9a70f0260e7dddd6a25806",
+          "reference_kind": "FP64 token recurrence",
+          "metadata": {
+            "model": "flash-next",
+            "variant": "collinear",
+            "tp": 8,
+            "hq": 2,
+            "hv": 6,
+            "seed": 101
+          },
+          "lengths": [
+            1,
+            65,
+            127,
+            0
+          ],
+          "auto_cp": true,
+          "actual_use_cp": false,
+          "finite": true,
+          "output_relative_rms_max": 0.010836233384907246,
+          "state_relative_rms_max_nonempty": 0.01589730940759182,
+          "empty_state_bitwise_unchanged": true
+        },
+        {
+          "name": "flash-next-collinear-8192",
+          "fixture_sha256": "f8cd56aca68c23ce4755ed0660af97eb3c672ab3a046a67cccbae4c666e1603c",
+          "reference_kind": "FP32 chunk triangular solve",
+          "metadata": {
+            "model": "flash-next",
+            "variant": "collinear",
+            "tp": 8,
+            "hq": 2,
+            "hv": 6,
+            "seed": 101
+          },
+          "lengths": [
+            8192
+          ],
+          "auto_cp": false,
+          "actual_use_cp": false,
+          "finite": true,
+          "output_relative_rms_max": 0.010898707434535027,
+          "state_relative_rms_max_nonempty": 0.014299686998128891,
+          "empty_state_bitwise_unchanged": true
+        },
+        {
+          "name": "flash-next-collinear-8192",
+          "fixture_sha256": "f8cd56aca68c23ce4755ed0660af97eb3c672ab3a046a67cccbae4c666e1603c",
+          "reference_kind": "FP32 chunk triangular solve",
+          "metadata": {
+            "model": "flash-next",
+            "variant": "collinear",
+            "tp": 8,
+            "hq": 2,
+            "hv": 6,
+            "seed": 101
+          },
+          "lengths": [
+            8192
+          ],
+          "auto_cp": true,
+          "actual_use_cp": true,
+          "finite": true,
+          "output_relative_rms_max": 0.010921231471002102,
+          "state_relative_rms_max_nonempty": 0.013583594001829624,
+          "empty_state_bitwise_unchanged": true
+        },
+        {
+          "name": "flash-next-normal-128",
+          "fixture_sha256": "93bde709d3a1adc46913f07121a0958d21308a39e7416ef168421b31bdfa82b1",
+          "reference_kind": "FP64 token recurrence",
+          "metadata": {
+            "model": "flash-next",
+            "variant": "normal",
+            "tp": 8,
+            "hq": 2,
+            "hv": 6,
+            "seed": 101
+          },
+          "lengths": [
+            128
+          ],
+          "auto_cp": false,
+          "actual_use_cp": false,
+          "finite": true,
+          "output_relative_rms_max": 0.003917569760233164,
+          "state_relative_rms_max_nonempty": 0.003657706780359149,
+          "empty_state_bitwise_unchanged": true
+        },
+        {
+          "name": "flash-next-normal-128",
+          "fixture_sha256": "93bde709d3a1adc46913f07121a0958d21308a39e7416ef168421b31bdfa82b1",
+          "reference_kind": "FP64 token recurrence",
+          "metadata": {
+            "model": "flash-next",
+            "variant": "normal",
+            "tp": 8,
+            "hq": 2,
+            "hv": 6,
+            "seed": 101
+          },
+          "lengths": [
+            128
+          ],
+          "auto_cp": true,
+          "actual_use_cp": false,
+          "finite": true,
+          "output_relative_rms_max": 0.003917569760233164,
+          "state_relative_rms_max_nonempty": 0.003657706780359149,
+          "empty_state_bitwise_unchanged": true
+        },
+        {
+          "name": "max-collinear-128",
+          "fixture_sha256": "17162dd50c997fb0f78b86eef62f400e782c3ad72bfbfca01a3c4e00bfc79b96",
+          "reference_kind": "FP64 token recurrence",
+          "metadata": {
+            "model": "max",
+            "variant": "collinear",
+            "tp": 8,
+            "hq": 2,
+            "hv": 16,
+            "seed": 101
+          },
+          "lengths": [
+            128
+          ],
+          "auto_cp": false,
+          "actual_use_cp": false,
+          "finite": true,
+          "output_relative_rms_max": 0.011219066567718983,
+          "state_relative_rms_max_nonempty": 0.015840204432606697,
+          "empty_state_bitwise_unchanged": true
+        },
+        {
+          "name": "max-collinear-128",
+          "fixture_sha256": "17162dd50c997fb0f78b86eef62f400e782c3ad72bfbfca01a3c4e00bfc79b96",
+          "reference_kind": "FP64 token recurrence",
+          "metadata": {
+            "model": "max",
+            "variant": "collinear",
+            "tp": 8,
+            "hq": 2,
+            "hv": 16,
+            "seed": 101
+          },
+          "lengths": [
+            128
+          ],
+          "auto_cp": true,
+          "actual_use_cp": false,
+          "finite": true,
+          "output_relative_rms_max": 0.011219066567718983,
+          "state_relative_rms_max_nonempty": 0.015840204432606697,
+          "empty_state_bitwise_unchanged": true
+        },
+        {
+          "name": "max-collinear-1_65_127_0",
+          "fixture_sha256": "113163ccf008954cd309b4098a687cd193d6d3e1b8013ce2de0e43ddd25edb25",
+          "reference_kind": "FP64 token recurrence",
+          "metadata": {
+            "model": "max",
+            "variant": "collinear",
+            "tp": 8,
+            "hq": 2,
+            "hv": 16,
+            "seed": 101
+          },
+          "lengths": [
+            1,
+            65,
+            127,
+            0
+          ],
+          "auto_cp": false,
+          "actual_use_cp": false,
+          "finite": true,
+          "output_relative_rms_max": 0.0117004020139575,
+          "state_relative_rms_max_nonempty": 0.014406878501176834,
+          "empty_state_bitwise_unchanged": false
+        },
+        {
+          "name": "max-collinear-1_65_127_0",
+          "fixture_sha256": "113163ccf008954cd309b4098a687cd193d6d3e1b8013ce2de0e43ddd25edb25",
+          "reference_kind": "FP64 token recurrence",
+          "metadata": {
+            "model": "max",
+            "variant": "collinear",
+            "tp": 8,
+            "hq": 2,
+            "hv": 16,
+            "seed": 101
+          },
+          "lengths": [
+            1,
+            65,
+            127,
+            0
+          ],
+          "auto_cp": true,
+          "actual_use_cp": false,
+          "finite": true,
+          "output_relative_rms_max": 0.0117004020139575,
+          "state_relative_rms_max_nonempty": 0.014406878501176834,
+          "empty_state_bitwise_unchanged": true
+        },
+        {
+          "name": "max-collinear-8192",
+          "fixture_sha256": "15b349ec29d14f40b535639fe3d297e923f12ba783533825d99f7a741e7eb072",
+          "reference_kind": "FP32 chunk triangular solve",
+          "metadata": {
+            "model": "max",
+            "variant": "collinear",
+            "tp": 8,
+            "hq": 2,
+            "hv": 16,
+            "seed": 101
+          },
+          "lengths": [
+            8192
+          ],
+          "auto_cp": false,
+          "actual_use_cp": false,
+          "finite": true,
+          "output_relative_rms_max": 0.010758216492831707,
+          "state_relative_rms_max_nonempty": 0.01655951701104641,
+          "empty_state_bitwise_unchanged": true
+        },
+        {
+          "name": "max-collinear-8192",
+          "fixture_sha256": "15b349ec29d14f40b535639fe3d297e923f12ba783533825d99f7a741e7eb072",
+          "reference_kind": "FP32 chunk triangular solve",
+          "metadata": {
+            "model": "max",
+            "variant": "collinear",
+            "tp": 8,
+            "hq": 2,
+            "hv": 16,
+            "seed": 101
+          },
+          "lengths": [
+            8192
+          ],
+          "auto_cp": true,
+          "actual_use_cp": true,
+          "finite": true,
+          "output_relative_rms_max": 0.010759547352790833,
+          "state_relative_rms_max_nonempty": 0.016352327540516853,
+          "empty_state_bitwise_unchanged": true
+        },
+        {
+          "name": "max-normal-128",
+          "fixture_sha256": "4956db70b962051b11abd0a4142b3099cf768c469f0d601380a5131c51392f3c",
+          "reference_kind": "FP64 token recurrence",
+          "metadata": {
+            "model": "max",
+            "variant": "normal",
+            "tp": 8,
+            "hq": 2,
+            "hv": 16,
+            "seed": 101
+          },
+          "lengths": [
+            128
+          ],
+          "auto_cp": false,
+          "actual_use_cp": false,
+          "finite": true,
+          "output_relative_rms_max": 0.003934741020202637,
+          "state_relative_rms_max_nonempty": 0.003597890492528677,
+          "empty_state_bitwise_unchanged": true
+        },
+        {
+          "name": "max-normal-128",
+          "fixture_sha256": "4956db70b962051b11abd0a4142b3099cf768c469f0d601380a5131c51392f3c",
+          "reference_kind": "FP64 token recurrence",
+          "metadata": {
+            "model": "max",
+            "variant": "normal",
+            "tp": 8,
+            "hq": 2,
+            "hv": 16,
+            "seed": 101
+          },
+          "lengths": [
+            128
+          ],
+          "auto_cp": true,
+          "actual_use_cp": false,
+          "finite": true,
+          "output_relative_rms_max": 0.003934741020202637,
+          "state_relative_rms_max_nonempty": 0.003597890492528677,
+          "empty_state_bitwise_unchanged": true
+        }
+      ]
+    }
+  }
+}

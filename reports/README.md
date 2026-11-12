@@ -1,5 +1,8 @@
 # PLA CUDA vs Triton Performance Comparison Report
 
+The [GDN near-collinear accuracy investigation](gdn_collinear_accuracy.md) documents
+810E/890P accuracy failures, model-impact limits, and a standalone reproduction CLI.
+
 ## Overview
 
 This directory contains performance comparison data for the PLA (PPU Linear Attention) kernels between the CUDA and Triton implementations.
