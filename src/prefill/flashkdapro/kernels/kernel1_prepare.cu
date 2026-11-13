@@ -167,6 +167,16 @@ __forceinline__ __device__ void k1_aiu_load_2d_b16(
 #endif
 }
 
+// Partial-tile q/k/g loads: tc01 steps per-thread row pointers (three int64
+// row offsets per element cost ~0.7 us of tail latency there); tc02 keeps the
+// indexed loop, since the live pointers raise K1 register pressure and slow
+// every full tile.
+#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ >= 150
+constexpr bool kK1StepTailRows = false;
+#else
+constexpr bool kK1StepTailRows = true;
+#endif
+
 // Build the exact number of 16-token tiles before each sequence. This mirrors
 // upstream FlashKDA commit 1ce47ea3: the one-time O(N) pass replaces the old
 // O(N) scan in every varlen K1 CTA. One lane is intentional; N is normally
@@ -222,14 +232,14 @@ template <int NThreads, bool IsVarlen, bool UseTilePrefix,
           bool PrecomputeAffine = false, int ChunksPerCTA = 1,
           bool FmaFront = false, bool Tc01KrContiguous = false>
 __global__ void __launch_bounds__(NThreads) flashkda_prepare_kernel(
-    const BF16* __restrict__ q,       // [H, T_total, D] (stride D, D*H, 1)
-    const BF16* __restrict__ k,
-    const BF16* __restrict__ g_in,
+    const BF16* __restrict__ q,       // [T_total, H, D] (token stride q_stride, D, 1)
+    const BF16* __restrict__ k,       // [T_total, H, D] (token stride k_stride, D, 1)
+    const BF16* __restrict__ g_in,    // [T_total, H, D] dense
     const BF16* __restrict__ beta,    // [T_total,H]
     const float* __restrict__ A_log,  // [H]
     const float* __restrict__ dt_bias,// [H, D]
     float scale, float gate_scale,
-    int T_total, int H, int beta_stride,
+    int T_total, int H, int beta_stride, int64_t q_stride, int64_t k_stride,
     int N, int total_tiles, int tile_count,
     const int32_t* __restrict__ cu_seqlens,
     const int* __restrict__ tile_prefix,
@@ -340,16 +350,16 @@ __global__ void __launch_bounds__(NThreads) flashkda_prepare_kernel(
     half_t* sTmp = sL;
     BF16* sMqk = smem.main.phase_b.Mqk.data;
 
-    const int64_t rstride = int64_t(D) * H;   // per-token row stride in q/k/g
+    const int64_t rstride = int64_t(D) * H;   // per-token row stride in g
 
     // --- 1. load q,k,g tiles (rows>=actual zeroed), beta, dt_bias ---
     if (actual_len == CHUNK) {
         if (tid == 0) {
-            const BF16* q_src = q + int64_t(head) * D + tok0 * rstride;
-            const BF16* k_src = k + int64_t(head) * D + tok0 * rstride;
+            const BF16* q_src = q + int64_t(head) * D + tok0 * q_stride;
+            const BF16* k_src = k + int64_t(head) * D + tok0 * k_stride;
             const BF16* g_src = g_in + int64_t(head) * D + tok0 * rstride;
-            k1_aiu_load_2d_b16(sq, q_src, D, CHUNK, rstride * sizeof(BF16));
-            k1_aiu_load_2d_b16(sk, k_src, D, CHUNK, rstride * sizeof(BF16));
+            k1_aiu_load_2d_b16(sq, q_src, D, CHUNK, q_stride * sizeof(BF16));
+            k1_aiu_load_2d_b16(sk, k_src, D, CHUNK, k_stride * sizeof(BF16));
             k1_aiu_load_2d_b16(g_bf16, g_src, D, CHUNK, rstride * sizeof(BF16));
             const BF16* beta_src = beta + tok0 * beta_stride + head;
             k1_aiu_load_2d_b16(
@@ -361,14 +371,35 @@ __global__ void __launch_bounds__(NThreads) flashkda_prepare_kernel(
         __syncthreads();
         for (int idx = tid; idx < CHUNK * D; idx += NThreads)
             sg[idx] = fk::bf16_to_f32(g_bf16[idx]);
+    } else if constexpr (kK1StepTailRows && NThreads % D == 0) {
+        // Each thread keeps one column: step the three row pointers instead of
+        // re-deriving three int64 row offsets per element (tc01 tail latency).
+        constexpr int kRowStep = NThreads / D;
+        const int c = tid % D;
+        int r = tid / D;
+        const int64_t col = int64_t(head) * D + c;
+        const BF16* q_row = q + col + (tok0 + r) * q_stride;
+        const BF16* k_row = k + col + (tok0 + r) * k_stride;
+        const BF16* g_row = g_in + col + (tok0 + r) * rstride;
+        for (int idx = tid; idx < CHUNK * D; idx += NThreads, r += kRowStep,
+             q_row += kRowStep * q_stride, k_row += kRowStep * k_stride,
+             g_row += kRowStep * rstride) {
+            if (r < actual_len) {
+                sq[idx] = *q_row;
+                sk[idx] = *k_row;
+                sg[idx] = fk::bf16_to_f32(*g_row);   // raw log-gate (pre-activation)
+            } else {
+                sq[idx] = BF16(0); sk[idx] = BF16(0); sg[idx] = 0.0f;
+            }
+        }
     } else {
         for (int idx = tid; idx < CHUNK * D; idx += NThreads) {
             int r = idx / D, c = idx % D;
             if (r < actual_len) {
-                int64_t off = int64_t(head) * D + (tok0 + r) * rstride + c;
-                sq[idx] = q[off];
-                sk[idx] = k[off];
-                sg[idx] = fk::bf16_to_f32(g_in[off]);   // raw log-gate (pre-activation)
+                int64_t off = int64_t(head) * D + c;
+                sq[idx] = q[off + (tok0 + r) * q_stride];
+                sk[idx] = k[off + (tok0 + r) * k_stride];
+                sg[idx] = fk::bf16_to_f32(g_in[off + (tok0 + r) * rstride]);   // raw log-gate (pre-activation)
             } else {
                 sq[idx] = BF16(0); sk[idx] = BF16(0); sg[idx] = 0.0f;
             }
@@ -879,7 +910,7 @@ void launch_flashkda_zero_padded_output_tail(
 void launch_flashkda_prepare(
     const void* q, const void* k, const void* g_in, const void* beta,
     const float* A_log, const float* dt_bias, float scale, float gate_scale,
-    int T_total, int H, int beta_stride,
+    int T_total, int H, int beta_stride, int64_t q_stride, int64_t k_stride,
     int N, int total_tiles, const int32_t* cu_seqlens,
     bool is_varlen,
     int tile_offset, int tile_count, int head_offset, int head_count,
@@ -1063,6 +1094,7 @@ void launch_flashkda_prepare(
                 reinterpret_cast<const BF16*>(q), reinterpret_cast<const BF16*>(k),
                 reinterpret_cast<const BF16*>(g_in), reinterpret_cast<const BF16*>(beta),
                 A_log, dt_bias, scale, gate_scale, T_total, H, beta_stride,
+                q_stride, k_stride,
                 N, total_tiles, tile_count, cu_seqlens,
                 tile_prefix, tile_offset, head_offset, ready, fp16_kd_qd,
                 reinterpret_cast<BF16*>(ws));
@@ -1103,6 +1135,7 @@ void launch_flashkda_prepare(
             reinterpret_cast<const BF16*>(q), reinterpret_cast<const BF16*>(k),
             reinterpret_cast<const BF16*>(g_in), reinterpret_cast<const BF16*>(beta),
             A_log, dt_bias, scale, gate_scale, T_total, H, beta_stride,
+            q_stride, k_stride,
             N, total_tiles, tile_count, cu_seqlens,
             tile_prefix, tile_offset, head_offset, ready, fp16_kd_qd,
             reinterpret_cast<BF16*>(ws));

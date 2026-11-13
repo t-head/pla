@@ -41,7 +41,7 @@ extern "C" {
 hggcError_t launch_fla_inter_solve_bf16_d128_bt64_bc16_h8(const void*, const void*, const float*,
     const uint16_t*, int64_t, const float*, void*, void*, float, const int32_t*, const int32_t*, int, int, int, int, hggcStream_t);
 hggcError_t configure_fla_recompute_h8_bf16_d128_bt64();
-hggcError_t launch_fla_recompute_h8_bf16_d128_bt64(const void*, const void*, const uint16_t*, int64_t,
+hggcError_t launch_fla_recompute_h8_bf16_d128_bt64(const void*, const void*, int64_t, const uint16_t*, int64_t,
     const void*, const float*, void*, void*, void*, const int32_t*, const int32_t*, int, int, int, int, hggcStream_t);
 hggcError_t configure_fla_glm53_recurrence_h8_bf16_d128_bt64();
 hggcError_t launch_fla_glm53_recurrence_h8_bf16_d128_bt64(const void*, const void*, const void*,
@@ -59,7 +59,7 @@ hggcError_t launch_fla_cp_pretriangular_output(
 #endif
 #if FLA_HEADS == 4 || FLA_HEADS == 8
 hggcError_t FLA_JOIN_HEAD(launch_fla_token_l2, FLA_HEADS)(
-    const void*, const void*, void*, void*, const float*, const uint16_t*, int64_t,
+    const void*, const void*, int64_t, int64_t, void*, void*, const float*, const uint16_t*, int64_t,
     void*, float*, void*, void*, void*, void*, float, const int32_t*, int, int, hggcStream_t);
 hggcError_t FLA_JOIN_HEAD(launch_fla_inter_solve_prepared, FLA_HEADS)(
     const void*, const void*, const float*, const uint16_t*, int64_t,

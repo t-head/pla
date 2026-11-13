@@ -33,7 +33,9 @@
 Every input and state of ``flashkda_fwd`` may be an arbitrary strided view. The
 result must be bit-identical to the dense call on the same values, for both tc01
 backends (monolithic FLA and legacy) and the tc02 legacy backend, in eager mode
-and under Graph capture.
+and under Graph capture. q/k/v split out of one fused projection (token stride
+over packed head rows, as SGLang passes them) must also be read in place,
+without a staging copy, on every kernel schedule.
 
 Run: python -m pytest tests/test_kda_prefill_strided_inputs.py -q
 """
@@ -256,3 +258,144 @@ def test_final_state_sharing_out_storage_is_rejected(backend):
     final = buffer[-(heads * D * (D + 8)):].view(1, heads, D, D + 8)[..., :D]
     with pytest.raises(RuntimeError, match="final_state must not share storage with out"):
         _call(inputs, out, final_state=final, cu_seqlens=cu, raw_cu_seqlens=offsets)
+
+
+def _fused_qkv(inputs):
+    """q/k/v as views of one [T, 3H, 128] projection and beta as a column slice.
+
+    This is the SGLang Kimi-Linear layout: each of q/k/v has strides
+    (3 * H * 128, 128, 1) and must be consumed without a staging copy.
+    """
+    heads = inputs["q"].shape[1]
+    qkv = torch.cat([inputs["q"], inputs["k"], inputs["v"]], dim=1)
+    q, k, v = qkv.split(heads, dim=1)
+    beta = torch.cat([inputs["beta"], torch.zeros_like(inputs["beta"])], dim=1)[:, :heads]
+    fused = dict(inputs, q=q, k=k, v=v, beta=beta)
+    for name in ("q", "k", "v"):
+        assert not fused[name].is_contiguous() and fused[name].stride() == (3 * heads * D, D, 1)
+        assert torch.equal(fused[name], inputs[name])
+    return fused
+
+
+def _peak_extra_bytes(fn):
+    torch.cuda.synchronize()
+    base = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    fn()
+    torch.cuda.synchronize()
+    return torch.cuda.max_memory_allocated() - base
+
+
+# Kernel schedules of the legacy backend that read raw q/k/v: K1 prepare plus the
+# CH16 recurrence (shared/nows/full-DV), the CH16 CP pre_scan/segment pair, and
+# on tc01 the BT64 prefill and BT64xCP front.
+LEGACY_SCHEDULES = {
+    "auto": {},
+    "serial_nows": {"PLA_FLASHKDA_CP": "0", "PLA_FLASHKDA_TC01_BT64": "0"},
+    "serial_shared": {"PLA_FLASHKDA_CP": "0", "PLA_FLASHKDA_TC01_BT64": "0",
+                      "PLA_FLASHKDA_K2_NOWS": "0"},
+    "serial_full_dv": {"PLA_FLASHKDA_CP": "0", "PLA_FLASHKDA_TC01_BT64": "0",
+                       "PLA_FLASHKDA_K2_NOWS": "1", "PLA_FLASHKDA_K2_DVSPLIT": "0"},
+    "cp_forced": {"PLA_FLASHKDA_CP": "2", "PLA_FLASHKDA_CP_SEG_TILES": "4"},
+    "bt64_cp": {"PLA_FLASHKDA_TC01_BT64_CP": "1"},
+}
+
+FUSED_CASES = [
+    # (lengths, heads, raw offsets): ragged varlen tails, the N1 prepared-token
+    # FLA shape, the tc01 BT64 H8/N1 window, and device-only offsets.
+    ((37, 64, 0, 20), 4, True),
+    ((4096,), 8, True),
+    ((300,), 8, True),
+    ((128, 517), 6, False),
+]
+
+
+@pytest.mark.parametrize("schedule", list(LEGACY_SCHEDULES))
+@pytest.mark.parametrize("lengths,heads,raw", FUSED_CASES)
+def test_fused_qkv_views_are_read_in_place(backend, monkeypatch, schedule, lengths, heads, raw):
+    if backend == "fla" and schedule != "auto":
+        pytest.skip("schedule overrides only steer the legacy backend")
+    for name, value in LEGACY_SCHEDULES[schedule].items():
+        monkeypatch.setenv(name, value)
+    inputs, cu, offsets = _inputs(lengths, heads, seed=15)
+    n = len(lengths)
+    initial = (torch.randn(n, heads, D, D, device="cuda") * 0.05).to(torch.bfloat16)
+    meta = dict(cu_seqlens=cu, raw_cu_seqlens=offsets if raw else None, initial_state=initial)
+    fused = _fused_qkv(inputs)
+
+    out_ref = torch.empty_like(inputs["q"])
+    final_ref = torch.empty_like(initial)
+    _call(inputs, out_ref, final_state=final_ref, **meta)
+    out = torch.empty_like(out_ref)
+    final = torch.empty_like(final_ref)
+    before = _snapshot(fused)
+    _call(fused, out, final_state=final, **meta)
+    torch.cuda.synchronize()
+    assert torch.equal(out, out_ref)
+    assert torch.equal(final, final_ref)
+    _assert_unchanged(before, fused)
+
+    # Zero copy: the fused call must not allocate more than the dense call.
+    dense_extra = _peak_extra_bytes(
+        lambda: _call(inputs, out, final_state=final, **meta))
+    fused_extra = _peak_extra_bytes(
+        lambda: _call(fused, out, final_state=final, **meta))
+    assert fused_extra <= dense_extra, (fused_extra, dense_extra)
+
+
+def test_fused_qkv_views_under_graph_capture(backend):
+    lengths, heads = (37, 64, 0, 20), 4
+    inputs, cu, offsets = _inputs(lengths, heads, seed=16)
+    slots = 5
+    pool0 = (torch.randn(slots, heads, D, D, device="cuda") * 0.05).to(torch.bfloat16)
+    indices = torch.tensor([4, 1, 0, 2], dtype=torch.int32, device="cuda")
+    meta = dict(cu_seqlens=cu, raw_cu_seqlens=offsets, state_indices=indices)
+
+    pool_ref = pool0.clone()
+    out_ref = torch.empty_like(inputs["q"])
+    _call(inputs, out_ref, state_pool=pool_ref, **meta)
+
+    fused = _fused_qkv(inputs)
+    pool = pool0.clone()
+    out = torch.empty_like(out_ref)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        _call(fused, out, state_pool=pool, **meta)
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        _call(fused, out, state_pool=pool, **meta)
+    for _ in range(2):
+        pool.copy_(pool0)
+        out.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, out_ref)
+        assert torch.equal(pool, pool_ref)
+
+
+def test_fused_qkv_views_in_debug_entries(monkeypatch):
+    from pla.prefill.flashkdapro import _C
+
+    monkeypatch.setenv("PLA_FLASHKDA_CP", "2")
+    monkeypatch.setenv("PLA_FLASHKDA_CP_SEG_TILES", "4")
+    lengths, heads = (200, 37, 300), 4
+    inputs, cu, offsets = _inputs(lengths, heads, seed=17)
+    fused = _fused_qkv(inputs)
+    scale, lower_bound = D ** -0.5, -5.0
+
+    def prepare(x):
+        return _C.flashkda_prepare(x["q"], x["k"], x["g"], x["beta"], x["A_log"], x["dt_bias"],
+                                   scale, lower_bound, cu)
+
+    for ref, got in zip(prepare(inputs), prepare(fused)):
+        assert torch.equal(ref, got)
+
+    def stages(x):
+        return _C.flashkda_cp_stages(x["q"], x["k"], x["v"], x["g"], x["beta"], x["A_log"],
+                                     x["dt_bias"], scale, lower_bound, None, cu, offsets)
+
+    for ref, got in zip(stages(inputs), stages(fused)):
+        assert torch.equal(ref, got)

@@ -37,6 +37,7 @@
 #include <torch/extension.h>
 
 #include "../../sanity_check.h"
+#include "../common/strided_inputs.h"
 
 #include <cmath>
 #include <limits>
@@ -59,13 +60,18 @@ inline std::vector<int64_t> sanity_prepare_inputs(
     sp::int_extent(check, T, "T");
     sp::int_extent(check, H, "H");
     for (const auto& named : std::initializer_list<std::pair<const char*, torch::Tensor>>{
-             {"q", q}, {"k", k}, {"g", g}}) {
+             {"q", q}, {"k", k}}) {
         check.tensor(named.second, named.first);
         check.check(named.second.sizes() == q.sizes() &&
                         named.second.scalar_type() == torch::kBFloat16 &&
-                        named.second.is_contiguous(),
-                    named.first, " must be contiguous bf16 [T,H,128] matching q");
+                        flashkda::layout::qkv_native(named.second),
+                    named.first, " must be bf16 [T,H,128] matching q with packed rows "
+                    "and a 16B-aligned int32 token stride");
     }
+    check.tensor(g, "g");
+    check.check(g.sizes() == q.sizes() && g.scalar_type() == torch::kBFloat16 &&
+                    g.is_contiguous(),
+                "g must be contiguous bf16 [T,H,128] matching q");
     check.tensor(beta, "beta");
     check.check(beta.dim() == 2 && beta.size(0) == T && beta.size(1) == H &&
                     beta.scalar_type() == torch::kBFloat16 &&
@@ -104,5 +110,7 @@ inline void sanity_v(const pla::sanity::Context& check, const torch::Tensor& q,
               const torch::Tensor& v) {
     check.tensor(v, "v");
     check.check(v.scalar_type() == torch::kBFloat16 && v.sizes() == q.sizes() &&
-                    v.is_contiguous(), "v must be contiguous bf16 [T,H,128] matching q");
+                    flashkda::layout::qkv_native(v),
+                "v must be bf16 [T,H,128] matching q with packed rows "
+                "and a 16B-aligned int32 token stride");
 }

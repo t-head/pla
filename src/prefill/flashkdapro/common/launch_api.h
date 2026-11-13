@@ -45,10 +45,13 @@
 
 #include "prefill/flashkdapro/common/workspace_abi.h"
 
+// q_stride, k_stride and v_stride are token strides in elements; the head and
+// feature dimensions of q/k/v are always packed ([T, H, 128] with strides
+// (stride, 128, 1)).  Dense inputs pass H * 128.
 void launch_flashkda_prepare(
     const void* q, const void* k, const void* g_in, const void* beta,
     const float* A_log, const float* dt_bias, float scale, float gate_scale,
-    int T_total, int H, int beta_stride,
+    int T_total, int H, int beta_stride, int64_t q_stride, int64_t k_stride,
     int N, int total_tiles, const int32_t* cu_seqlens,
     bool is_varlen,
     int tile_offset, int tile_count, int head_offset, int head_count,
@@ -62,7 +65,7 @@ void launch_flashkda_zero_padded_output_tail(
     hggcStream_t stream);
 
 void launch_flashkda_recurrence(
-    void* o, const void* v, const void* beta,
+    void* o, const void* v, int64_t v_stride, const void* beta,
     const void* ws,
     const void* init_state, void* final_state,
     const int32_t* init_state_indices, const int32_t* final_state_indices,
@@ -75,7 +78,7 @@ void launch_flashkda_recurrence(
 // dispatcher.  It remains in the shared interface so its definition and the
 // cross-TU call are checked against the same declaration.
 void launch_flashkda_recurrence_nows(
-    void* o, const void* v, const void* beta,
+    void* o, const void* v, int64_t v_stride, const void* beta,
     const void* ws,
     const void* init_state, void* final_state,
     const int32_t* init_state_indices, const int32_t* final_state_indices,
@@ -87,7 +90,7 @@ void launch_flashkda_recurrence_nows(
 // tc01-only four-stage BT64 path. The public operator ABI is unchanged; these
 // buffers are private, same-stream intermediates owned by the host call.
 void launch_flashkda_bt64_prefill_tc01(
-    void* o, const void* v, const void* ws16,
+    void* o, const void* v, int64_t v_stride, const void* ws16,
     void* bt_ws, void* x, void* h_checkpoint,
     const void* init_state, void* final_state,
     const int32_t* init_state_indices,
@@ -104,7 +107,8 @@ void launch_flashkda_bt64_prefill_tc01(
 // int32 lanes per segment); carries is the bf16 [n_seg, H, DV, DK] merge
 // output consumed as each segment's init state.
 void launch_flashkda_bt64_cp_front_tc01(
-    const void* v, const void* ws16, void* bt_ws, void* h_checkpoint_scratch,
+    const void* v, int64_t v_stride, const void* ws16, void* bt_ws,
+    void* h_checkpoint_scratch,
     int T_total, int H, int N, int total_tiles, int total_bt,
     const int32_t* cu_seqlens, flashkda::KrWorkspaceLayout kr_layout,
     hggcStream_t stream);
@@ -128,13 +132,13 @@ bool flashkda_kr_is_preswizzled(hggcStream_t stream);
 
 // CP pass 1/3 (template modes of the register-resident recurrence kernel).
 void launch_flashkda_cp_prescan(
-    const void* v, const void* beta, const void* ws,
+    const void* v, int64_t v_stride, const void* beta, const void* ws,
     void* chain_state, bool fp16_state,
     int T_total, int H, int n_seg, int total_tiles,
     const int* seg_tbl, int bv, hggcStream_t stream);
 
 void launch_flashkda_cp_segment(
-    void* o, const void* v, const void* beta, const void* ws,
+    void* o, const void* v, int64_t v_stride, const void* beta, const void* ws,
     const void* carries, bool fp16_state, void* final_state,
     const int32_t* final_state_indices, bool final_state_is_fp32,
     int T_total, int H, int n_seg, int total_tiles,

@@ -258,7 +258,8 @@ template <int DVT, int NTHREADS>
 __device__ __forceinline__ void k2_preload_stage(
     int stage, int actual, int ws_idx, int64_t tok0,
     int H, int T_total, int head, int dv0, int tid,
-    const BF16* __restrict__ v, const BF16* __restrict__ beta,
+    const BF16* __restrict__ v, int64_t v_stride,
+    const BF16* __restrict__ beta,
     const BF16* __restrict__ ws,
     BF16* sWsBase, BF16* sVBase, float* sBetaBase) {
     using S = K2Smem<DVT>;
@@ -276,8 +277,8 @@ __device__ __forceinline__ void k2_preload_stage(
         k2_aiu_load_2d_b16(sWs, g_slot, DK, fk::WS_SLOT_UNITS / DK,
                            int64_t(DK) * sizeof(BF16));
         if (actual == CH) {
-            const BF16* v_src = v + tok0 * int64_t(H) * DV + int64_t(head) * DV + dv0;
-            k2_aiu_load_2d_b16(sV, v_src, DVT, CH, int64_t(H) * DV * sizeof(BF16));
+            const BF16* v_src = v + tok0 * v_stride + int64_t(head) * DV + dv0;
+            k2_aiu_load_2d_b16(sV, v_src, DVT, CH, v_stride * sizeof(BF16));
         }
         k2_aiu_commit();
     }
@@ -285,7 +286,7 @@ __device__ __forceinline__ void k2_preload_stage(
         for (int idx = tid; idx < CH * DVT; idx += NTHREADS) {
             int r = idx / DVT, c = idx % DVT;
             sV[idx] = (r < actual)
-                ? v[(tok0 + r) * int64_t(H) * DV + int64_t(head) * DV + (dv0 + c)] : BF16(0);
+                ? v[(tok0 + r) * v_stride + int64_t(head) * DV + (dv0 + c)] : BF16(0);
         }
     }
     (void)beta;
@@ -296,7 +297,8 @@ template <int DVT, int NTHREADS, bool IsVarlen, bool HasStateIn,
           bool HasStateOut, bool CompactBf16State>
 __global__ void __launch_bounds__(NTHREADS) flashkda_recurrence_kernel(
     BF16* __restrict__ o,             // [T_total, H, DV]
-    const BF16* __restrict__ v,       // [T_total, H, DV]
+    const BF16* __restrict__ v,       // [T_total, H, DV] (token stride v_stride, DV, 1)
+    int64_t v_stride,
     const BF16* __restrict__ beta,    // [H*T_total]
     const BF16* __restrict__ ws,      // merged workspace [nht, WS_SLOT_UNITS]
     K2StateInAccessor<CompactBf16State> init_state,
@@ -388,7 +390,7 @@ __global__ void __launch_bounds__(NTHREADS) flashkda_recurrence_kernel(
         int64_t pf_tok0 = bos + int64_t(pf) * CH;
         k2_preload_stage<DVT, NTHREADS>(pf & 1, pf_actual, pf_ws_idx, pf_tok0,
                               H, T_total, head, dv0, tid,
-                              v, beta, ws,
+                              v, v_stride, beta, ws,
                               sWsBase, sVBase, sBetaBase);
     }
 
@@ -471,7 +473,7 @@ __global__ void __launch_bounds__(NTHREADS) flashkda_recurrence_kernel(
             int64_t pf_tok0 = bos + int64_t(pf_t) * CH;
             k2_preload_stage<DVT, NTHREADS>(pf_t & 1, pf_actual, pf_ws_idx, pf_tok0,
                                   H, T_total, head, dv0, tid,
-                                  v, beta, ws,
+                                  v, v_stride, beta, ws,
                                   sWsBase, sVBase, sBetaBase);
         }
     }
@@ -501,7 +503,7 @@ __global__ void __launch_bounds__(NTHREADS) flashkda_recurrence_kernel(
 }  // namespace flashkda_cute
 
 void launch_flashkda_recurrence(
-    void* o, const void* v, const void* beta,
+    void* o, const void* v, int64_t v_stride, const void* beta,
     const void* ws,
     const void* init_state, void* final_state,
     const int32_t* init_state_indices, const int32_t* final_state_indices,
@@ -583,7 +585,7 @@ void launch_flashkda_recurrence(
             || kr_layout == flashkda::KrWorkspaceLayout::kContiguousAffineP;
         if (use_nows || contiguous_layout || affine_layout) {
             launch_flashkda_recurrence_nows(
-                o, v, beta, ws,
+                o, v, v_stride, beta, ws,
                 init_state, final_state,
                 init_state_indices, final_state_indices,
                 init_state_is_fp32, final_state_is_fp32,
@@ -633,7 +635,7 @@ void launch_flashkda_recurrence(
         hggcFuncSetAttribute(kern, hggcFuncAttributeMaxDynamicSharedMemorySize, smem);
         kern<<<grid, NT, smem, stream>>>(
             reinterpret_cast<BF16*>(o), reinterpret_cast<const BF16*>(v),
-            reinterpret_cast<const BF16*>(beta),
+            v_stride, reinterpret_cast<const BF16*>(beta),
             reinterpret_cast<const BF16*>(ws),
             state_in, state_out,
             T_total, H, N, total_tiles, cu_seqlens, tile_prefix);

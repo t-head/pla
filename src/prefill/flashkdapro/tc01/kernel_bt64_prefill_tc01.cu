@@ -1123,7 +1123,8 @@ struct alignas(128) RecomputeInputSmem {
 template <bool KrContiguous>
 __global__ void __launch_bounds__(RECOMPUTE_THREADS_TC01, 1)
 flashkda_bt64_prepare_recompute_kernel(
-    const BF16* __restrict__ v, const BF16* __restrict__ ws16,
+    const BF16* __restrict__ v, int64_t v_stride,
+    const BF16* __restrict__ ws16,
     BF16* __restrict__ bt_ws, BF16* __restrict__ prepared,
     int T_total, int H, int N, int total_tiles, int total_bt,
     const int32_t* __restrict__ cu) {
@@ -1158,7 +1159,7 @@ flashkda_bt64_prepare_recompute_kernel(
         const int sub = r / BC;
         float vv = 0.f, kd = 0.f, kg = 0.f;
         if (r < map.len && map.tok + r < T_total) {
-            vv = fk::bf16_to_f32(v[int64_t(map.tok + r) * H * DV
+            vv = fk::bf16_to_f32(v[int64_t(map.tok + r) * v_stride
                 + int64_t(head) * DV + dk]);
         }
         if (sub < nsub && r < map.len) {
@@ -1206,7 +1207,7 @@ __global__ void __launch_bounds__(RECOMPUTE_THREADS_TC01, 1)
 __global__ void __launch_bounds__(THREADS, 1)
 #endif
 flashkda_bt64_recompute_kernel(
-    const BF16* __restrict__ v,
+    const BF16* __restrict__ v, int64_t v_stride,
     const BF16* __restrict__ ws16,
     BF16* __restrict__ bt_ws,
     const BF16* __restrict__ prepared,
@@ -1325,7 +1326,7 @@ flashkda_bt64_recompute_kernel(
             const int c = i - r * BC;
             float vv = 0.f;
             if (r < map.len && map.tok + r < T_total) {
-                const int64_t off = int64_t(map.tok + r) * H * DV
+                const int64_t off = int64_t(map.tok + r) * v_stride
                     + int64_t(head) * DV + fb * BC + c;
                 vv = fk::bf16_to_f32(v[off]);
             }
@@ -2587,7 +2588,8 @@ namespace flashkda_cute_bt64 {
 // (bt, head), so the front composes freely with either serial stage.
 template <bool KrContiguous>
 void launch_bt64_parallel_front(
-    const BF16* v, const BF16* ws16, BF16* bt_ws, BF16* h_checkpoint_scratch,
+    const BF16* v, int64_t v_stride, const BF16* ws16, BF16* bt_ws,
+    BF16* h_checkpoint_scratch,
     int T_total, int H, int N, int total_tiles, int total_bt,
     const int32_t* cu, hggcStream_t stream) {
     // The entry has already confirmed tc01 and a successful BT64 allocation; other shapes keep the original order.
@@ -2612,7 +2614,7 @@ void launch_bt64_parallel_front(
     if (reorder) {
         flashkda_bt64_prepare_recompute_kernel<KrContiguous>
             <<<bt_grid, RECOMPUTE_THREADS_TC01, 0, stream>>>(
-                v, ws16, bt_ws, h_checkpoint_scratch,
+                v, v_stride, ws16, bt_ws, h_checkpoint_scratch,
                 T_total, H, N, total_tiles, total_bt, cu);
         check_launch_or_throw("early prepare recompute launch", T_total, H, N, total_bt);
     }
@@ -2637,7 +2639,7 @@ void launch_bt64_parallel_front(
         if (!reorder) {
             flashkda_bt64_prepare_recompute_kernel<KrContiguous>
                 <<<bt_grid, RECOMPUTE_THREADS_TC01, 0, stream>>>(
-                    v, ws16, bt_ws, h_checkpoint_scratch,
+                    v, v_stride, ws16, bt_ws, h_checkpoint_scratch,
                     T_total, H, N, total_tiles, total_bt, cu);
             check_launch_or_throw("prepare recompute launch", T_total, H, N, total_bt);
         }
@@ -2649,7 +2651,7 @@ void launch_bt64_parallel_front(
         flashkda_bt64_recompute_kernel<KrContiguous>
             <<<bt_grid, RECOMPUTE_THREADS_TC01,
                RECOMPUTE_SMEM_BYTES_TC01, stream>>>(
-                v, ws16, bt_ws, h_checkpoint_scratch,
+                v, v_stride, ws16, bt_ws, h_checkpoint_scratch,
                 T_total, H, N, total_tiles, total_bt, cu);
         check_launch_or_throw("recompute launch", T_total, H, N, total_bt);
     }
@@ -2707,7 +2709,7 @@ void launch_bt64_parallel_back(
 
 template <bool KrContiguous>
 void launch_bt64_impl(
-    BF16* o, const BF16* v, const BF16* ws16,
+    BF16* o, const BF16* v, int64_t v_stride, const BF16* ws16,
     BF16* bt_ws, BF16* x, BF16* h_checkpoint,
     const void* init_state, void* final_state,
     const int32_t* init_state_indices,
@@ -2717,7 +2719,7 @@ void launch_bt64_impl(
     const int32_t* cu, bool has_state_in, bool has_state_out,
     hggcStream_t stream) {
     launch_bt64_parallel_front<KrContiguous>(
-        v, ws16, bt_ws, h_checkpoint,
+        v, v_stride, ws16, bt_ws, h_checkpoint,
         T_total, H, N, total_tiles, total_bt, cu, stream);
 
     dim3 recurrence_grid(DV / BV, N, H);
@@ -2757,7 +2759,7 @@ void launch_bt64_impl(
 }  // namespace flashkda_cute_bt64
 
 void launch_flashkda_bt64_prefill_tc01(
-    void* o, const void* v, const void* ws16,
+    void* o, const void* v, int64_t v_stride, const void* ws16,
     void* bt_ws, void* x, void* h_checkpoint,
     const void* init_state, void* final_state,
     const int32_t* init_state_indices,
@@ -2793,6 +2795,7 @@ void launch_flashkda_bt64_prefill_tc01(
     if (kr_layout == flashkda::KrWorkspaceLayout::kNormalRaw) {
         bt64::launch_bt64_impl<false>(
             reinterpret_cast<BF16*>(o), reinterpret_cast<const BF16*>(v),
+            v_stride,
             reinterpret_cast<const BF16*>(ws16), reinterpret_cast<BF16*>(bt_ws),
             reinterpret_cast<BF16*>(x), reinterpret_cast<BF16*>(h_checkpoint),
             init_state, final_state, init_state_indices, final_state_indices,
@@ -2804,6 +2807,7 @@ void launch_flashkda_bt64_prefill_tc01(
     if (kr_layout == flashkda::KrWorkspaceLayout::kContiguousRawKrT) {
         bt64::launch_bt64_impl<true>(
             reinterpret_cast<BF16*>(o), reinterpret_cast<const BF16*>(v),
+            v_stride,
             reinterpret_cast<const BF16*>(ws16), reinterpret_cast<BF16*>(bt_ws),
             reinterpret_cast<BF16*>(x), reinterpret_cast<BF16*>(h_checkpoint),
             init_state, final_state, init_state_indices, final_state_indices,
@@ -2817,7 +2821,8 @@ void launch_flashkda_bt64_prefill_tc01(
 }
 
 void launch_flashkda_bt64_cp_front_tc01(
-    const void* v, const void* ws16, void* bt_ws, void* h_checkpoint_scratch,
+    const void* v, int64_t v_stride, const void* ws16, void* bt_ws,
+    void* h_checkpoint_scratch,
     int T_total, int H, int N, int total_tiles, int total_bt,
     const int32_t* cu_seqlens, flashkda::KrWorkspaceLayout kr_layout,
     hggcStream_t stream) {
@@ -2839,7 +2844,7 @@ void launch_flashkda_bt64_cp_front_tc01(
 
     if (kr_layout == flashkda::KrWorkspaceLayout::kNormalRaw) {
         bt64::launch_bt64_parallel_front<false>(
-            reinterpret_cast<const BF16*>(v),
+            reinterpret_cast<const BF16*>(v), v_stride,
             reinterpret_cast<const BF16*>(ws16),
             reinterpret_cast<BF16*>(bt_ws),
             reinterpret_cast<BF16*>(h_checkpoint_scratch),
@@ -2848,7 +2853,7 @@ void launch_flashkda_bt64_cp_front_tc01(
     }
     if (kr_layout == flashkda::KrWorkspaceLayout::kContiguousRawKrT) {
         bt64::launch_bt64_parallel_front<true>(
-            reinterpret_cast<const BF16*>(v),
+            reinterpret_cast<const BF16*>(v), v_stride,
             reinterpret_cast<const BF16*>(ws16),
             reinterpret_cast<BF16*>(bt_ws),
             reinterpret_cast<BF16*>(h_checkpoint_scratch),

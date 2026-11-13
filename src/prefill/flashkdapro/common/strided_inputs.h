@@ -33,12 +33,14 @@
 /*
  * Layout staging shared by the FlashKDA prefill entries (legacy and tc01 FLA).
  *
- * The kernels address q/k/v/g, A_log, dt_bias and the recurrent states as dense
- * row-major buffers, and beta through a token stride. Serving frameworks pass
- * exactly that layout, so those tensors go through untouched after a few
- * metadata reads. Any other strided view is materialized once on the current
- * stream before the first kernel; a strided final state is computed into a
- * dense scratch and published to the caller's view after the last kernel.
+ * The kernels address g, A_log, dt_bias and the recurrent states as dense
+ * row-major buffers, and q/k/v and beta through a token stride over packed
+ * rows. Serving frameworks pass exactly that layout (dense tensors, or q/k/v
+ * split out of one fused projection), so those tensors go through untouched
+ * after a few metadata reads. Any other strided view is materialized once on
+ * the current stream before the first kernel; a strided final state is
+ * computed into a dense scratch and published to the caller's view after the
+ * last kernel.
  * Malformed tensors (wrong rank/device/dtype) are never rejected here: the
  * entry's own validation keeps reporting them.
  */
@@ -70,9 +72,32 @@ inline bool beta_native(const at::Tensor& beta) {
            reinterpret_cast<uintptr_t>(beta.data_ptr()) % beta.element_size() == 0;
 }
 
+// Token stride of a [T,H,D] q/k/v view in elements. A single-token view has
+// no meaningful stride, so it reports the packed row size.
+inline int64_t token_stride(const at::Tensor& x) {
+    return x.size(0) > 1 ? x.stride(0) : x.size(1) * x.size(2);
+}
+
+// q/k/v are consumed natively with a token stride over packed [H,D] rows
+// (strides (s, D, 1)). Every row must start 16B aligned for the AIU tile
+// loads, and s must fit the tc01 AIU int32 element-stride field.
+inline bool qkv_native(const at::Tensor& x) {
+    if (x.dim() != 3) return false;
+    const int64_t row = x.size(1) * x.size(2);
+    const int64_t s = token_stride(x);
+    return (x.size(2) <= 1 || x.stride(2) == 1) &&
+           (x.size(1) <= 1 || x.stride(1) == x.size(2)) &&
+           s >= row && s <= std::numeric_limits<int32_t>::max() &&
+           (s * x.element_size()) % 16 == 0 &&
+           reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0;
+}
+
 inline void stage_inputs(at::Tensor& q, at::Tensor& k, at::Tensor& v, at::Tensor& g,
                          at::Tensor& beta, at::Tensor& a_log, at::Tensor& dt_bias) {
-    for (auto* x : {&q, &k, &v, &g}) stage_dense(*x, 16);
+    for (auto* x : {&q, &k, &v})
+        if (x->defined() && x->dim() == 3 && !qkv_native(*x))
+            *x = x->clone(at::MemoryFormat::Contiguous);
+    stage_dense(g, 16);
     if (beta.defined() && beta.dim() == 2 && !beta_native(beta))
         beta = beta.clone(at::MemoryFormat::Contiguous);
     stage_dense(a_log, 4);

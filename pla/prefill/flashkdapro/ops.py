@@ -45,9 +45,10 @@ Tensors follow the upstream FlashKDA/FLA packed-token contract — q/k/v/g are
 the SGLang/vLLM serving metadata. Legacy int64 offsets remain accepted and are
 converted after an explicit range check.
 
-Inputs and states may be arbitrary strided views. Dense views (and beta with a
-token stride) are consumed in place at no extra cost, which is what serving
-frameworks pass; any other layout is materialized once on the current stream
+Inputs and states may be arbitrary strided views. Dense views, and q/k/v/beta
+with a token stride over packed head rows (slices of one fused projection), are
+consumed in place at no extra cost, which is what serving frameworks pass; any
+other layout is materialized once on the current stream
 before the first kernel, and a strided ``final_state``/``state_pool`` is
 written back after the last kernel. Results are bit-identical either way.
 """
@@ -86,7 +87,10 @@ def flashkda_fwd(
 
     Args:
         q, k, v, g: ``[total_tokens, H, 128]`` bf16, any strides. ``g`` is the
-            raw (pre-gate) input; the gate is applied inside Kernel 1.
+            raw (pre-gate) input; the gate is applied inside Kernel 1. q/k/v
+            with strides ``(s, 128, 1)`` (``s`` a multiple of 8 elements,
+            16B-aligned base) are read in place; other strides, and any
+            non-dense ``g``, are materialized.
         beta: raw pre-sigmoid ``[total_tokens, H]`` bf16. Each consumer kernel
             computes the fp32 sigmoid from the raw value with one shared inlined
             implementation, so all stages observe bit-identical activations. A
