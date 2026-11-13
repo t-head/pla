@@ -428,13 +428,13 @@ CUTE_DEVICE void bf16_cfrag_to_bfrag_movmatrix_batched_u32(
   CUTE_UNROLL
   for (int i = 0; i < 4; ++i) scratch[i * 32 + lane] = c_regs[i];
   __syncwarp();
-  const int row = lane & 7;
-  CUTE_UNROLL
-  for (int i = 0; i < 4; ++i) {
-    uint32_t smem_addr = static_cast<uint32_t>(
-        __cvta_generic_to_shared(scratch + i * 32 + row * 4));
-    b_regs[i] = ldmatrix_x1_trans_u32(smem_addr);
-  }
+  // Same four scratch planes and warp barriers; one transposed x4 load.
+  uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(
+      scratch + (lane >> 3) * 32 + (lane & 7) * 4));
+  asm volatile(
+      "ppu.tc02.ldmatrix.sync.aligned.x4.trans.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+      : "=r"(b_regs[0]), "=r"(b_regs[1]), "=r"(b_regs[2]), "=r"(b_regs[3])
+      : "r"(smem_addr));
   __syncwarp();
 #else
   (void)scratch;
