@@ -57,11 +57,6 @@ from pla.prefill.flashqla.private.cp_preprocess import (
     calc_cp_seqs,
 )
 
-# Shapes allowed to stay on the H-only legacy CP floor. A head config reaching
-# the whitelist without a measured floor must be a deliberate act, otherwise a
-# new shape quietly inherits the (num_v_heads <= 16) 3072-token tier.
-UNCALIBRATED_HEAD_CONFIGS = frozenset({(8, 1), (16, 16)})
-
 
 @contextmanager
 def _legacy_tc01_planner(enabled: bool):
@@ -188,6 +183,9 @@ GROUPED_PLANNER_CASES = (
     ((415,), 6, 2, 32, False),
     ((416,), 6, 2, 32, True),
     ((417,), 6, 2, 32, True),
+    ((1023,), 8, 1, 32, False),
+    ((1024,), 8, 1, 32, True),
+    ((1025,), 8, 1, 32, True),
     ((423,), 8, 2, 32, False),
     ((424,), 8, 2, 32, True),
     ((425,), 8, 2, 32, True),
@@ -206,6 +204,9 @@ GROUPED_PLANNER_CASES = (
     ((1408,), 16, 8, 32, False),
     ((1409,), 16, 8, 32, True),
     ((1410,), 16, 8, 32, True),
+    ((3071,), 16, 16, 32, False),
+    ((3072,), 16, 16, 32, True),
+    ((3073,), 16, 16, 32, True),
     ((2048,), 24, 8, 32, False),
     ((2049,), 24, 8, 32, True),
     ((2050,), 24, 8, 32, True),
@@ -357,13 +358,7 @@ def main() -> int:
         _TC02_SINGLE_SEQ_CP_MIN_TOKENS_BY_TOPOLOGY
         if chunk_size == TC02_SINGLE_SEQ_CALIBRATED_CHUNK_SIZE
     )
-    # The measured map may lag the whitelist by exactly the shapes listed in
-    # UNCALIBRATED_HEAD_CONFIGS; any other difference means a shape gained
-    # support without a floor, or a floor was measured for a supportless shape.
-    topology_coverage_ok = (
-        calibrated_topologies <= SUPPORTED_HEAD_CONFIGS and
-        SUPPORTED_HEAD_CONFIGS - calibrated_topologies ==
-        UNCALIBRATED_HEAD_CONFIGS)
+    topology_coverage_ok = calibrated_topologies == SUPPORTED_HEAD_CONFIGS
     calibrated_chunk_size_ok = (
         CHUNK_SIZE == TC02_SINGLE_SEQ_CALIBRATED_CHUNK_SIZE and
         OPS_CHUNK_SIZE == TC02_SINGLE_SEQ_CALIBRATED_CHUNK_SIZE
