@@ -639,7 +639,7 @@ def test_qla_fused_metadata(prefill_native, case):
                       4, 2, scale, None, pool, indices)
 
 
-@pytest.mark.parametrize("case", ["k_shape", "q_stride", "cu_overflow", "state_slot", "host_cu", "scale"])
+@pytest.mark.parametrize("case", ["k_shape", "out_stride", "cu_overflow", "state_slot", "host_cu", "scale"])
 def test_kda_native_contract(prefill_native, case):
     _, kda = prefill_native
     q = torch.zeros((32, 4, 128), device="cuda", dtype=torch.bfloat16)
@@ -656,8 +656,9 @@ def test_kda_native_contract(prefill_native, case):
     raw, scale = (0, 16, 32), 0.125
     if case == "k_shape":
         k = k[:1]
-    elif case == "q_stride":
-        q = torch.zeros((32, 8, 128), device="cuda", dtype=torch.bfloat16)[:, :4]
+    elif case == "out_stride":
+        # Strided inputs are staged; out is written in place and stays dense.
+        out = torch.zeros((32, 8, 128), device="cuda", dtype=torch.bfloat16)[:, :4]
     elif case == "cu_overflow":
         cu = torch.tensor([0, 2**32 + 16, 32], device="cuda", dtype=torch.int64)
     elif case == "state_slot":

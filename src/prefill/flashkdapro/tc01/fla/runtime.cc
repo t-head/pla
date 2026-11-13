@@ -42,6 +42,7 @@
 #include <c10/cuda/CUDACachingAllocator.h>
 #include "launchers.h"
 #include "workspace_layout.h"
+#include "../../common/strided_inputs.h"
 #include <array>
 #include <cmath>
 #include <cstdlib>
@@ -80,6 +81,16 @@ bool alias(const at::Tensor& a, const at::Tensor& b) {
   return a.storage().data_ptr().get() == b.storage().data_ptr().get();
 }
 struct Shape { int64_t t, h, n, chunks; std::vector<int64_t> offsets; };
+// Dense views pass through; other strided inputs and states are staged before validation.
+flashkda::layout::StateStage stage_layout(Arguments& a) {
+  flashkda::layout::stage_inputs(a.q, a.k, a.v, a.g, a.beta, a.a_log, a.dt_bias);
+  if (a.pool.defined() && !a.pool.is_contiguous() && a.indices.defined() &&
+      !a.initial.defined() && !a.final.defined()) {
+    a.initial = a.final = a.pool;
+    a.pool = at::Tensor();
+  }
+  return flashkda::layout::stage_states("flashkda_tc01_fla", a.initial, a.final, a.indices, a.out);
+}
 Shape validate(Arguments& a) {
   require(a.q.defined() && a.q.is_cuda() && a.q.dim() == 3 && a.q.size(2) == 128, "q must be a device tensor [T,H,128]");
   auto device = a.q.device();
@@ -348,6 +359,7 @@ void forward(Arguments a) {
     }
     return;
   }
+  const auto staged = stage_layout(a);
   const Shape s = validate(a);
   const auto& table = launchers_for(s.h);
   const CpSelection cp = select_cp(a, s, table);
@@ -539,6 +551,7 @@ void forward(Arguments a) {
     if (a.indices.defined()) a.final.index_copy_(0, a.indices.to(at::kLong), publish);
     else a.final.copy_(publish);
   }
+  staged.publish();
 }
 
 std::vector<at::Tensor> metadata_only(const at::Tensor& input, int64_t tokens, int64_t heads) {

@@ -72,6 +72,7 @@
 #include "prefill/flashkdapro/common/launch_api.h"
 #include "prefill/flashkdapro/common/bt64_workspace_abi.h"
 #include "prefill/flashkdapro/common/runtime_arch.h"
+#include "prefill/flashkdapro/common/strided_inputs.h"
 #include "op_forge_case.h"
 #include "../../sanity_check.h"
 #include "../../../bypass_exec.h"
@@ -1260,7 +1261,8 @@ std::vector<torch::Tensor> flashkda_prepare(
 // choice and the final state is only computed when a tensor is supplied. The
 // recurrence always carries the state in bf16 internally (FlashKDA design); an
 // fp32 state is rounded on load and widened on store, at the boundary only.
-void flashkda_fwd(
+// The kernels assume the dense layouts produced by flashkda_fwd's staging.
+void flashkda_fwd_dense(
     torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g,
     torch::Tensor beta, torch::Tensor A_log, torch::Tensor dt_bias,
     torch::Tensor out,
@@ -1297,6 +1299,9 @@ void flashkda_fwd(
                               scale, lower_bound, cu_seqlens_opt, raw_cu_seqlens_opt);
         sanity_v(sanity, q, v);
         sanity.tensor(out, "out");
+        sanity.check(out.scalar_type() == torch::kBFloat16 && out.sizes() == q.sizes() &&
+                         out.is_contiguous(),
+                     "out must be contiguous bf16 [T,H,128] matching q");
         sanity.check(!sp::overlaps(out, v) && !sp::overlaps(out, beta),
                      "out must not overlap recurrence inputs v/beta");
         const int64_t N = cu_seqlens_opt.has_value() ? cu_seqlens_opt->numel() - 1 : 1;
@@ -1666,6 +1671,52 @@ void flashkda_fwd(
         seg_tbl_d.data_ptr<int32_t>(), cp.bv, stream);
     cp_check("segment");
 
+}
+
+// Public entry: dense inputs/states reach flashkda_fwd_dense untouched; other
+// strided views are staged first and a staged final state is published after
+// the last kernel on the same stream.
+void flashkda_fwd(
+    torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g,
+    torch::Tensor beta, torch::Tensor A_log, torch::Tensor dt_bias,
+    torch::Tensor out,
+    double scale, double lower_bound,
+    c10::optional<torch::Tensor> initial_state_opt,
+    c10::optional<torch::Tensor> final_state_opt,
+    c10::optional<torch::Tensor> cu_seqlens_opt,
+    c10::optional<torch::Tensor> state_indices_opt,
+    c10::optional<std::vector<int64_t>> raw_cu_seqlens_opt) {
+    if (pla::bypass::enabled() || !q.is_cuda()) {
+        flashkda_fwd_dense(
+            std::move(q), std::move(k), std::move(v), std::move(g), std::move(beta),
+            std::move(A_log), std::move(dt_bias), std::move(out), scale, lower_bound,
+            std::move(initial_state_opt), std::move(final_state_opt),
+            std::move(cu_seqlens_opt), std::move(state_indices_opt),
+            std::move(raw_cu_seqlens_opt));
+        return;
+    }
+    const c10::cuda::CUDAGuard device_guard(q.device());
+    flashkda::layout::stage_inputs(q, k, v, g, beta, A_log, dt_bias);
+    torch::Tensor initial = initial_state_opt.value_or(torch::Tensor());
+    torch::Tensor final = final_state_opt.value_or(torch::Tensor());
+    torch::Tensor indices = state_indices_opt.value_or(torch::Tensor());
+    const auto staged = flashkda::layout::stage_states(
+        "flashkda_fwd", initial, final, indices, out);
+    if (staged.active) {
+        auto optional = [](const torch::Tensor& x) {
+            return x.defined() ? c10::optional<torch::Tensor>(x) : c10::nullopt;
+        };
+        initial_state_opt = optional(initial);
+        final_state_opt = optional(final);
+        state_indices_opt = optional(indices);
+    }
+    flashkda_fwd_dense(
+        std::move(q), std::move(k), std::move(v), std::move(g), std::move(beta),
+        std::move(A_log), std::move(dt_bias), std::move(out), scale, lower_bound,
+        std::move(initial_state_opt), std::move(final_state_opt),
+        std::move(cu_seqlens_opt), std::move(state_indices_opt),
+        std::move(raw_cu_seqlens_opt));
+    staged.publish();
 }
 
 // flashkda_cp_stages: debug view of the CP pipeline's first two passes.  Runs

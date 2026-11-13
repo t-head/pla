@@ -44,6 +44,12 @@ Tensors follow the upstream FlashKDA/FLA packed-token contract — q/k/v/g are
 3-D ``[total_tokens, H, 128]``. ``cu_seqlens`` is consumed as int32, matching
 the SGLang/vLLM serving metadata. Legacy int64 offsets remain accepted and are
 converted after an explicit range check.
+
+Inputs and states may be arbitrary strided views. Dense views (and beta with a
+token stride) are consumed in place at no extra cost, which is what serving
+frameworks pass; any other layout is materialized once on the current stream
+before the first kernel, and a strided ``final_state``/``state_pool`` is
+written back after the last kernel. Results are bit-identical either way.
 """
 from typing import Optional, Tuple
 
@@ -79,31 +85,32 @@ def flashkda_fwd(
     """FlashKDA prefill forward. Writes ``out`` (and ``final_state`` if given).
 
     Args:
-        q, k, v, g: ``[total_tokens, H, 128]`` bf16, contiguous. ``g`` is the
+        q, k, v, g: ``[total_tokens, H, 128]`` bf16, any strides. ``g`` is the
             raw (pre-gate) input; the gate is applied inside Kernel 1.
         beta: raw pre-sigmoid ``[total_tokens, H]`` bf16. Each consumer kernel
             computes the fp32 sigmoid from the raw value with one shared inlined
-            implementation, so all stages observe bit-identical activations. The
-            head dimension must be contiguous, while a strided token dimension
-            is accepted for fused-projection column slices.
-        A_log: ``[H]`` fp32. ``dt_bias``: ``[H, 128]`` fp32.
+            implementation, so all stages observe bit-identical activations. A
+            unit head stride with a token stride (fused-projection column
+            slices) is read in place; other strides are materialized.
+        A_log: ``[H]`` fp32. ``dt_bias``: ``[H, 128]`` fp32. Any strides.
         out: ``[total_tokens, H, DV]`` bf16, contiguous. Written in full; the
             caller allocates it. If ``cu_seqlens[-1] < total_tokens``, the real
             prefix is computed and the physical padded suffix is set to zero.
         scale: q scaling; defaults to ``DK ** -0.5``.
         lower_bound: KDA gate lower bound, expected in ``[-5, 0]``.
-        initial_state: ``[N, H, DV, DK]`` bf16 or fp32, contiguous. ``None``
+        initial_state: ``[N, H, DV, DK]`` bf16 or fp32, any strides. ``None``
             starts from a zero state.
-        final_state: ``[N, H, DV, DK]`` bf16 or fp32, contiguous. Written with
+        final_state: ``[N, H, DV, DK]`` bf16 or fp32, any strides. Written with
             the state after the last chunk; ``None`` skips computing it. When
-            both states are given their dtypes must match.
+            both states are given their dtypes must match. It must not share
+            storage with ``out``.
         cu_seqlens: ``[N+1]`` int32 prefix offsets for packed/varlen input.
             Legacy int64 input is accepted when its endpoint fits in int32.
             ``None`` treats the input as a single sequence. Its last offset may
             be smaller than the physical token dimension to describe suffix
             padding; padding never contributes to the recurrent state.
-        state_pool: Indexed serving cache ``[slots,H,DV,DK]``. When supplied,
-            it is both the initial and final state and is updated in place;
+        state_pool: Indexed serving cache ``[slots,H,DV,DK]``, any strides. When
+            supplied, it is both the initial and final state and is updated in place;
             ``initial_state`` and ``final_state`` must be ``None``.
         state_indices: ``[N]`` contiguous int32 cache slots. Indices must be in
             range and unique within the batch. Serving owns this invariant, so
