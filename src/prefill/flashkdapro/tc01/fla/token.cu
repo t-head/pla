@@ -522,9 +522,12 @@ union alignas(16) Bf16x8 {
 
 // On return packed[pass] holds this thread's rounded qn (pass < 4) or kn
 // (pass >= 4) slice of chunk row (pass % 4) * 16 + threadIdx.x / 16.
+// raw_q/raw_k are [T, kH, kK] views with token strides q_stride/k_stride
+// (elements) over packed head rows; qn/kn are dense.
 __device__ __forceinline__ void chunk_l2_rows(
     const __ppu_bfloat16* __restrict__ raw_q,
     const __ppu_bfloat16* __restrict__ raw_k,
+    int64_t q_stride, int64_t k_stride,
     __ppu_bfloat16* qn, __ppu_bfloat16* kn, int total_tokens,
     Bf16x8 (&packed)[kL2Passes]) {
   const int row_in_pass = static_cast<int>(threadIdx.x) >> 4;
@@ -538,10 +541,11 @@ __device__ __forceinline__ void chunk_l2_rows(
     constexpr int kPassesEach = kL2Passes / 2;
     const int token = chunk_start + (pass % kPassesEach) * kL2RowsPerPass + row_in_pass;
     const __ppu_bfloat16* x = pass < kPassesEach ? raw_q : raw_k;
+    const int64_t stride = pass < kPassesEach ? q_stride : k_stride;
     packed[pass].vector = make_uint4(0u, 0u, 0u, 0u);
     if (token < total_tokens)
       packed[pass].vector = *reinterpret_cast<const uint4*>(
-          x + (static_cast<int64_t>(token) * kH + head) * kK + first_d);
+          x + static_cast<int64_t>(token) * stride + head * kK + first_d);
   }
 #pragma unroll
   for (int pass = 0; pass < kL2Passes; ++pass) {
@@ -742,6 +746,7 @@ __block_size__((kChunkThreads, 1, 1))
 void token_intra_chunk_l2_bf16_d128_bt64_bc16_kernel(
     const __ppu_bfloat16* __restrict__ raw_q,
     const __ppu_bfloat16* __restrict__ raw_k,
+    int64_t q_stride, int64_t k_stride,
     __ppu_bfloat16* qn,
     __ppu_bfloat16* kn,
     const float* __restrict__ g,
@@ -757,7 +762,7 @@ void token_intra_chunk_l2_bf16_d128_bt64_bc16_kernel(
     const int32_t* __restrict__ cu_seqlens,
     int total_tokens) {
   Bf16x8 packed[kL2Passes];
-  chunk_l2_rows(raw_q, raw_k, qn, kn, total_tokens, packed);
+  chunk_l2_rows(raw_q, raw_k, q_stride, k_stride, qn, kn, total_tokens, packed);
   if (w) chunk_prepare_tiles(packed, g, w, u, kg, cu_seqlens, total_tokens);
   if (w) chunk_zero_aqk_upper(aqk, cu_seqlens, total_tokens);
   // The barrier publishes this CTA's qn/kn rows and Aqk zeros; no other CTA
@@ -778,7 +783,8 @@ void token_intra_chunk_l2_bf16_d128_bt64_bc16_kernel(
 // the inter, recompute and output stages. Non-null w/u/kg also fuse the inter
 // stage's operand preparation and diagonal solve.
 extern "C" hggcError_t FLA_JOIN_HEAD(launch_fla_token_l2, FLA_HEADS)(
-    const void* raw_q, const void* raw_k, void* qn, void* kn,
+    const void* raw_q, const void* raw_k, int64_t q_stride, int64_t k_stride,
+    void* qn, void* kn,
     const float* g, const uint16_t* beta_raw, int64_t beta_stride,
     void* aqk, float* akk, void* qg, void* w, void* u, void* kg, float scale,
     const int32_t* cu_seqlens, int total_tokens, int heads,
@@ -791,7 +797,7 @@ extern "C" hggcError_t FLA_JOIN_HEAD(launch_fla_token_l2, FLA_HEADS)(
   fla_glm53_token_intra_cute::token_intra_chunk_l2_bf16_d128_bt64_bc16_kernel
       <<<grid, fla_glm53_token_intra_cute::kChunkThreads, 0, stream>>>(
           static_cast<const __ppu_bfloat16*>(raw_q),
-          static_cast<const __ppu_bfloat16*>(raw_k),
+          static_cast<const __ppu_bfloat16*>(raw_k), q_stride, k_stride,
           static_cast<__ppu_bfloat16*>(qn), static_cast<__ppu_bfloat16*>(kn), g,
           reinterpret_cast<const __ppu_bfloat16*>(beta_raw), beta_stride,
           static_cast<__ppu_bfloat16*>(aqk), akk,

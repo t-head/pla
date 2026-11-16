@@ -72,6 +72,7 @@
 #include "prefill/flashkdapro/common/launch_api.h"
 #include "prefill/flashkdapro/common/bt64_workspace_abi.h"
 #include "prefill/flashkdapro/common/runtime_arch.h"
+#include "prefill/flashkdapro/common/strided_inputs.h"
 #include "op_forge_case.h"
 #include "../../sanity_check.h"
 #include "../../../bypass_exec.h"
@@ -1118,8 +1119,9 @@ py::dict cp_plan_cache_stats() {
     return d;
 }
 
-// flashkda_prepare: Kernel 1. Inputs are the FLA-style [T_total,H,D] contiguous
-// tensors (q,k,g bf16), beta [T_total,H] bf16, A_log [H] f32, dt_bias [H,D] f32.
+// flashkda_prepare: Kernel 1. Inputs are the FLA-style [T_total,H,D] tensors
+// (q,k,g bf16; q/k may carry a token stride over packed rows, g is contiguous),
+// beta [T_total,H] bf16, A_log [H] f32, dt_bias [H,D] f32.
 // Returns the 6 workspace tensors for validation against the torch reference.
 std::vector<torch::Tensor> flashkda_prepare(
     torch::Tensor q, torch::Tensor k, torch::Tensor g, torch::Tensor beta,
@@ -1202,6 +1204,7 @@ std::vector<torch::Tensor> flashkda_prepare(
         reinterpret_cast<const void*>(beta.data_ptr<at::BFloat16>()),
         A_log.data_ptr<float>(), dt_bias.data_ptr<float>(),
         float(scale), gate_scale, T_total, H, int(beta.stride(0)),
+        flashkda::layout::token_stride(q), flashkda::layout::token_stride(k),
         N, total_tiles, cu, is_varlen,
         0, total_tiles, 0, H, nullptr,
         reinterpret_cast<void*>(ws.data_ptr<at::BFloat16>()),
@@ -1260,7 +1263,9 @@ std::vector<torch::Tensor> flashkda_prepare(
 // choice and the final state is only computed when a tensor is supplied. The
 // recurrence always carries the state in bf16 internally (FlashKDA design); an
 // fp32 state is rounded on load and widened on store, at the boundary only.
-void flashkda_fwd(
+// The kernels assume the layouts produced by flashkda_fwd's staging: q/k/v
+// with packed [H,D] rows under a token stride, everything else dense.
+void flashkda_fwd_dense(
     torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g,
     torch::Tensor beta, torch::Tensor A_log, torch::Tensor dt_bias,
     torch::Tensor out,
@@ -1297,6 +1302,9 @@ void flashkda_fwd(
                               scale, lower_bound, cu_seqlens_opt, raw_cu_seqlens_opt);
         sanity_v(sanity, q, v);
         sanity.tensor(out, "out");
+        sanity.check(out.scalar_type() == torch::kBFloat16 && out.sizes() == q.sizes() &&
+                         out.is_contiguous(),
+                     "out must be contiguous bf16 [T,H,128] matching q");
         sanity.check(!sp::overlaps(out, v) && !sp::overlaps(out, beta),
                      "out must not overlap recurrence inputs v/beta");
         const int64_t N = cu_seqlens_opt.has_value() ? cu_seqlens_opt->numel() - 1 : 1;
@@ -1477,6 +1485,9 @@ void flashkda_fwd(
     const bool fp16_state = cp.engage
         && !flashkda::host_runtime::current_device_is_tc01()
         && cp_env_int("PLA_FLASHKDA_CP_STATE_FP16", 0) != 0;
+    const int64_t q_stride = flashkda::layout::token_stride(q);
+    const int64_t k_stride = flashkda::layout::token_stride(k);
+    const int64_t v_stride = flashkda::layout::token_stride(v);
     auto launch_prepare_range = [&](int tile_offset, int tile_count,
                                     int head_offset, int head_count,
                                     int* ready, hggcStream_t target_stream) {
@@ -1487,6 +1498,7 @@ void flashkda_fwd(
             reinterpret_cast<const void*>(beta.data_ptr<at::BFloat16>()),
             A_log.data_ptr<float>(), dt_bias.data_ptr<float>(),
             float(scale), gate_scale, T_total, H, int(beta.stride(0)),
+            q_stride, k_stride,
             N, total_tiles, cu, is_varlen,
             tile_offset, tile_count, head_offset, head_count, ready,
             reinterpret_cast<void*>(ws.data_ptr<at::BFloat16>()),
@@ -1550,7 +1562,7 @@ void flashkda_fwd(
         }
 
         launch_flashkda_bt64_cp_front_tc01(
-            reinterpret_cast<const void*>(v.data_ptr<at::BFloat16>()),
+            reinterpret_cast<const void*>(v.data_ptr<at::BFloat16>()), v_stride,
             reinterpret_cast<const void*>(ws.data_ptr<at::BFloat16>()),
             reinterpret_cast<void*>(bt_ws.data_ptr<at::BFloat16>()),
             reinterpret_cast<void*>(bt_h.data_ptr<at::BFloat16>()),
@@ -1558,7 +1570,7 @@ void flashkda_fwd(
             stream);
 
         launch_flashkda_cp_prescan(
-            reinterpret_cast<const void*>(v.data_ptr<at::BFloat16>()),
+            reinterpret_cast<const void*>(v.data_ptr<at::BFloat16>()), v_stride,
             reinterpret_cast<const void*>(beta.data_ptr<at::BFloat16>()),
             reinterpret_cast<const void*>(ws.data_ptr<at::BFloat16>()),
             reinterpret_cast<void*>(chain_state.data_ptr<at::BFloat16>()),
@@ -1599,7 +1611,7 @@ void flashkda_fwd(
     if (bt64_ready) {
         launch_flashkda_bt64_prefill_tc01(
             reinterpret_cast<void*>(out.data_ptr<at::BFloat16>()),
-            reinterpret_cast<const void*>(v.data_ptr<at::BFloat16>()),
+            reinterpret_cast<const void*>(v.data_ptr<at::BFloat16>()), v_stride,
             reinterpret_cast<const void*>(ws.data_ptr<at::BFloat16>()),
             reinterpret_cast<void*>(bt_ws.data_ptr<at::BFloat16>()),
             reinterpret_cast<void*>(bt_x.data_ptr<at::BFloat16>()),
@@ -1614,7 +1626,7 @@ void flashkda_fwd(
     if (!cp.engage) {
         launch_flashkda_recurrence(
             reinterpret_cast<void*>(out.data_ptr<at::BFloat16>()),
-            reinterpret_cast<const void*>(v.data_ptr<at::BFloat16>()),
+            reinterpret_cast<const void*>(v.data_ptr<at::BFloat16>()), v_stride,
             reinterpret_cast<const void*>(beta.data_ptr<at::BFloat16>()),
             reinterpret_cast<const void*>(ws.data_ptr<at::BFloat16>()),
             init_ptr, final_ptr,
@@ -1641,7 +1653,7 @@ void flashkda_fwd(
     }
 
     launch_flashkda_cp_prescan(
-        reinterpret_cast<const void*>(v.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const void*>(v.data_ptr<at::BFloat16>()), v_stride,
         reinterpret_cast<const void*>(beta.data_ptr<at::BFloat16>()),
         reinterpret_cast<const void*>(ws.data_ptr<at::BFloat16>()),
         chain_state.data_ptr(), fp16_state,
@@ -1657,7 +1669,7 @@ void flashkda_fwd(
 
     launch_flashkda_cp_segment(
         reinterpret_cast<void*>(out.data_ptr<at::BFloat16>()),
-        reinterpret_cast<const void*>(v.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const void*>(v.data_ptr<at::BFloat16>()), v_stride,
         reinterpret_cast<const void*>(beta.data_ptr<at::BFloat16>()),
         reinterpret_cast<const void*>(ws.data_ptr<at::BFloat16>()),
         carries.data_ptr(), fp16_state, final_ptr,
@@ -1666,6 +1678,58 @@ void flashkda_fwd(
         seg_tbl_d.data_ptr<int32_t>(), cp.bv, stream);
     cp_check("segment");
 
+}
+
+// Public entry: dense inputs/states reach flashkda_fwd_dense untouched; other
+// strided views are staged first and a staged final state is published after
+// the last kernel on the same stream.
+void flashkda_fwd(
+    torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g,
+    torch::Tensor beta, torch::Tensor A_log, torch::Tensor dt_bias,
+    torch::Tensor out,
+    double scale, double lower_bound,
+    c10::optional<torch::Tensor> initial_state_opt,
+    c10::optional<torch::Tensor> final_state_opt,
+    c10::optional<torch::Tensor> cu_seqlens_opt,
+    c10::optional<torch::Tensor> state_indices_opt,
+    c10::optional<std::vector<int64_t>> raw_cu_seqlens_opt) {
+    if (pla::bypass::enabled() || !q.is_cuda()) {
+        flashkda_fwd_dense(
+            std::move(q), std::move(k), std::move(v), std::move(g), std::move(beta),
+            std::move(A_log), std::move(dt_bias), std::move(out), scale, lower_bound,
+            std::move(initial_state_opt), std::move(final_state_opt),
+            std::move(cu_seqlens_opt), std::move(state_indices_opt),
+            std::move(raw_cu_seqlens_opt));
+        return;
+    }
+    const c10::cuda::CUDAGuard device_guard(q.device());
+    torch::Tensor initial = initial_state_opt.value_or(torch::Tensor());
+    torch::Tensor final = final_state_opt.value_or(torch::Tensor());
+    torch::Tensor indices = state_indices_opt.value_or(torch::Tensor());
+    const torch::Tensor cu = cu_seqlens_opt.value_or(torch::Tensor());
+    flashkda::layout::check_aliases({&q, &k, &v, &g, &beta, &A_log, &dt_bias},
+                                  out, initial, final);
+    const auto stream = c10::cuda::getCurrentCUDAStream(q.get_device());
+    flashkda::layout::record_tensors(
+        {&q, &k, &v, &g, &beta, &A_log, &dt_bias, &out, &initial, &final, &cu, &indices}, stream);
+    flashkda::layout::stage_inputs(q, k, v, g, beta, A_log, dt_bias);
+    const auto staged = flashkda::layout::stage_states(
+        "flashkda_fwd", initial, final, indices, out);
+    if (staged.active) {
+        auto optional = [](const torch::Tensor& x) {
+            return x.defined() ? c10::optional<torch::Tensor>(x) : c10::nullopt;
+        };
+        initial_state_opt = optional(initial);
+        final_state_opt = optional(final);
+        state_indices_opt = optional(indices);
+    }
+    flashkda_fwd_dense(
+        std::move(q), std::move(k), std::move(v), std::move(g), std::move(beta),
+        std::move(A_log), std::move(dt_bias), std::move(out), scale, lower_bound,
+        std::move(initial_state_opt), std::move(final_state_opt),
+        std::move(cu_seqlens_opt), std::move(state_indices_opt),
+        std::move(raw_cu_seqlens_opt));
+    staged.publish();
 }
 
 // flashkda_cp_stages: debug view of the CP pipeline's first two passes.  Runs
@@ -1779,6 +1843,7 @@ std::vector<torch::Tensor> flashkda_cp_stages(
         reinterpret_cast<const void*>(beta.data_ptr<at::BFloat16>()),
         A_log.data_ptr<float>(), dt_bias.data_ptr<float>(),
         float(scale), gate_scale, T_total, H, int(beta.stride(0)),
+        flashkda::layout::token_stride(q), flashkda::layout::token_stride(k),
         N, total_tiles, cu, is_varlen,
         0, total_tiles, 0, H, nullptr,
         reinterpret_cast<void*>(ws.data_ptr<at::BFloat16>()),
@@ -1788,6 +1853,7 @@ std::vector<torch::Tensor> flashkda_cp_stages(
 
     launch_flashkda_cp_prescan(
         reinterpret_cast<const void*>(v.data_ptr<at::BFloat16>()),
+        flashkda::layout::token_stride(v),
         reinterpret_cast<const void*>(beta.data_ptr<at::BFloat16>()),
         reinterpret_cast<const void*>(ws.data_ptr<at::BFloat16>()),
         chain_state.data_ptr(), fp16_state,

@@ -120,12 +120,15 @@ __global__ void l2norm_bf16_d128_bt16_kernel(
 
 // Fused q+k variant: one launch normalizes two [rows_each, 128] pairs; the first half of the rows selects
 // (x0, y0) and the second half (x1, y1); the per-row math is identical to the single-pair kernel.
+// Rows are (token, head) pairs in token-major order. With Strided the inputs are [T, heads, 128] views
+// with a token stride (x0_stride / x1_stride elements) over packed head rows; the outputs stay dense.
+template <bool Strided>
 __global__ void l2norm2_bf16_d128_bt16_kernel(
     const __ppu_bfloat16* __restrict__ x0,
     __ppu_bfloat16* __restrict__ y0,
     const __ppu_bfloat16* __restrict__ x1,
     __ppu_bfloat16* __restrict__ y1,
-    int64_t rows_each) {
+    int64_t rows_each, int heads, int64_t x0_stride, int64_t x1_stride) {
   using namespace cute;
 
   const int row_in_block = static_cast<int>(threadIdx.x) >> 4;
@@ -145,9 +148,17 @@ __global__ void l2norm2_bf16_d128_bt16_kernel(
                   make_stride(Int<kD>{}, Int<1>{})));
 
   const int first_d = lane_in_row * 8;
+  const __ppu_bfloat16* src;
+  if constexpr (Strided) {
+    const int64_t token = local_row / heads;
+    const int64_t head = local_row - token * heads;
+    src = (second ? x1 : x0) + token * (second ? x1_stride : x0_stride)
+        + head * kD + first_d;
+  } else {
+    src = &gX(local_row, first_d);
+  }
   Bf16x8 packed_input;
-  packed_input.vector =
-      *reinterpret_cast<const uint4*>(&gX(local_row, first_d));
+  packed_input.vector = *reinterpret_cast<const uint4*>(src);
   float values[8];
   float sum_sq = 0.0f;
 #pragma unroll
@@ -191,16 +202,20 @@ hggcError_t launch_fla_l2norm_bf16_d128_bt16(
 
 hggcError_t launch_fla_l2norm2_bf16_d128_bt16(
     const void* x0, void* y0, const void* x1, void* y1, int64_t rows_each,
-    hggcStream_t stream) {
+    int heads, int64_t x0_stride, int64_t x1_stride, hggcStream_t stream) {
   if (rows_each == 0) return hggcSuccess;
   const int64_t rows = 2 * rows_each;
   const dim3 grid(rows / fla_l2_cute::kBlockRows +
                   (rows % fla_l2_cute::kBlockRows != 0));
   const dim3 block(fla_l2_cute::kThreads);
-  fla_l2_cute::l2norm2_bf16_d128_bt16_kernel<<<grid, block, 0, stream>>>(
+  const int64_t packed = int64_t(heads) * fla_l2_cute::kD;
+  auto* kernel = x0_stride == packed && x1_stride == packed
+      ? fla_l2_cute::l2norm2_bf16_d128_bt16_kernel<false>
+      : fla_l2_cute::l2norm2_bf16_d128_bt16_kernel<true>;
+  kernel<<<grid, block, 0, stream>>>(
       static_cast<const __ppu_bfloat16*>(x0),
       static_cast<__ppu_bfloat16*>(y0),
       static_cast<const __ppu_bfloat16*>(x1),
-      static_cast<__ppu_bfloat16*>(y1), rows_each);
+      static_cast<__ppu_bfloat16*>(y1), rows_each, heads, x0_stride, x1_stride);
   return hggcGetLastError();
 }

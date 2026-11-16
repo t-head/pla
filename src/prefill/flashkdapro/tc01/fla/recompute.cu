@@ -131,14 +131,16 @@ CUTE_DEVICE int64_t offset(int64_t token,int head,int feature,int width=128) {
 // Every lane publishes two vectors, including zero-sized masked copies. A
 // valid in-allocation source address is used for drain/invalid rows: cp.async
 // has source size0 then, so the mathematical/pipeline operation is unchanged.
+// input is a [T,H,128] view with token stride `stride` (elements) over packed
+// head rows.
 CUTE_DEVICE void prefetch_bf16(unsigned char* target,uint16_t const* input,
-    int64_t first,int rows,int head,int panel,bool drain=false) {
+    int64_t stride,int64_t first,int rows,int head,int panel,bool drain=false) {
   int tid=threadIdx.x,c=8*(tid%8);
   CUTE_UNROLL
   for(int h=0;h<2;++h) {
     int r=tid/8+32*h;
     bool valid=!drain && r<rows;
-    int64_t source=valid ? offset(first+r,head,64*panel+c) : offset(first,head,0);
+    int64_t source=(first+(valid ? r : 0))*stride+head*128+(valid ? 64*panel+c : 0);
     copy16(target+128*r+2*c,input+source,valid);
   }
   commit();
@@ -314,6 +316,7 @@ CUTE_DEVICE void publish_w_kg(unsigned char* raw_k,unsigned char* raw_g,
 
 extern "C" __global__ __launch_bounds__(256,1) __block_size__((256,1,1))
 void fla_recompute_h8_bf16_d128_bt64(uint16_t const* k,uint16_t const* v,
+    int64_t v_stride,
     uint16_t const* beta_raw,int64_t beta_stride,uint16_t const* A,float const* g,
     uint16_t* w,uint16_t* u,uint16_t* kg,int32_t const* cu,
     int32_t const* indices,int total_tokens,int n) {
@@ -331,11 +334,12 @@ void fla_recompute_h8_bf16_d128_bt64(uint16_t const* k,uint16_t const* v,
   // Raw V owns [0,16K), G1 [16K,32K), K [32K,48K), A [48K,56K) and the
   // rounded U/W operand [56K,64K). Everything but G0 is issued up front;
   // groups in issue order: A, V0, V1, K0, K1, G1, then G0 into raw V.
+  const int64_t k_stride=int64_t(FLA_DEVICE_HEADS(y))*128;
   prefetch_a(shared+49152,A,first,rows,head);
-  prefetch_bf16(shared,v,first,rows,head,0);
-  prefetch_bf16(shared+8192,v,first,rows,head,1);
-  prefetch_bf16(shared+32768,k,first,rows,head,0);
-  prefetch_bf16(shared+40960,k,first,rows,head,1);
+  prefetch_bf16(shared,v,v_stride,first,rows,head,0);
+  prefetch_bf16(shared+8192,v,v_stride,first,rows,head,1);
+  prefetch_bf16(shared+32768,k,k_stride,first,rows,head,0);
+  prefetch_bf16(shared+40960,k,k_stride,first,rows,head,1);
   prefetch_gate(shared+16384,g,first,rows,head,1);
   float b[2];
   CUTE_UNROLL
@@ -377,13 +381,15 @@ extern "C" hggcError_t configure_fla_recompute_h8_bf16_d128_bt64() {
       hggcFuncAttributeMaxDynamicSharedMemorySize,65536);
 }
 extern "C" hggcError_t launch_fla_recompute_h8_bf16_d128_bt64(
-    void const* k,void const* v,uint16_t const* beta_raw,int64_t beta_stride,
+    void const* k,void const* v,int64_t v_stride,
+    uint16_t const* beta_raw,int64_t beta_stride,
     void const* A,float const* g,
     void* w,void* u,void* kg,int32_t const* cu,int32_t const* indices,
     int chunks,int total_tokens,int n,int heads,hggcStream_t stream) {
   if(chunks==0) return hggcSuccess;
   fla_recompute_h8_bf16_d128_bt64<<<dim3(chunks,heads),256,65536,stream>>>(
-      static_cast<uint16_t const*>(k),static_cast<uint16_t const*>(v),beta_raw,beta_stride,
+      static_cast<uint16_t const*>(k),static_cast<uint16_t const*>(v),v_stride,
+      beta_raw,beta_stride,
       static_cast<uint16_t const*>(A),g,static_cast<uint16_t*>(w),
       static_cast<uint16_t*>(u),static_cast<uint16_t*>(kg),cu,indices,total_tokens,n);
   return hggcGetLastError();

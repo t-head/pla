@@ -373,7 +373,8 @@ template <int NThreads, int CtaDV = DV, bool DeferWait = false>
 __device__ __forceinline__ void k2n_load_chunk(
     int actual, int ws_idx, int64_t tok0, int H, int T_total, int head,
     int dv_base, int tid,
-    const BF16* __restrict__ v, const BF16* __restrict__ beta,
+    const BF16* __restrict__ v, int64_t v_stride,
+    const BF16* __restrict__ beta,
     const BF16* __restrict__ ws,
     BF16* sWs, BF16* sV, float* sBeta, bool skip_v = false) {
     // One contiguous slot (kd|qd|kr_swzl|inv|mqk|gt) = fk::WS_SLOT_UNITS bf16.
@@ -388,9 +389,9 @@ __device__ __forceinline__ void k2n_load_chunk(
                             int64_t(DK) * sizeof(BF16));
         if (actual == CH && !skip_v) {
             const BF16* v_src =
-                v + tok0 * int64_t(H) * DV + int64_t(head) * DV + dv_base;
+                v + tok0 * v_stride + int64_t(head) * DV + dv_base;
             k2n_aiu_load_2d_b16(
-                sV, v_src, CtaDV, CH, int64_t(H) * DV * sizeof(BF16));
+                sV, v_src, CtaDV, CH, v_stride * sizeof(BF16));
         }
         k2n_aiu_commit();
     }
@@ -398,7 +399,7 @@ __device__ __forceinline__ void k2n_load_chunk(
         for (int idx = tid; idx < CH * CtaDV; idx += NThreads) {
             int r = idx / CtaDV, c = idx % CtaDV;
             sV[idx] = (r < actual)
-                ? v[(tok0 + r) * int64_t(H) * DV
+                ? v[(tok0 + r) * v_stride
                     + int64_t(head) * DV + dv_base + c] : BF16(0);
         }
     }
@@ -647,7 +648,8 @@ __global__ void __launch_bounds__(
     K2NLaunchConfig<NThreads>::MinBlocksPerCU)
 flashkda_recurrence_nows_kernel(
     BF16* __restrict__ o,             // [T_total, H, DV]
-    const BF16* __restrict__ v,       // [T_total, H, DV]
+    const BF16* __restrict__ v,       // [T_total, H, DV] (token stride v_stride, DV, 1)
+    int64_t v_stride,
     const BF16* __restrict__ beta,    // [H*T_total]
     const BF16* __restrict__ ws,      // merged workspace [nht, WS_SLOT_UNITS]
     K2NStateInAccessor<CompactBf16State> init_state,
@@ -889,7 +891,7 @@ flashkda_recurrence_nows_kernel(
                 // prologue: prime chunk 0 into buffer 0
                 k2n_load_chunk<NThreads, CtaDV, /*DeferWait=*/true>(
                     actual, ws_idx, tok0, H, T_total, head, dv_base, tid,
-                    v, beta, ws, sWs, sV, sBeta, /*skip_v=*/chain_m);
+                    v, v_stride, beta, ws, sWs, sV, sBeta, /*skip_v=*/chain_m);
             }
             if (t + 1 < t_tiles) {
                 const int nxt = (t + 1) % S::PF_STAGES;
@@ -901,7 +903,7 @@ flashkda_recurrence_nows_kernel(
                 float* sBeta_n = reinterpret_cast<float*>(smem + S::O_beta + nxt * S::PF_STRIDE);
                 k2n_load_chunk<NThreads, CtaDV, /*DeferWait=*/true>(
                     actual_n, ws_idx_n, tok0_n, H, T_total, head, dv_base, tid,
-                    v, beta, ws, sWs_n, sV_n, sBeta_n, /*skip_v=*/chain_m);
+                    v, v_stride, beta, ws, sWs_n, sV_n, sBeta_n, /*skip_v=*/chain_m);
                 if (tid == 0) k2n_aiu_wait_group<1>();
             } else {
                 if (tid == 0) k2n_aiu_wait_group<0>();
@@ -913,7 +915,7 @@ flashkda_recurrence_nows_kernel(
             sBeta = reinterpret_cast<float*>(smem + S::O_beta);
             k2n_load_chunk<NThreads, CtaDV>(
                 actual, ws_idx, tok0, H, T_total, head, dv_base, tid,
-                v, beta, ws, sWs, sV, sBeta, /*skip_v=*/chain_m);
+                v, v_stride, beta, ws, sWs, sV, sBeta, /*skip_v=*/chain_m);
             __syncthreads();
         }
 
@@ -1490,7 +1492,7 @@ flashkda_recurrence_nows_kernel(
 }  // namespace flashkda_cute_nows
 
 void launch_flashkda_recurrence_nows(
-    void* o, const void* v, const void* beta,
+    void* o, const void* v, int64_t v_stride, const void* beta,
     const void* ws,
     const void* init_state, void* final_state,
     const int32_t* init_state_indices, const int32_t* final_state_indices,
@@ -1829,7 +1831,7 @@ void launch_flashkda_recurrence_nows(
                     SDV::SMEM_BYTES);
                 kern<<<split_grid, BLOCK_THREADS, SDV::SMEM_BYTES, stream>>>(
                     reinterpret_cast<BF16*>(o),
-                    reinterpret_cast<const BF16*>(v),
+                    reinterpret_cast<const BF16*>(v), v_stride,
                     reinterpret_cast<const BF16*>(beta),
                     reinterpret_cast<const BF16*>(ws),
                     state_in, state_out,
@@ -2037,6 +2039,7 @@ void launch_flashkda_recurrence_nows(
         hggcFuncSetAttribute(kern, hggcFuncAttributeMaxDynamicSharedMemorySize, smem);
         kern<<<grid, BLOCK_THREADS, smem, stream>>>(
             reinterpret_cast<BF16*>(o), reinterpret_cast<const BF16*>(v),
+            v_stride,
             reinterpret_cast<const BF16*>(beta), reinterpret_cast<const BF16*>(ws),
             state_in, state_out,
             T_total, H, N, total_tiles, cu_seqlens, tile_prefix,
@@ -2106,7 +2109,7 @@ void launch_flashkda_recurrence_nows(
 // dedicated leader stay off: the pre_scan static_asserts forbid the latter and
 // CP already has all the parallelism the DK split was invented to buy.
 void launch_flashkda_cp_prescan(
-    const void* v, const void* beta, const void* ws,
+    const void* v, int64_t v_stride, const void* beta, const void* ws,
     void* chain_state, bool fp16_state,
     int T_total, int H, int n_seg, int total_tiles,
     const int* seg_tbl, int bv, hggcStream_t stream) {
@@ -2132,7 +2135,7 @@ void launch_flashkda_cp_prescan(
         dim3 grid(n_seg, H, 2 * (fkn::DV / BV));
         kern<<<grid, NT, SDV::SMEM_BYTES, stream>>>(
             /*o=*/nullptr,
-            reinterpret_cast<const BF16*>(v),
+            reinterpret_cast<const BF16*>(v), v_stride,
             reinterpret_cast<const BF16*>(beta),
             reinterpret_cast<const BF16*>(ws),
             state_in, state_out,
@@ -2152,7 +2155,7 @@ void launch_flashkda_cp_prescan(
 }
 
 void launch_flashkda_cp_segment(
-    void* o, const void* v, const void* beta, const void* ws,
+    void* o, const void* v, int64_t v_stride, const void* beta, const void* ws,
     const void* carries, bool fp16_state, void* final_state,
     const int32_t* final_state_indices, bool final_state_is_fp32,
     int T_total, int H, int n_seg, int total_tiles,
@@ -2186,7 +2189,7 @@ void launch_flashkda_cp_segment(
             dim3 grid(n_seg, H, fkn::DV / BV);
             kern<<<grid, NT, SDV::SMEM_BYTES, stream>>>(
                 reinterpret_cast<BF16*>(o),
-                reinterpret_cast<const BF16*>(v),
+                reinterpret_cast<const BF16*>(v), v_stride,
                 reinterpret_cast<const BF16*>(beta),
                 reinterpret_cast<const BF16*>(ws),
                 state_in, state_out,

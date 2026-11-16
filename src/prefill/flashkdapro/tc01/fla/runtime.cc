@@ -42,6 +42,7 @@
 #include <c10/cuda/CUDACachingAllocator.h>
 #include "launchers.h"
 #include "workspace_layout.h"
+#include "../../common/strided_inputs.h"
 #include <array>
 #include <cmath>
 #include <cstdlib>
@@ -76,10 +77,19 @@ void tensor(const at::Tensor& x, const char* name, at::Device device,
       (x.numel() && reinterpret_cast<uintptr_t>(x.data_ptr()) % alignment))
     throw std::invalid_argument(std::string(name) + ": shape/device/dtype/stride/alignment mismatch");
 }
-bool alias(const at::Tensor& a, const at::Tensor& b) {
-  return a.storage().data_ptr().get() == b.storage().data_ptr().get();
-}
 struct Shape { int64_t t, h, n, chunks; std::vector<int64_t> offsets; };
+// Dense views pass through; other strided inputs and states are staged before validation.
+flashkda::layout::StateStage stage_layout(Arguments& a) {
+  flashkda::layout::check_aliases({&a.q, &a.k, &a.v, &a.g, &a.beta, &a.a_log, &a.dt_bias},
+      a.out, a.pool.defined() ? a.pool : a.initial, a.pool.defined() ? a.pool : a.final);
+  flashkda::layout::stage_inputs(a.q, a.k, a.v, a.g, a.beta, a.a_log, a.dt_bias);
+  if (a.pool.defined() && !flashkda::layout::dense(a.pool, 16) && a.indices.defined() &&
+      !a.initial.defined() && !a.final.defined()) {
+    a.initial = a.final = a.pool;
+    a.pool = at::Tensor();
+  }
+  return flashkda::layout::stage_states("flashkda_tc01_fla", a.initial, a.final, a.indices, a.out);
+}
 Shape validate(Arguments& a) {
   require(a.q.defined() && a.q.is_cuda() && a.q.dim() == 3 && a.q.size(2) == 128, "q must be a device tensor [T,H,128]");
   auto device = a.q.device();
@@ -87,7 +97,12 @@ Shape validate(Arguments& a) {
   dimensions(s.t, s.h, s.n, 0);
   require(std::isfinite(a.scale) && std::abs(a.scale) <= std::numeric_limits<float>::max(), "scale must be a finite FP32");
   require(std::isfinite(a.lower_bound) && a.lower_bound >= -5 && a.lower_bound <= 0, "lower_bound must lie in [-5,0]");
-  for (auto entry : {std::pair{"q", &a.q}, {"k", &a.k}, {"v", &a.v}, {"g", &a.g}, {"out", &a.out}})
+  for (auto entry : {std::pair{"q", &a.q}, {"k", &a.k}, {"v", &a.v}}) {
+    tensor(*entry.second, entry.first, device, at::kBFloat16, {s.t, s.h, 128}, 16, false);
+    require(flashkda::layout::qkv_native(*entry.second),
+            "q/k/v only allow a 16B-aligned int32 token-dim stride over packed rows");
+  }
+  for (auto entry : {std::pair{"g", &a.g}, {"out", &a.out}})
     tensor(*entry.second, entry.first, device, at::kBFloat16, {s.t, s.h, 128});
   tensor(a.beta, "beta", device, at::kBFloat16, {s.t, s.h}, 2, false);
   require(a.beta.stride(1) == 1 && a.beta.stride(0) >= s.h && a.beta.stride(0) <= INT32_MAX,
@@ -129,13 +144,6 @@ Shape validate(Arguments& a) {
   }
   require(!a.initial.defined() || !a.final.defined() || a.initial.scalar_type() == a.final.scalar_type(),
           "initial_state/final_state dtypes must match");
-  for (const auto* x : {&a.q, &a.k, &a.v, &a.g, &a.beta, &a.a_log, &a.dt_bias}) {
-    require(!a.out.numel() || !alias(a.out, *x), "out must not share storage with an input");
-    for (const auto* state : {&a.initial, &a.final})
-      require(!state->defined() || !alias(*state, *x), "state must not share storage with an activation");
-  }
-  for (const auto* state : {&a.initial, &a.final})
-    require(!state->defined() || !alias(*state, a.out), "state must not share storage with out");
   return s;
 }
 
@@ -318,16 +326,9 @@ std::shared_ptr<const Metadata> trusted_plan(const Arguments& a, const Shape& s,
   return value;
 }
 void record_inputs(const Arguments& a, const c10::cuda::CUDAStream& stream) {
-  std::array<const void*, 13> seen{};
-  size_t count = 0;
-  for (const auto* x : {&a.q, &a.k, &a.v, &a.g, &a.beta, &a.a_log, &a.dt_bias, &a.out,
-                        &a.initial, &a.final, &a.cu, &a.indices}) {
-    if (!x->defined() || !x->numel()) continue;
-    auto address = x->storage().data_ptr().get();
-    if (std::find(seen.begin(), seen.begin() + count, address) != seen.begin() + count) continue;
-    seen[count++] = address;
-    c10::cuda::CUDACachingAllocator::recordStream(x->storage().data_ptr(), stream);
-  }
+  flashkda::layout::record_tensors(
+      {&a.q, &a.k, &a.v, &a.g, &a.beta, &a.a_log, &a.dt_bias, &a.out,
+       &a.initial, &a.final, &a.pool, &a.cu, &a.indices}, stream);
 }
 }  // namespace
 
@@ -348,6 +349,11 @@ void forward(Arguments a) {
     }
     return;
   }
+  require(a.q.defined() && a.q.is_cuda(), "q must be a device tensor [T,H,128]");
+  c10::cuda::CUDAGuard guard(a.q.device());
+  const auto stream = c10::cuda::getCurrentCUDAStream(a.q.get_device());
+  record_inputs(a, stream);
+  const auto staged = stage_layout(a);
   const Shape s = validate(a);
   const auto& table = launchers_for(s.h);
   const CpSelection cp = select_cp(a, s, table);
@@ -358,7 +364,6 @@ void forward(Arguments a) {
                : CpAlgorithm::State)
       : CpAlgorithm::Legacy;
   const WorkspaceLayout layout(s.t, s.h, s.n, s.chunks, !a.raw, cp.count);
-  c10::cuda::CUDAGuard guard(a.q.device());
   // FLA dispatch also keeps the branch's value diagnostics; capture only checks metadata and never reads device values.
   const pla::sanity::Context sanity("flashkda_tc01_fla", a.q);
   if (sanity) {
@@ -380,7 +385,6 @@ void forward(Arguments a) {
   const pla::instrument::PrefillRange profile_range(
       s.n, s.t, 128, 128, s.h, s.h, get_dtype_string(a.q), true,
       a.cu.defined() ? &a.cu : nullptr, static_cast<float>(a.lower_bound));
-  const auto stream = c10::cuda::getCurrentCUDAStream(a.q.get_device());
   hggcStreamCaptureStatus status{};
   cuda_check(hggcStreamIsCapturing(reinterpret_cast<hggcStream_t>(stream.stream()), &status), "capture status query failed");
   const bool capture = status != hggcStreamCaptureStatusNone;
@@ -467,16 +471,21 @@ void forward(Arguments a) {
     auto aqk = pointer(arena, layout.aqk), inverse = pointer(arena, layout.inverse);
     auto akkd = pointer<float>(arena, layout.akkd);
     auto w = pointer(arena, layout.w), u = pointer(arena, layout.u), kg = pointer(arena, layout.kg);
+    const int64_t q_stride = flashkda::layout::token_stride(a.q);
+    const int64_t k_stride = flashkda::layout::token_stride(a.k);
+    const int64_t v_stride = flashkda::layout::token_stride(a.v);
     if (!prepared_n1)
       cuda_check(launch_fla_l2norm2_bf16_d128_bt16(a.q.data_ptr(), qn, a.k.data_ptr(), kn,
-                                                   s.t * s.h, reinterpret_cast<hggcStream_t>(stream.stream())), "L2 q+k");
+                                                   s.t * s.h, s.h, q_stride, k_stride,
+                                                   reinterpret_cast<hggcStream_t>(stream.stream())), "L2 q+k");
     cuda_check(table.gate(a.g.data_ptr(), a.a_log.data_ptr<float>(), a.dt_bias.data_ptr<float>(), gate,
                          s.t, cu, chunks, s.n, s.chunks, s.h, a.lower_bound, reinterpret_cast<hggcStream_t>(stream.stream())), "gate");
     if (prepared_n1) {
       TORCH_INTERNAL_ASSERT(layout.w.bytes == s.t * s.h * 128 * 2 &&
                             layout.u.bytes == layout.w.bytes &&
                             layout.kg.bytes == layout.w.bytes && s.chunks <= s.t / 64);
-      cuda_check(table.token_l2(a.q.data_ptr(), a.k.data_ptr(), qn, kn, gate, beta_raw, beta_stride,
+      cuda_check(table.token_l2(a.q.data_ptr(), a.k.data_ptr(), q_stride, k_stride, qn, kn, gate,
+                          beta_raw, beta_stride,
                           aqk, akkd, qg, w, u, kg, a.scale, cu, s.t, s.h,
                           reinterpret_cast<hggcStream_t>(stream.stream())), "L2 + token + prepare");
     } else {
@@ -491,7 +500,8 @@ void forward(Arguments a) {
       cuda_check(table.inter(qn, kn, gate, beta_raw, beta_stride, akkd, aqk, inverse, a.scale, cu, chunks,
                             s.chunks, s.t, s.n, s.h, reinterpret_cast<hggcStream_t>(stream.stream())), "inter");
     }
-    cuda_check(table.recompute(kn, a.v.data_ptr(), beta_raw, beta_stride, inverse, gate, w, u, kg, cu, chunks,
+    cuda_check(table.recompute(kn, a.v.data_ptr(), v_stride, beta_raw, beta_stride, inverse, gate, w, u, kg,
+                              cu, chunks,
                               s.chunks, s.t, s.n, s.h, reinterpret_cast<hggcStream_t>(stream.stream())), "recompute");
     if (cp.active()) {
       auto bias = pointer<float>(arena, layout.cp_bias);
@@ -539,6 +549,7 @@ void forward(Arguments a) {
     if (a.indices.defined()) a.final.index_copy_(0, a.indices.to(at::kLong), publish);
     else a.final.copy_(publish);
   }
+  staged.publish();
 }
 
 std::vector<at::Tensor> metadata_only(const at::Tensor& input, int64_t tokens, int64_t heads) {
