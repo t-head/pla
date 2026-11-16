@@ -1703,10 +1703,16 @@ void flashkda_fwd(
         return;
     }
     const c10::cuda::CUDAGuard device_guard(q.device());
-    flashkda::layout::stage_inputs(q, k, v, g, beta, A_log, dt_bias);
     torch::Tensor initial = initial_state_opt.value_or(torch::Tensor());
     torch::Tensor final = final_state_opt.value_or(torch::Tensor());
     torch::Tensor indices = state_indices_opt.value_or(torch::Tensor());
+    const torch::Tensor cu = cu_seqlens_opt.value_or(torch::Tensor());
+    flashkda::layout::check_aliases({&q, &k, &v, &g, &beta, &A_log, &dt_bias},
+                                  out, initial, final);
+    const auto stream = c10::cuda::getCurrentCUDAStream(q.get_device());
+    flashkda::layout::record_tensors(
+        {&q, &k, &v, &g, &beta, &A_log, &dt_bias, &out, &initial, &final, &cu, &indices}, stream);
+    flashkda::layout::stage_inputs(q, k, v, g, beta, A_log, dt_bias);
     const auto staged = flashkda::layout::stage_states(
         "flashkda_fwd", initial, final, indices, out);
     if (staged.active) {

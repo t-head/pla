@@ -77,14 +77,13 @@ void tensor(const at::Tensor& x, const char* name, at::Device device,
       (x.numel() && reinterpret_cast<uintptr_t>(x.data_ptr()) % alignment))
     throw std::invalid_argument(std::string(name) + ": shape/device/dtype/stride/alignment mismatch");
 }
-bool alias(const at::Tensor& a, const at::Tensor& b) {
-  return a.storage().data_ptr().get() == b.storage().data_ptr().get();
-}
 struct Shape { int64_t t, h, n, chunks; std::vector<int64_t> offsets; };
 // Dense views pass through; other strided inputs and states are staged before validation.
 flashkda::layout::StateStage stage_layout(Arguments& a) {
+  flashkda::layout::check_aliases({&a.q, &a.k, &a.v, &a.g, &a.beta, &a.a_log, &a.dt_bias},
+      a.out, a.pool.defined() ? a.pool : a.initial, a.pool.defined() ? a.pool : a.final);
   flashkda::layout::stage_inputs(a.q, a.k, a.v, a.g, a.beta, a.a_log, a.dt_bias);
-  if (a.pool.defined() && !a.pool.is_contiguous() && a.indices.defined() &&
+  if (a.pool.defined() && !flashkda::layout::dense(a.pool, 16) && a.indices.defined() &&
       !a.initial.defined() && !a.final.defined()) {
     a.initial = a.final = a.pool;
     a.pool = at::Tensor();
@@ -145,13 +144,6 @@ Shape validate(Arguments& a) {
   }
   require(!a.initial.defined() || !a.final.defined() || a.initial.scalar_type() == a.final.scalar_type(),
           "initial_state/final_state dtypes must match");
-  for (const auto* x : {&a.q, &a.k, &a.v, &a.g, &a.beta, &a.a_log, &a.dt_bias}) {
-    require(!a.out.numel() || !alias(a.out, *x), "out must not share storage with an input");
-    for (const auto* state : {&a.initial, &a.final})
-      require(!state->defined() || !alias(*state, *x), "state must not share storage with an activation");
-  }
-  for (const auto* state : {&a.initial, &a.final})
-    require(!state->defined() || !alias(*state, a.out), "state must not share storage with out");
   return s;
 }
 
@@ -334,16 +326,9 @@ std::shared_ptr<const Metadata> trusted_plan(const Arguments& a, const Shape& s,
   return value;
 }
 void record_inputs(const Arguments& a, const c10::cuda::CUDAStream& stream) {
-  std::array<const void*, 13> seen{};
-  size_t count = 0;
-  for (const auto* x : {&a.q, &a.k, &a.v, &a.g, &a.beta, &a.a_log, &a.dt_bias, &a.out,
-                        &a.initial, &a.final, &a.cu, &a.indices}) {
-    if (!x->defined() || !x->numel()) continue;
-    auto address = x->storage().data_ptr().get();
-    if (std::find(seen.begin(), seen.begin() + count, address) != seen.begin() + count) continue;
-    seen[count++] = address;
-    c10::cuda::CUDACachingAllocator::recordStream(x->storage().data_ptr(), stream);
-  }
+  flashkda::layout::record_tensors(
+      {&a.q, &a.k, &a.v, &a.g, &a.beta, &a.a_log, &a.dt_bias, &a.out,
+       &a.initial, &a.final, &a.pool, &a.cu, &a.indices}, stream);
 }
 }  // namespace
 
@@ -364,6 +349,10 @@ void forward(Arguments a) {
     }
     return;
   }
+  require(a.q.defined() && a.q.is_cuda(), "q must be a device tensor [T,H,128]");
+  c10::cuda::CUDAGuard guard(a.q.device());
+  const auto stream = c10::cuda::getCurrentCUDAStream(a.q.get_device());
+  record_inputs(a, stream);
   const auto staged = stage_layout(a);
   const Shape s = validate(a);
   const auto& table = launchers_for(s.h);
@@ -375,7 +364,6 @@ void forward(Arguments a) {
                : CpAlgorithm::State)
       : CpAlgorithm::Legacy;
   const WorkspaceLayout layout(s.t, s.h, s.n, s.chunks, !a.raw, cp.count);
-  c10::cuda::CUDAGuard guard(a.q.device());
   // FLA dispatch also keeps the branch's value diagnostics; capture only checks metadata and never reads device values.
   const pla::sanity::Context sanity("flashkda_tc01_fla", a.q);
   if (sanity) {
@@ -397,7 +385,6 @@ void forward(Arguments a) {
   const pla::instrument::PrefillRange profile_range(
       s.n, s.t, 128, 128, s.h, s.h, get_dtype_string(a.q), true,
       a.cu.defined() ? &a.cu : nullptr, static_cast<float>(a.lower_bound));
-  const auto stream = c10::cuda::getCurrentCUDAStream(a.q.get_device());
   hggcStreamCaptureStatus status{};
   cuda_check(hggcStreamIsCapturing(reinterpret_cast<hggcStream_t>(stream.stream()), &status), "capture status query failed");
   const bool capture = status != hggcStreamCaptureStatusNone;

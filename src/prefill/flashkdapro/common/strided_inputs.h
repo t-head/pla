@@ -47,10 +47,15 @@
 #pragma once
 
 #include <ATen/ATen.h>
+#include <c10/cuda/CUDACachingAllocator.h>
+#include <c10/cuda/CUDAStream.h>
 
 #include "../../sanity_check.h"
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
+#include <initializer_list>
 #include <limits>
 
 namespace flashkda::layout {
@@ -106,7 +111,45 @@ inline void stage_inputs(at::Tensor& q, at::Tensor& k, at::Tensor& v, at::Tensor
 
 inline bool same_storage(const at::Tensor& a, const at::Tensor& b) {
     return a.defined() && b.defined() && a.numel() && b.numel() &&
+           a.has_storage() && b.has_storage() &&
            a.storage().data_ptr().get() == b.storage().data_ptr().get();
+}
+
+// Check the caller's views before clones/gathers hide aliases from validation.
+// Activation storage is read-only; only exact in-place state views may overlap.
+inline void check_aliases(std::initializer_list<const at::Tensor*> inputs,
+                          const at::Tensor& out, const at::Tensor& initial,
+                          const at::Tensor& final) {
+    for (const auto* x : inputs) {
+        TORCH_CHECK(!same_storage(out, *x), "out must not share storage with an input");
+        TORCH_CHECK(!same_storage(initial, *x),
+                    "initial_state must not share storage with an activation");
+        TORCH_CHECK(!same_storage(final, *x),
+                    "final_state must not share storage with an activation");
+    }
+    TORCH_CHECK(!same_storage(initial, out), "initial_state must not share storage with out");
+    TORCH_CHECK(!same_storage(final, out), "final_state must not share storage with out");
+    if (same_storage(initial, final))
+        TORCH_CHECK(!pla::sanity::prefill::overlaps(initial, final) ||
+                        pla::sanity::prefill::same_view(initial, final),
+                    pla::sanity::enabled() ? "PLA_SANITY_CHECK: " : "",
+                    "initial/final state may alias only as the exact same tensor view");
+}
+
+// Staging and writeback also consume the original allocations asynchronously.
+// Record each caller storage once, including state pools, before replacing views.
+inline void record_tensors(std::initializer_list<const at::Tensor*> tensors,
+                           const c10::cuda::CUDAStream& stream) {
+    std::array<const void*, 13> seen{};
+    size_t count = 0;
+    for (const auto* x : tensors) {
+        if (!x->defined() || !x->is_cuda() || !x->numel() || !x->has_storage()) continue;
+        auto address = x->storage().data_ptr().get();
+        if (std::find(seen.begin(), seen.begin() + count, address) != seen.begin() + count) continue;
+        TORCH_INTERNAL_ASSERT(count < seen.size());
+        seen[count++] = address;
+        c10::cuda::CUDACachingAllocator::recordStream(x->storage().data_ptr(), stream);
+    }
 }
 
 // A strided final state computed into dense scratch, published by the entry
@@ -129,8 +172,8 @@ struct StateStage {
 // sanity-checked before the gather because the kernels no longer see it.
 inline StateStage stage_states(const char* operation, at::Tensor& initial, at::Tensor& final,
                                at::Tensor& indices, const at::Tensor& out) {
-    const bool initial_dense = !initial.defined() || initial.is_contiguous();
-    const bool final_dense = !final.defined() || final.is_contiguous();
+    const bool initial_dense = !initial.defined() || dense(initial, 16);
+    const bool final_dense = !final.defined() || dense(final, 16);
     if (initial_dense && final_dense) return {};
     for (const auto* state : {&initial, &final})
         if (state->defined() && (!state->is_cuda() || state->dim() != 4)) return {};
