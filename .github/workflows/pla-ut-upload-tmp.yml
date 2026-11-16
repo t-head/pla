@@ -1,0 +1,214 @@
+name: PLA temporary wheel upload
+
+# Build a wheel on each PPU board, run the functional check-in suite, then
+# publish the wheels to a temporary directory. Publishing is gated on the
+# suite and on an explicit dispatch input; a failed run keeps the wheel as a
+# build artifact only. Requires RELEASE_USERNAME / RELEASE_TOKEN secrets
+# (TEMPLATE_TOKEN for private templates).
+on:
+  schedule:
+    # Staggered from the DeepGEMM temporary upload nightly to avoid fighting
+    # over the same board pool.
+    - cron: '30 13 * * *'
+  workflow_dispatch:
+    inputs:
+      matrix:
+        description: "JSON array of PPU runner board types"
+        required: false
+        type: string
+        default: '["ZW-M890P"]'
+      push:
+        description: "Whether to trigger the temporary wheel upload job"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pla-ut-upload-tmp-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SAIL_IMAGE: download.t-head.cn/docker_release/pytorch:sdk2.2.0-2.10.0-ubuntu24.04-hggcrt3-py312-20261005
+
+jobs:
+  build-test:
+    name: Build & Test (${{ matrix.board }})
+    runs-on: k8s-runner-group-cpu-thead
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 900
+    strategy:
+      fail-fast: false
+      matrix:
+        board: ${{ fromJson(inputs.matrix || '["ZW-M890P"]') }}
+    env:
+      REPORT_ROOT: /wl_nas/devops/pla-ci-tmp/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.board }}
+      WORKER_REPORT_ROOT: /mnt/wl_nas/devops/pla-ci-tmp/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.board }}
+    steps:
+      - name: Validate board selection
+        env:
+          BOARD: ${{ matrix.board }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$BOARD" | grep -Eq '^[A-Za-z0-9._-]+$'; then
+            echo "invalid board value: $BOARD" >&2
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Sync PLA submodules
+        run: |
+          git submodule sync --recursive
+          git submodule update --init --recursive
+      - name: Validate CI assets
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python3 .github/workflows/scripts/test_ci_functional.py
+      - name: Build and Test on PPU
+        id: ppu-test
+        uses: t-head/ci-infra/cluster-run@main
+        with:
+          image: ${{ env.SAIL_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 1
+          node_selector: board-type=${{ matrix.board }}
+          namespace: ppu-sched
+          timeout_minutes: 840
+          cleanup_policy: always
+          dmesg_policy: on_failure
+          extra_env: PLA_REPORT_ROOT=${{ env.WORKER_REPORT_ROOT }},PLA_TEST_REVISION=${{ github.sha }},PLA_CI_BOARD=${{ matrix.board }}
+          command: |
+            set -Eeo pipefail
+            err_trap() {
+              local code=$? line=${1:-$LINENO}
+              echo "worker command failed: code=$code line=$line"
+              if [ -n "${PLA_REPORT_ROOT:-}" ]; then
+                mkdir -p "$PLA_REPORT_ROOT"
+                echo "code=$code line=$line" > "$PLA_REPORT_ROOT/worker_failure.txt"
+              fi
+              exit "$code"
+            }
+            trap 'err_trap $LINENO' ERR
+            mkdir -p "$PLA_REPORT_ROOT"
+            exec > >(tee "$PLA_REPORT_ROOT/worker.log") 2>&1
+
+            cd /workspace/source
+            unset PIP_INDEX_URL PYTHONPATH PLA_BUILD_NAMESPACE PPU_ACTLIZE_DIR
+            export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
+            source /usr/local/PPU_SDK/envsetup.sh
+            set -u
+            export PPU_SDK_DIR=/usr/local/PPU_SDK
+            export PPU_ACTLIZE_DIR=/workspace/source/3rdparty/actlize
+            "$PPU_SDK_DIR/bin/hgcc" --version
+            python -m pip install setuptools==69.5.1 setuptools-scm==9.2.2 packaging==24.2 wheel==0.45.1 pybind11==2.13.6 ninja==1.11.1.4 numpy==1.26.4 pandas==2.2.3 pytest==8.3.5 einops==0.8.1
+            python -c 'import torch, triton; print(torch.__version__, triton.__version__)'
+            python .github/workflows/scripts/run_functional.py --list
+
+            export MAX_JOBS=20
+            export HGCC_THREADS=2
+            BUILD_ROOT=$(mktemp -d /tmp/pla-build.XXXXXX)
+            timeout --signal=TERM --kill-after=30s 180m python setup.py bdist_wheel --bdist-dir "$BUILD_ROOT/wheel" --dist-dir "$BUILD_ROOT/dist" 2>&1 | tee "$PLA_REPORT_ROOT/build.log"
+            wheels=("$BUILD_ROOT"/dist/pla-*.whl)
+            if [ "${#wheels[@]}" -ne 1 ] || [ ! -f "${wheels[0]}" ]; then
+              echo "expected exactly one pla wheel; found ${#wheels[@]}"
+              ls -l "$BUILD_ROOT/dist" || true
+              exit 1
+            fi
+
+            # Stage the wheel on NAS before the suite so a failed run still
+            # leaves an uploadable artifact behind.
+            mkdir -p "$PLA_REPORT_ROOT/wheels"
+            cp "${wheels[0]}" "$PLA_REPORT_ROOT/wheels/"
+
+            python -m pip install --force-reinstall --no-deps "${wheels[0]}"
+            result=0
+            for phase in decode prefill; do
+              python .github/workflows/scripts/run_functional.py \
+                --board "$PLA_CI_BOARD" \
+                --phase "$phase" \
+                --output "$PLA_REPORT_ROOT/$phase" \
+                --budget-seconds 18000 || result=1
+            done
+            exit "$result"
+      - name: Upload wheel (${{ matrix.board }})
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: pla-wheel-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.board }}
+          path: /wl_nas/devops/pla-ci-tmp/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.board }}/wheels/*.whl
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+          retention-days: 14
+      - name: Collect reports from shared NAS
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          destination=".ci-results/${{ matrix.board }}"
+          mkdir -p "$destination"
+          if [ -d "$REPORT_ROOT" ]; then
+            cp -a "$REPORT_ROOT/." "$destination/"
+          fi
+      - name: Board results (${{ matrix.board }})
+        if: always()
+        env:
+          PLA_TEST_RESULT: ${{ steps.ppu-test.outcome }}
+        run: python3 .github/workflows/scripts/run_functional.py --summary-root .ci-results --board "${{ matrix.board }}"
+
+  merge:
+    name: Merge board wheel artifacts
+    # Every board must pass its check-in suite before anything is merged.
+    needs: build-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      artifact_name: ${{ steps.artifact-name.outputs.artifact_name }}
+    steps:
+      - name: Set merged artifact name
+        id: artifact-name
+        shell: bash
+        run: |
+          echo "artifact_name=pla-wheels-${{ github.run_id }}-${{ github.run_attempt }}" >> "$GITHUB_OUTPUT"
+
+      - name: Merge wheel artifacts
+        uses: actions/upload-artifact/merge@v4
+        with:
+          name: ${{ steps.artifact-name.outputs.artifact_name }}
+          pattern: pla-wheel-${{ github.run_id }}-${{ github.run_attempt }}-*
+          compression-level: 0
+          delete-merged: false
+
+  push:
+    name: Call temporary wheel upload template
+    needs: merge
+    # Gated on the workflow_dispatch `push` input; schedule runs leave it unset (skipped).
+    if: ${{ inputs.push }}
+    uses: t-head/ci-infra/.github/workflows/push-tmp-wheel.yml@main
+    with:
+      # run_attempt moves when only the publishing job is rerun.
+      artifact_name: ${{ needs.merge.outputs.artifact_name }}
+      template_repository: t-head/ci-infra
+      template_ref: main
+    secrets:
+      release_username: ${{ secrets.RELEASE_USERNAME }}
+      release_token: ${{ secrets.RELEASE_TOKEN }}
+      template_token: ${{ secrets.TEMPLATE_TOKEN }}
+
+  result:
+    name: Show batch directory URL
+    needs: push
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Write to logs and job summary
+        shell: bash
+        env:
+          UPLOAD_URL: ${{ needs.push.outputs.upload_url }}
+        run: |
+          set -euo pipefail
+          printf 'Batch directory: %s\n' "$UPLOAD_URL" | tee -a "$GITHUB_STEP_SUMMARY"
