@@ -337,6 +337,34 @@ class FunctionalCITests(unittest.TestCase):
         self.assertNotIn("pla-basic-test-ppu.yml", entry)
         self.assertFalse((runner.ROOT / ".github/workflows/pla-basic-test-ppu.yml").exists())
 
+    def test_temporary_upload_workflow_is_gated_and_address_free(self):
+        # The temporary upload pipeline never runs on PRs, publishes only when
+        # an operator sets the push input after every board passed its suite,
+        # and hardcodes no publishing address.
+        workflow = (runner.ROOT / ".github/workflows/pla-ut-upload-tmp.yml").read_text()
+        self.assertIn("schedule:", workflow)
+        self.assertIn("workflow_dispatch:", workflow)
+        self.assertNotIn("pull_request:", workflow)
+        self.assertIn("group: pla-ut-upload-tmp-${{ github.ref }}", workflow)
+        # Board values come from a dispatch input, so they pass a plain-token
+        # whitelist before being interpolated into paths or selectors.
+        self.assertIn("BOARD: ${{ matrix.board }}", workflow)
+        self.assertIn("'^[A-Za-z0-9._-]+$'", workflow)
+        worker = workflow.split("          command: |\n", 1)[1].split("      - name:", 1)[0]
+        # The wheel is staged on NAS before the suite so a failed run still
+        # leaves an uploadable artifact; the suite result fails the job, so a
+        # failed board skips merge and publishing.
+        self.assertLess(worker.index('mkdir -p "$PLA_REPORT_ROOT/wheels"'),
+                        worker.index("for phase in decode prefill"))
+        self.assertIn('exit "$result"', worker)
+        self.assertIn("needs: build-test", workflow)
+        self.assertIn("uses: actions/upload-artifact/merge@v4", workflow)
+        self.assertIn("if: ${{ inputs.push }}", workflow)
+        self.assertIn("uses: t-head/ci-infra/.github/workflows/push-tmp-wheel.yml@main", workflow)
+        for secret in ("RELEASE_USERNAME", "RELEASE_TOKEN", "TEMPLATE_TOKEN"):
+            self.assertIn("secrets." + secret, workflow)
+        self.assertNotIn("://", workflow)
+
     def test_entry_requires_serial_review_gates(self):
         workflow = (runner.ROOT / ".github/workflows/ci.yml").read_text()
         self.assertIn("branches: [master]", workflow)
