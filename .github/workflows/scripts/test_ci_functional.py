@@ -350,6 +350,10 @@ class FunctionalCITests(unittest.TestCase):
         # whitelist before being interpolated into paths or selectors.
         self.assertIn("BOARD: ${{ matrix.board }}", workflow)
         self.assertIn("'^[A-Za-z0-9._-]+$'", workflow)
+        # The k8s self-hosted runner runs default-shell steps with /bin/sh,
+        # which rejects bash-only options such as pipefail.
+        validate = workflow.split("- name: Validate board selection", 1)[1].split("      - ", 1)[0]
+        self.assertIn("shell: bash", validate)
         worker = workflow.split("          command: |\n", 1)[1].split("      - name:", 1)[0]
         # The wheel is staged on NAS before the suite so a failed run still
         # leaves an uploadable artifact; the suite result fails the job, so a

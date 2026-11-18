@@ -49,6 +49,9 @@ jobs:
       WORKER_REPORT_ROOT: /mnt/wl_nas/devops/pla-ci-tmp/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.board }}
     steps:
       - name: Validate board selection
+        # The k8s self-hosted runner executes default-shell steps with /bin/sh,
+        # which rejects bash-only options such as pipefail.
+        shell: bash
         env:
           BOARD: ${{ matrix.board }}
         run: |
