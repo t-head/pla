@@ -53,7 +53,6 @@ from . import _C as flashqla_cute
 from .private.tc02_folded_policy import folded_schedule
 from .private.cp_preprocess import (
     calc_cp_seqs,
-    tc01_overlap_warmup_threshold,
     _cuda_device_properties,
     _cp_plan_cache,
 )
@@ -714,22 +713,10 @@ def chunk_gated_delta_rule_fwd(
         ht = (initial_state[initial_state_indices] if indexed_state else final) if output_final_state else None
         return g_cum_32, A, o, None, ht
 
-    production_overlap_threshold = None
-    if (auto_cp and not use_folded and overlap_warmup_threshold is None and
-            not force_tc01_cp_candidate):
-        production_overlap_threshold = tc01_overlap_warmup_threshold(
-            cu32, raw_cu, CHUNK_SIZE, H, Hg,
-            use_raw_gating=use_raw_gating,
-            indexed_state=indexed_state,
-            has_initial_state=initial_state is not None,
-        )
-
     cp_plan = (
         calc_cp_seqs(
             cu32, CHUNK_SIZE, H, raw_cu, num_k_heads=Hg,
             tc01_force_candidate=force_tc01_cp_candidate,
-            tc01_enable_overlap_candidate=(
-                production_overlap_threshold is not None),
             tc01_packed_raw_gate=use_raw_gating,
             folded_prefill=use_folded,
             folded_max_local_chunks=folded_max_local_chunks or 0,
@@ -748,11 +735,6 @@ def chunk_gated_delta_rule_fwd(
         if use_cp:
             cp_cu_i32 = cp_cu_seqlens.to(torch.int32)
             cp_batch = cp_cu_i32.numel() - 1
-            effective_overlap_threshold = (
-                overlap_warmup_threshold
-                if overlap_warmup_threshold is not None
-                else production_overlap_threshold
-            )
             # A fresh sequence starts at zero, but earlier tokens can create
             # the entire state consumed by a continuation segment. Log decay
             # alone bounds neither that state's magnitude nor relative error.
@@ -769,7 +751,7 @@ def chunk_gated_delta_rule_fwd(
                 fallback_mask = torch.ones(
                     (cp_batch, H), dtype=torch.int8, device=q.device)
             use_overlap_warmup = (
-                effective_overlap_threshold is not None and
+                overlap_warmup_threshold is not None and
                 (indexed_state or initial_state is None)
             )
             if use_overlap_warmup:

@@ -129,6 +129,62 @@ def test_qwen38_real_gate_raw_indexed_state_prefill(auto_cp):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a PPU device")
+@pytest.mark.parametrize("layout,tokens,heads,state_mode,dispatch", [
+    ("packed", 4173, 16, "indexed", "serial"),
+    ("packed", 4173, 16, "dense", "serial"),
+    ("packed", 4173, 16, "dense", "regular"),
+    ("packed", 15900, 8, "indexed", "serial"),
+    ("packed", 4173, 16, "indexed", "overlap"),
+    ("raw", 4173, 16, "none", "serial"),
+    ("raw", 4173, 16, "dense", "serial"),
+    ("raw", 4173, 16, "dense", "regular"),
+    ("raw", 8192, 16, "none", "overlap"),
+    ("activated", 8192, 16, "none", "serial"),
+    ("activated", 15900, 8, "none", "regular"),
+])
+def test_tc01_prefill_cp_dispatch(layout, tokens, heads, state_mode, dispatch):
+    from pla.prefill.flashqla import ops
+
+    if torch.cuda.get_device_capability() != (8, 0):
+        pytest.skip("requires tc01 FlashQLA")
+    offsets = (0, tokens)
+    cu = torch.tensor(offsets, device="cuda", dtype=torch.int32)
+    gate = torch.zeros(tokens, heads, device="cuda", dtype=torch.bfloat16)
+    bias = torch.zeros(heads, device="cuda", dtype=torch.float32)
+    state = None
+    indices = None
+    if state_mode != "none":
+        state = torch.ones(1, heads, D, D, device="cuda", dtype=torch.float32)
+    if state_mode == "indexed":
+        indices = torch.tensor([0], device="cuda", dtype=torch.int32)
+    options = dict(
+        cu_seqlens=cu, raw_cu_seqlens=offsets, initial_state=state,
+        initial_state_indices=indices, force_tc01_cp_candidate=dispatch != "serial",
+        overlap_warmup_threshold=-4.0 if dispatch == "overlap" else None,
+    )
+    with patch.object(ops.flashqla_cute, "fused_fwd",
+                      wraps=ops.flashqla_cute.fused_fwd) as fused:
+        if layout == "packed":
+            qkv = gate.new_zeros((tokens, (heads + 2 * HG) * D))
+            ops.gdn_prefill_packed_qkv_fwd(
+                qkv, gate, gate, bias, bias, num_qk_heads=HG, num_v_heads=heads, **options)
+        else:
+            q = gate.new_zeros((1, tokens, HG, D))
+            v = gate.new_zeros((1, tokens, heads, D))
+            if layout == "raw":
+                options.update(raw_gate_a=gate, raw_beta_b=gate, A_log=bias, dt_bias=bias)
+                g = None
+            else:
+                g = gate.float().unsqueeze(0)
+            chunk_gated_delta_rule_fwd(q, q, v, g, g, normalize_qk=True, **options)
+
+    fused.assert_called_once()
+    assert (fused.call_args.args[7] is not None) == (dispatch != "serial")
+    assert (fused.call_args.args[19] is not None) == (dispatch == "overlap")
+    assert (fused.call_args.args[20] is not None) == (dispatch == "overlap")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a PPU device")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("indexed", [True, False])
