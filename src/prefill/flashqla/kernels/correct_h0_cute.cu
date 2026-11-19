@@ -62,7 +62,10 @@
 
 #include "flashqla_cute_traits.cuh"
 
-namespace flashqla_cute {
+#ifndef FLASHQLA_CORRECT_NAMESPACE
+#define FLASHQLA_CORRECT_NAMESPACE flashqla_cute
+#endif
+namespace FLASHQLA_CORRECT_NAMESPACE {
 
 namespace fq = flashqla;
 
@@ -172,7 +175,8 @@ __device__ __forceinline__ int64_t ch0_off(
            (int64_t)dk * CH0_DV + dv_tile * CH0_DVT + dv;
 }
 
-template <typename Element, int NGRP, bool Pipe = false, int GW = 4>
+template <typename Element, int NGRP, bool Pipe = false, int GW = 4,
+          int TilePadding = 0, typename FirstSegment = void>
 __global__ void __launch_bounds__(32 * GW * NGRP, 1)
 correct_h0_cute_kernel(
     void* __restrict__ cp_h0,
@@ -192,6 +196,8 @@ correct_h0_cute_kernel(
     constexpr int HT_VECS = CH0_DK * CH0_DVT / 8 / WG;   // int4 per thread
     constexpr int OUT_VECS = CH0_DK * CH0_DVT / 4 / WG;  // float4 per thread
     static_assert(GW == 4 || (GW == 8 && Pipe), "unsupported warp group");
+    static_assert(!Pipe || TilePadding == 0, "pipe owns its padded layout");
+    constexpr int TilePitch = CH0_DK + TilePadding;
     const int tiles_per_head = CH0_DV / CH0_DVT;      // 4
     const int blocks_per_head = tiles_per_head / NGRP;
     const int blocks_per_batch = H * blocks_per_head;
@@ -234,8 +240,8 @@ correct_h0_cute_kernel(
     // into registers, and stages ht/output tiles for coalesced global access;
     // the arithmetic and its order are unchanged.
     extern __shared__ char smem[];
-    constexpr int MT_ELEMS = Pipe ? CH0_DK * CH0_K_LD : CH0_DK * CH0_DK;
-    constexpr int HT_T_ELEMS = Pipe ? CH0_DVT * CH0_K_LD : CH0_DVT * CH0_DK;
+    constexpr int MT_ELEMS = Pipe ? CH0_DK * CH0_K_LD : CH0_DK * TilePitch;
+    constexpr int HT_T_ELEMS = Pipe ? CH0_DVT * CH0_K_LD : CH0_DVT * TilePitch;
     Element* mt_buf = reinterpret_cast<Element*>(smem);
     Element* hT_buf = mt_buf + (Pipe ? 2 : 1) * MT_ELEMS +
         group * (Pipe ? CH0_PIPE_GRP_BYTES / 2 : HT_T_ELEMS);
@@ -425,6 +431,12 @@ correct_h0_cute_kernel(
 
     for (int i_s = 0; i_s < num_iters; ++i_s) {
         int cp_idx = seq_start + i_s;
+        if constexpr (!std::is_void_v<FirstSegment>) {
+            if (i_s == 0) {
+                FirstSegment::load(rH, tc, cp_h0, cp_idx + 1, head_idx, dv_tile, H);
+                continue;
+            }
+        }
         bool needs_mt = (cp_idx >= 0 && cp_idx < cp_batch_size)
             ? (bool)fallback_mask[cp_idx * H + head_idx] : false;
 
@@ -503,7 +515,7 @@ correct_h0_cute_kernel(
                                    (int64_t)head_idx * CH0_DK * CH0_DK;
 #if defined(FLASHQLA_ARCH_150)
             if (threadIdx.x == 0) {
-                ch0_load_mt_tc02<>(mt_buf, mt_src);
+                ch0_load_mt_tc02<TilePitch>(mt_buf, mt_src);
                 ch0_aiu_commit();
             }
 #else
@@ -524,7 +536,7 @@ correct_h0_cute_kernel(
                 for (int vv = 0; vv < cute::size<0>(tc); ++vv) {
                   auto crd = tc(vv, m, n);
                   int dk = cute::get<0>(crd), dv = cute::get<1>(crd);
-                  hT_buf[dv * CH0_DK + dk] =
+                  hT_buf[dv * TilePitch + dk] =
                       fq::float_to_element<Element>(rH(vv, m, n));
                 }
               }
@@ -535,8 +547,8 @@ correct_h0_cute_kernel(
             __syncthreads();
 
             {
-                auto sMt = fq::make_smem_tensor_h<CH0_DK, CH0_DK>(mt_buf);
-                auto sHt = fq::make_smem_tensor_h<CH0_DVT, CH0_DK>(hT_buf);
+                auto sMt = fq::make_smem_tensor_h_ld<CH0_DK, CH0_DK, TilePitch>(mt_buf);
+                auto sHt = fq::make_smem_tensor_h_ld<CH0_DVT, CH0_DK, TilePitch>(hT_buf);
                 fq::flashqla_gemm_ss<decltype(sMt), decltype(sHt),
                     decltype(h_acc), Mma, Element>(sMt, sHt, tx, h_acc);
             }
@@ -595,13 +607,13 @@ correct_h0_cute_kernel(
     }
 }
 
-}  // namespace flashqla_cute
+}  // namespace FLASHQLA_CORRECT_NAMESPACE
 
 // ============================================================
 // Host launch
 // ============================================================
 static int ch0_smem_bytes(int ngrp, bool pipe) {
-    using namespace flashqla_cute;
+    using namespace FLASHQLA_CORRECT_NAMESPACE;
     if (pipe) return 2 * CH0_DK * CH0_K_LD * 2 + ngrp * CH0_PIPE_GRP_BYTES;
     return (CH0_DK * CH0_DK + ngrp * CH0_DVT * CH0_DK) * 2;
 }
@@ -610,11 +622,12 @@ namespace {
 
 constexpr int CH0_MAX_CACHED_DEVICES = 64;
 
-template <typename Element, int Ngrp, bool Pipe, int Gw>
+template <typename Element, int Ngrp, bool Pipe, int Gw,
+          int TilePadding = 0, typename FirstSegment = void>
 void ch0_configure_dynamic_smem(int device_index, int smem_bytes) {
     auto configure = [smem_bytes]() {
         if (hggcFuncSetAttribute(
-                flashqla_cute::correct_h0_cute_kernel<Element, Ngrp, Pipe, Gw>,
+                FLASHQLA_CORRECT_NAMESPACE::correct_h0_cute_kernel<Element, Ngrp, Pipe, Gw, TilePadding, FirstSegment>,
                 hggcFuncAttributeMaxDynamicSharedMemorySize,
                 smem_bytes) != hggcSuccess) {
             hggcGetLastError();
@@ -632,6 +645,7 @@ void ch0_configure_dynamic_smem(int device_index, int smem_bytes) {
 
 }  // namespace
 
+#ifndef FLASHQLA_CORRECT_KERNEL_ONLY
 static void ch0_launch(
     void* cp_h0, const void* raw_h0, const void* ht_buffer,
     const void* mt_buffer, const signed char* fallback_mask,
@@ -658,15 +672,15 @@ static void ch0_launch(
     const int gw = pipe ? 8 : 4;
     int smem_bytes = ch0_smem_bytes(ngrp, pipe);
     int blocks_per_batch = H * (
-        flashqla_cute::CH0_DV /
-        (ngrp * flashqla_cute::CH0_DVT));
+        FLASHQLA_CORRECT_NAMESPACE::CH0_DV /
+        (ngrp * FLASHQLA_CORRECT_NAMESPACE::CH0_DVT));
     dim3 grid(raw_batch_size * blocks_per_batch);
     dim3 block(32 * gw * ngrp);
 
 #define CH0_LAUNCH_N(ElementType, NG, PIPE, GW) \
     do { \
       ch0_configure_dynamic_smem<ElementType, NG, PIPE, GW>(device_index, smem_bytes); \
-      flashqla_cute::correct_h0_cute_kernel<ElementType, NG, PIPE, GW><<<grid, block, smem_bytes, stream>>>( \
+      FLASHQLA_CORRECT_NAMESPACE::correct_h0_cute_kernel<ElementType, NG, PIPE, GW><<<grid, block, smem_bytes, stream>>>( \
           cp_h0, raw_h0, raw_h0_indices, reinterpret_cast<const ElementType*>(ht_buffer), \
           reinterpret_cast<const ElementType*>(mt_buffer), fallback_mask, seq_map_r2c, \
           cp_batch_size, raw_batch_size, H, has_raw, raw_h0_k_last, \
@@ -712,3 +726,4 @@ void launch_correct_h0_raw_cute(
                raw_h0_k_last, raw_h0_is_bf16, cp_h0_is_bf16, dtype_tag,
                device_index, num_cu, compute_capability, stream);
 }
+#endif  // FLASHQLA_CORRECT_KERNEL_ONLY

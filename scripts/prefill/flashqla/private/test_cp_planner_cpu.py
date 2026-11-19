@@ -700,6 +700,81 @@ class Tc02RealGatePlannerTest(unittest.TestCase):
         self.assertEqual(plan[3].tolist(), [0] * 6)
         self.assertEqual(plan[4].tolist(), [0] * 5 + [1])
 
+    def test_folded_h24_cp_plan_is_opt_in_and_cache_isolated(self):
+        with mock.patch.object(
+            cp, "_device_execution_model", side_effect=self._tc02_device_model
+        ):
+            default = cp.calc_cp_seqs(self._cu(24576), 32, 24, num_k_heads=8)
+            folded = cp.calc_cp_seqs(
+                self._cu(24576), 32, 24, num_k_heads=8, folded_prefill=True)
+            default_again = cp.calc_cp_seqs(
+                self._cu(24576), 32, 24, num_k_heads=8)
+            folded_again = cp.calc_cp_seqs(
+                self._cu(24576), 32, 24, num_k_heads=8, folded_prefill=True)
+        self.assertIs(default, default_again)
+        self.assertIs(folded, folded_again)
+        self.assertIsNot(default, folded)
+        self.assertEqual(folded[1].numel(), 9)
+        self.assertNotEqual(default[1].tolist(), folded[1].tolist())
+
+    def test_folded_small_heads_balance_segments_without_truncating_history(self):
+        for heads, qk_heads in ((4, 2), (6, 2), (8, 1), (8, 2), (8, 4)):
+            with self.subTest(heads=heads, qk_heads=qk_heads), mock.patch.object(
+                cp, "_device_execution_model", side_effect=self._tc02_device_model
+            ):
+                plan = cp.calc_cp_seqs(
+                    self._cu(32768), 32, heads, num_k_heads=qk_heads,
+                    folded_prefill=True)
+                default = cp.calc_cp_seqs(
+                    self._cu(32768), 32, heads, num_k_heads=qk_heads)
+                self.assertIsNot(plan, default)
+                self.assertTrue(plan[0])
+                offsets = plan[1].tolist()
+                self.assertEqual(len(offsets) - 1, 8 if heads == 8 else 13)
+                chunks = [(end - start + 31) // 32
+                          for start, end in zip(offsets, offsets[1:])]
+                self.assertEqual(sum(chunks), 1024)
+                warmup, fallback = plan.warmup_metadata
+                self.assertEqual(warmup.tolist(), [[n] * heads for n in chunks])
+                self.assertEqual(fallback.tolist(), [[1] * heads] * len(chunks))
+
+    def test_folded_h12_uses_full_history_long_cp_and_keeps_legacy_plan(self):
+        for length, segments in ((12288, 6), (16384, 13), (32768, 13), (98304, 13)):
+            with self.subTest(length=length), mock.patch.object(
+                cp, "_device_execution_model", side_effect=self._tc02_device_model
+            ):
+                plan = cp.calc_cp_seqs(
+                    self._cu(length), 32, 12, num_k_heads=4, folded_prefill=True)
+                default = cp.calc_cp_seqs(self._cu(length), 32, 12, num_k_heads=4)
+                self.assertIsNot(plan, default)
+                self.assertTrue(plan[0])
+                offsets = plan[1].tolist()
+                self.assertEqual(len(offsets) - 1, segments)
+                chunks = [(end - start + 31) // 32
+                          for start, end in zip(offsets, offsets[1:])]
+                self.assertEqual(sum(chunks), length // 32)
+                warmup, fallback = plan.warmup_metadata
+                self.assertEqual(warmup.tolist(), [[n] * 12 for n in chunks])
+                self.assertEqual(fallback.tolist(), [[1] * 12] * len(chunks))
+
+    def test_folded_h24_cp_keeps_full_segment_history(self):
+        for length, segments in ((15328, 6), (15329, 8), (32768, 8),
+                                 (32769, 13), (98304, 13)):
+            with self.subTest(length=length), mock.patch.object(
+                cp, "_device_execution_model", side_effect=self._tc02_device_model
+            ):
+                plan = cp.calc_cp_seqs(
+                    self._cu(length), 32, 24, num_k_heads=8, folded_prefill=True)
+                offsets = plan[1].tolist()
+                self.assertEqual(len(offsets) - 1, segments)
+                self.assertEqual(offsets[-1], length)
+                chunks = [(end - start + 31) // 32
+                          for start, end in zip(offsets, offsets[1:])]
+                warmup, fallback = plan.warmup_metadata
+                self.assertEqual(sum(chunks), (length + 31) // 32)
+                self.assertEqual(warmup.tolist(), [[n] * 24 for n in chunks])
+                self.assertEqual(fallback.tolist(), [[1] * 24] * len(chunks))
+
     def test_tc02_h6_target_full_history_cp12(self):
         with mock.patch.object(
             cp, "_device_execution_model", side_effect=self._tc02_device_model

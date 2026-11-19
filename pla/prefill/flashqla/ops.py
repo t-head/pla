@@ -42,13 +42,14 @@ the fused_fwd kernel is fed an identity CP mapping so every cp segment is its
 own raw batch.
 """
 import math
-from typing import Optional, Set, Tuple
+from typing import Optional, Sequence, Set, Tuple, Union
 
 import torch
 
-from . import _C as flashqla_cute
 from .. import _sanity
+from . import _C as flashqla_cute
 from .private.cp_preprocess import (
+    _cuda_device_properties,
     calc_cp_seqs,
     tc01_overlap_warmup_threshold,
 )
@@ -237,7 +238,7 @@ def chunk_gated_delta_rule_fwd(
     overlap_warmup_threshold: Optional[float] = None,
     force_tc01_cp_candidate: bool = False,
     normalize_qk: bool = False,
-    raw_cu_seqlens: Optional[Tuple[int, ...]] = None,
+    raw_cu_seqlens: Optional[Union[Sequence[int], torch.Tensor]] = None,
     raw_gate_a: Optional[torch.Tensor] = None,   # [T,H] b16
     raw_beta_b: Optional[torch.Tensor] = None,   # [T,H] b16
     A_log: Optional[torch.Tensor] = None,        # [H] fp32
@@ -249,8 +250,9 @@ def chunk_gated_delta_rule_fwd(
     The pool is updated in place even when output_final_state is false.
     ``cu_seqlens`` covers the real-token prefix and may end before the physical
     token length; in that case ``O`` keeps the physical shape and its padded
-    suffix is zero. Serving callers may pass the same offsets as a trusted Host
-    tuple in ``raw_cu_seqlens`` to avoid a Device-to-Host planning read.
+    suffix is zero. Serving callers may supply the same offsets as a host
+    sequence or CPU tensor in ``raw_cu_seqlens`` to avoid a device-to-host
+    planning read. Pass device tensors as ``cu_seqlens``.
 
     The recurrent state may be fp32 or bf16. The recurrence itself always runs
     in fp32 registers and only converts at the two memory boundaries, so bf16
@@ -392,6 +394,13 @@ def chunk_gated_delta_rule_fwd(
             raise ValueError("FlashQLA does not support an empty token dimension")
         _input_validation_signature = validation_signature
 
+    if raw_cu_seqlens is not None and not isinstance(raw_cu_seqlens, tuple):
+        if isinstance(raw_cu_seqlens, torch.Tensor):
+            if (raw_cu_seqlens.device.type != "cpu" or raw_cu_seqlens.ndim != 1
+                    or raw_cu_seqlens.dtype not in (torch.int32, torch.int64)):
+                raise ValueError("raw_cu_seqlens must be a 1-D CPU int32 or int64 tensor")
+            raw_cu_seqlens = raw_cu_seqlens.tolist()
+        raw_cu_seqlens = tuple(raw_cu_seqlens)
     raw_cu = _sanity.offsets(
         cu_seqlens, num_tokens, raw_cu_seqlens, reference=q)
     if cu_seqlens is None:
@@ -451,13 +460,49 @@ def chunk_gated_delta_rule_fwd(
         initial_state_indices.record_stream(
             torch.cuda.current_stream(initial_state_indices.device))
     chunk_indices = _prepare_chunk_indices(cu32, CHUNK_SIZE, raw_cu)
+    # The folded path uses the same extension and public API. Its workspace is
+    # private to this call; unsupported shapes keep the established stages.
+    # Coefficient preparation amortizes at shorter lengths when three value
+    # heads share Q/K. Other configurations need more work per sequence, and
+    # batched MHA keeps the established fused kernel. Preserve the calibrated
+    # 8K CP kernels for small heads, where they remain faster.
+    folded_min_length = (512 if (H, Hg) == (24, 8)
+                         else 1024 if batch == 1 else 4096)
+    calibrated_cp = (auto_cp and raw_cu == (0, 8192)
+                     and (H, Hg) in ((12, 4), (6, 2)))
+    use_folded = (
+        q.dtype == torch.bfloat16
+        and valid_num_tokens >= folded_min_length * batch
+        and (H != Hg or batch == 1) and not calibrated_cp
+        and indexed_state and initial_state.dtype == torch.float32
+        and overlap_warmup_threshold is None and not force_tc01_cp_candidate
+        and (normalize_qk or (q.is_contiguous() and k.is_contiguous()))
+        and _cuda_device_properties(q.device.index) == (8, 9, 39)
+    )
+    if use_folded and batch > 1 and H in (32, 64, 128):
+        # Short sequences can erase the gain even when the mean length is
+        # high. At 64 or more value heads, also bound the length skew.
+        lengths = [end - start for start, end in zip(raw_cu, raw_cu[1:])]
+        shortest = min(lengths)
+        use_folded = (
+            shortest >= folded_min_length
+            and (H == 32 or max(lengths) <= 2 * shortest)
+        )
+    # BF16 can round each weak CP decay to one. Use the FP32 transition
+    # path for long sequences and the 24K+ single-sequence 12/4 schedule.
+    precise_transitions = use_folded and (
+        (batch == 1 and (H, Hg) == (12, 4) and valid_num_tokens >= 24576)
+        or any(
+            b - a > 65536 for a, b in zip(raw_cu, raw_cu[1:])))
+    precise_folded = use_folded and (
+        (H, Hg) != (24, 8) or precise_transitions)
     # Framework adapters may pass raw q/k and fold both L2 normalizations into
     # the cumsum launch. The default preserves the existing normalized-q/k API.
     if use_raw_gating:
         g_cum_32, beta, q, k = (
             flashqla_cute.chunk_local_cumsum_qk_norm_gated(
                 raw_gate_a, raw_beta_b, A_log, dt_bias,
-                cu32, chunk_indices, q, k, valid_num_tokens)
+                cu32, chunk_indices, q, k, valid_num_tokens, use_folded and (H, Hg) in ((24, 8), (12, 4)))
         )
     elif normalize_qk:
         g_cum_32, q, k = flashqla_cute.chunk_local_cumsum_qk_norm(
@@ -468,12 +513,17 @@ def chunk_gated_delta_rule_fwd(
     # Step 2: KKT solve (WY factor). kkt_solve internally computes K@K^T at CS=32.
     # A padded single sequence also needs the explicit chunk map: the implicit
     # single-sequence path derives its grid from the physical token dimension.
-    A = flashqla_cute.kkt_solve(
-        k, beta, cu32, H,
-        chunk_indices if batch > 1 or valid_num_tokens < num_tokens else None)
+    if use_folded:
+        A, coefficients = flashqla_cute.folded_coefficients(
+            q, k, beta, g_cum_32, cu32, chunk_indices, float(scale), precise_folded)
+    else:
+        A = flashqla_cute.kkt_solve(
+            k, beta, cu32, H,
+            chunk_indices if batch > 1 or valid_num_tokens < num_tokens else None)
+        coefficients = None
 
     production_overlap_threshold = None
-    if (auto_cp and overlap_warmup_threshold is None and
+    if (auto_cp and not use_folded and overlap_warmup_threshold is None and
             not force_tc01_cp_candidate):
         production_overlap_threshold = tc01_overlap_warmup_threshold(
             cu32, raw_cu, CHUNK_SIZE, H, Hg,
@@ -489,6 +539,7 @@ def chunk_gated_delta_rule_fwd(
             tc01_enable_overlap_candidate=(
                 production_overlap_threshold is not None),
             tc01_packed_raw_gate=use_raw_gating,
+            folded_prefill=use_folded,
         ) if auto_cp else None
     )
 
@@ -537,9 +588,25 @@ def chunk_gated_delta_rule_fwd(
                     raw_state_input = torch.index_select(
                         initial_state, 0, initial_state_indices)
             else:
+                # The compact grid saves a prepare wave for this short single-
+                # sequence shape on the 39-CU M890P.
+                seed_first = (
+                    use_folded and batch == 1 and (H, Hg) == (24, 8)
+                    and 8192 <= valid_num_tokens <= 32768
+                )
+                seeded_h0 = None
+                if seed_first:
+                    seeded_h0 = torch.empty(
+                        (cp_batch, H, DK, DV), dtype=torch.float32, device=q.device)
+                # Seeded prepare already computes the first continuation in
+                # FP32. Keep the later transitions in FP32 as well.
                 ht_buf, mt_buf = flashqla_cute.prepare_h(
                     k, v, A, g_cum_32, beta, cp_cu_i32,
-                    num_warmup.reshape(-1).contiguous(), H, Hg)
+                    num_warmup.reshape(-1).contiguous(), H, Hg, coefficients,
+                    precise_transitions or seed_first, skip_last_segment=use_folded,
+                    seeded_cp_h0=seeded_h0,
+                    initial_pool=initial_state if seed_first else None,
+                    first_slot=initial_state_indices if seed_first else None)
                 ht_buf = ht_buf.view(cp_batch, H, DK, DV)
                 mt_buf = mt_buf.view(cp_batch, H, DK, DK)
                 fb_2d = fallback_mask.view(cp_batch, H).contiguous()
@@ -549,7 +616,8 @@ def chunk_gated_delta_rule_fwd(
                     ht_buf, mt_buf, fb_2d, seq_map_r2c.to(torch.int32),
                     batch, initial_state,
                     initial_state_indices if indexed_state else None,
-                    indexed_state, state_dtype == torch.bfloat16)
+                    indexed_state, state_dtype == torch.bfloat16, use_folded,
+                    seeded_cp_h0=seeded_h0)
             cp_seq_map_i32 = seq_map_c2r.to(torch.int32)
             raw_cu_i32 = cu32
 
@@ -561,7 +629,7 @@ def chunk_gated_delta_rule_fwd(
             initial_state if indexed_state else None,
             initial_state_indices if indexed_state else None,
             output_final_state, state_dtype == torch.bfloat16,
-            raw_state_input, num_warmup_flat, fallback_mask_flat)
+            raw_state_input, num_warmup_flat, fallback_mask_flat, coefficients)
     else:
         h0 = (initial_state if initial_state is not None and not indexed_state
               else torch.empty(0, device=q.device))
@@ -571,7 +639,7 @@ def chunk_gated_delta_rule_fwd(
             initial_state if indexed_state else None,
             initial_state_indices if indexed_state else None,
             output_final_state, state_dtype == torch.bfloat16,
-            None, None, None)
+            None, None, None, coefficients)
 
     if output_final_state:
         ht = initial_state[initial_state_indices] if indexed_state else ht
@@ -597,7 +665,7 @@ def gdn_prefill_packed_qkv_fwd(
     auto_cp: bool = True,
     overlap_warmup_threshold: Optional[float] = None,
     force_tc01_cp_candidate: bool = False,
-    raw_cu_seqlens: Optional[Tuple[int, ...]] = None,
+    raw_cu_seqlens: Optional[Union[Sequence[int], torch.Tensor]] = None,
     final_state_dtype: Optional[torch.dtype] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, None, Optional[torch.Tensor]]:
     """Run GDN prefill directly on a post-convolution ``Q|K|V`` buffer.
