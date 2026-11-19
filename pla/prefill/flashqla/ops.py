@@ -472,22 +472,22 @@ def chunk_gated_delta_rule_fwd(
         k, beta, cu32, H,
         chunk_indices if batch > 1 or valid_num_tokens < num_tokens else None)
 
-    production_overlap_threshold = None
-    if (auto_cp and overlap_warmup_threshold is None and
-            not force_tc01_cp_candidate):
-        production_overlap_threshold = tc01_overlap_warmup_threshold(
+    # Non-indexed raw gating already uses prepare/correct for these plans.
+    # Preserve its regular CP admission through the tc01 shape policy.
+    raw_cp_fallback = False
+    if (auto_cp and use_raw_gating and
+            initial_state is not None and not indexed_state and
+            overlap_warmup_threshold is None and not force_tc01_cp_candidate):
+        raw_cp_fallback = tc01_overlap_warmup_threshold(
             cu32, raw_cu, CHUNK_SIZE, H, Hg,
-            use_raw_gating=use_raw_gating,
-            indexed_state=indexed_state,
-            has_initial_state=initial_state is not None,
-        )
+            use_raw_gating=True, indexed_state=False, has_initial_state=True,
+        ) is not None
 
     cp_plan = (
         calc_cp_seqs(
             cu32, CHUNK_SIZE, H, raw_cu, num_k_heads=Hg,
             tc01_force_candidate=force_tc01_cp_candidate,
-            tc01_enable_overlap_candidate=(
-                production_overlap_threshold is not None),
+            tc01_enable_overlap_candidate=raw_cp_fallback,
             tc01_packed_raw_gate=use_raw_gating,
         ) if auto_cp else None
     )
@@ -504,11 +504,6 @@ def chunk_gated_delta_rule_fwd(
         if use_cp:
             cp_cu_i32 = cp_cu_seqlens.to(torch.int32)
             cp_batch = cp_cu_i32.numel() - 1
-            effective_overlap_threshold = (
-                overlap_warmup_threshold
-                if overlap_warmup_threshold is not None
-                else production_overlap_threshold
-            )
             # A fresh sequence starts at zero, but earlier tokens can create
             # the entire state consumed by a continuation segment. Log decay
             # alone bounds neither that state's magnitude nor relative error.
@@ -525,7 +520,7 @@ def chunk_gated_delta_rule_fwd(
                 fallback_mask = torch.ones(
                     (cp_batch, H), dtype=torch.int8, device=q.device)
             use_overlap_warmup = (
-                effective_overlap_threshold is not None and
+                overlap_warmup_threshold is not None and
                 (indexed_state or initial_state is None)
             )
             if use_overlap_warmup:

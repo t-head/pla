@@ -130,6 +130,61 @@ def test_qwen38_real_gate_raw_indexed_state_prefill():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a PPU device")
+@pytest.mark.parametrize("layout,tokens,heads,state_mode,dispatch", [
+    ("packed", 4173, 16, "indexed", "serial"),
+    ("packed", 4173, 16, "dense", "regular"),
+    ("packed", 15900, 8, "indexed", "regular"),
+    ("packed", 4173, 16, "indexed", "overlap"),
+    ("raw", 4173, 16, "none", "serial"),
+    ("raw", 4173, 16, "dense", "regular"),
+    ("raw", 15900, 8, "none", "regular"),
+    ("raw", 8192, 16, "none", "overlap"),
+    ("activated", 8192, 16, "none", "serial"),
+    ("activated", 15900, 8, "none", "regular"),
+])
+def test_tc01_prefill_cp_dispatch(layout, tokens, heads, state_mode, dispatch):
+    from pla.prefill.flashqla import ops
+
+    if torch.cuda.get_device_capability() != (8, 0):
+        pytest.skip("requires tc01 FlashQLA")
+    offsets = (0, tokens)
+    cu = torch.tensor(offsets, device="cuda", dtype=torch.int32)
+    gate = torch.zeros(tokens, heads, device="cuda", dtype=torch.bfloat16)
+    bias = torch.zeros(heads, device="cuda", dtype=torch.float32)
+    state = None
+    indices = None
+    if state_mode != "none":
+        state = torch.ones(1, heads, D, D, device="cuda", dtype=torch.float32)
+    if state_mode == "indexed":
+        indices = torch.tensor([0], device="cuda", dtype=torch.int32)
+    options = dict(
+        cu_seqlens=cu, raw_cu_seqlens=offsets, initial_state=state,
+        initial_state_indices=indices, force_tc01_cp_candidate=dispatch == "overlap",
+        overlap_warmup_threshold=-4.0 if dispatch == "overlap" else None,
+    )
+    with patch.object(ops.flashqla_cute, "fused_fwd",
+                      wraps=ops.flashqla_cute.fused_fwd) as fused:
+        if layout == "packed":
+            qkv = gate.new_zeros((tokens, (heads + 2 * HG) * D))
+            ops.gdn_prefill_packed_qkv_fwd(
+                qkv, gate, gate, bias, bias, num_qk_heads=HG, num_v_heads=heads, **options)
+        else:
+            q = gate.new_zeros((1, tokens, HG, D))
+            v = gate.new_zeros((1, tokens, heads, D))
+            if layout == "raw":
+                options.update(raw_gate_a=gate, raw_beta_b=gate, A_log=bias, dt_bias=bias)
+                g = None
+            else:
+                g = gate.float().unsqueeze(0)
+            chunk_gated_delta_rule_fwd(q, q, v, g, g, normalize_qk=True, **options)
+
+    fused.assert_called_once()
+    assert (fused.call_args.args[7] is not None) == (dispatch != "serial")
+    assert (fused.call_args.args[19] is not None) == (dispatch == "overlap")
+    assert (fused.call_args.args[20] is not None) == (dispatch == "overlap")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a PPU device")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("indexed", [True, False])
@@ -427,8 +482,8 @@ def test_cp_finite_initial_state_carry(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a PPU device")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_auto_cp_initial_state_carry(dtype):
-    """Keep the original single-sequence serving repro on production dispatch."""
+def test_explicit_overlap_cp_initial_state_carry(dtype):
+    """Keep the original serving repro on the explicit overlap path."""
     from pla.prefill.flashqla import ops
 
     total, heads, qk_heads = 8192, 16, 2
@@ -450,8 +505,11 @@ def test_auto_cp_initial_state_carry(dtype):
                 q, k, v, gate, beta,
                 initial_state=pool, initial_state_indices=indices,
                 cu_seqlens=cu, normalize_qk=True,
-                output_final_state=False, auto_cp=auto_cp)
+                output_final_state=False, auto_cp=auto_cp,
+                force_tc01_cp_candidate=auto_cp,
+                overlap_warmup_threshold=-4.0 if auto_cp else None)
             assert (fused.call_args.args[7] is not None) == auto_cp
+            assert (fused.call_args.args[19] is not None) == auto_cp
         relative = (pool[1] - expected).norm() / expected.expand_as(pool[1]).norm()
         assert float(relative) < 0.05, "auto CP lost initial-state carry"
         torch.testing.assert_close(
@@ -463,7 +521,7 @@ def test_auto_cp_initial_state_carry(dtype):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a PPU device")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_auto_cp_fresh_prefix(dtype):
+def test_explicit_overlap_cp_fresh_prefix(dtype):
     """Token zero writes history that None and explicit zero must both retain."""
     from pla.prefill.flashqla import ops
 
@@ -490,11 +548,11 @@ def test_auto_cp_fresh_prefix(dtype):
                 result = chunk_gated_delta_rule_fwd(
                     q, k, v, gate, beta, initial_state=initial,
                     cu_seqlens=cu, normalize_qk=True,
-                    output_final_state=True, auto_cp=auto_cp)
-                # The None path must really use production CP, not pass by
-                # silently disabling the optimization for this input.
-                if not zero_state:
-                    assert (fused.call_args.args[7] is not None) == auto_cp
+                    output_final_state=True, auto_cp=auto_cp,
+                    force_tc01_cp_candidate=auto_cp,
+                    overlap_warmup_threshold=-4.0 if auto_cp else None)
+                assert (fused.call_args.args[7] is not None) == auto_cp
+                assert (fused.call_args.args[19] is not None) == (auto_cp and not zero_state)
             torch.testing.assert_close(
                 result[4][0, :, 0].float(), expected_state[:, None].expand(heads, D),
                 rtol=0.05, atol=0.0)
