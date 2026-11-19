@@ -128,6 +128,9 @@ jobs:
             cp "${wheels[0]}" "$PLA_REPORT_ROOT/wheels/"
 
             python -m pip install --force-reinstall --no-deps "${wheels[0]}"
+            # Stage the wheel's compiled extensions back into the source tree
+            # before the suite; repo-root `import pla` groups fail otherwise.
+            python .github/workflows/scripts/run_functional.py --stage-wheel "${wheels[0]}"
             result=0
             for phase in decode prefill; do
               python .github/workflows/scripts/run_functional.py \
