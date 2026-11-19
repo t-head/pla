@@ -32,4 +32,4 @@ include ppu_build.py
 include LICENSE
 include NOTICE
 recursive-include LICENSES *.txt
-recursive-include src *.h *.hpp *.cuh *.cu *.cc *.cpp *.json *.py *.map
+recursive-include src *.h *.hpp *.cuh *.cu *.cc *.cpp *.inc *.json *.py *.map
