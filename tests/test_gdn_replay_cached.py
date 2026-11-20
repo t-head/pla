@@ -1333,6 +1333,23 @@ class BoundaryTests(DeviceBase):
             with self.subTest(mutation=index):
                 self.rejected(lambda: getattr(self.adapter, COMMIT)(**{**kw, **mutation}), d, extra=(items, n, mutation))
 
+    def test_layered_commit_rejects_work_metadata_aliasing_state(self):
+        d = make_cached_case(CachedCase(), shared_mapping=True, integer="int32", device=self.device)
+        t = self.t
+        state = d["state"].unsqueeze(0)
+        state_words = state.view(t.int32).flatten()[:4]
+        state_words.zero_()
+        items = t.zeros((1, 4), dtype=t.int32, device=self.device)
+        count = t.zeros(1, dtype=t.int32, device=self.device)
+        commit = getattr(self.adapter, COMMIT)
+        for field, work, n_writes in (("items", state_words.view(1, 4), count),
+                                       ("n_items", items, state_words[:1])):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(RuntimeError, f"state_layers and {field} overlap"):
+                    commit(ssm_states=state, old_u=d["u"].unsqueeze(0), old_k=d["hk"].unsqueeze(0),
+                           old_G=d["G"].unsqueeze(0), replay_work_items=work, n_writes=n_writes,
+                           history_size=d["config"].L)
+
     def test_device_range_errors_in_fresh_processes(self):
         for name in RANGE_CASES:
             with self.subTest(problem=name):

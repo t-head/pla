@@ -4,13 +4,8 @@ import argparse
 from collections import defaultdict
 import glob
 import json
-import math
 from pathlib import Path
-
-
-def geometric_mean(values):
-    values = list(values)
-    return math.exp(sum(math.log(x) for x in values) / len(values))
+from statistics import geometric_mean
 
 
 def load_rows(patterns):
