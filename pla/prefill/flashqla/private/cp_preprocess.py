@@ -91,6 +91,10 @@ H32_HG16_MID_CP_SEGMENTS = 7
 # tc02.  The generic power-of-two cap alternates between 13--15 and 30 segments
 # in this range, creating avoidable fused waves at both sides of the transition.
 H8_HG2_LONG_CP_SEGMENTS = 18
+# The factorized prepare/correct kernels make nine balanced H=16 segments
+# profitable across the measured long single-sequence interval on 890P.
+H16_LONG_CP_SEGMENTS = 9
+H8_MIXED_LONG_CP_SEGMENTS = 24
 # A plan contains the dispatch decision and, when CP is selected, four device
 # metadata tensors consumed read-only by get_warmup/prepare_h/fused_fwd.  Model
 # serving repeatedly invokes the same small set of packed shapes, so rebuilding
@@ -103,8 +107,9 @@ class _CpPlan(tuple):
     """Five-field CP plan with optional derived full-history launch metadata.
 
     ``warmup_metadata`` holds the read-only ``[segments, H]`` int32 chunk counts
-    and int8 all-ones fallback mask that prepare_h/correct_h0 consume when every
-    segment replays its complete prefix.  Both depend only on the cached plan, so
+    and int8 all-ones fallback mask that prepare_h/correct_h0 consume. Each
+    consumed predecessor replays its complete prefix; an unused terminal
+    transition may have zero warmup. Both depend only on the cached plan, so
     building them once removes per-call elementwise launches from the API path.
     """
 
@@ -193,12 +198,13 @@ def _tc01_real_gate_cp_allowed(
     chunk_size: int,
     num_v_heads: int,
 ) -> bool:
-    """Return the conservative tc01 CP suffix measured with real gating.
+    """Return the historical tc01 CP suffix for offline comparisons.
 
     The rule comes from an interleaved auto/serial sweep of every current GDN
     prefill shape with Qwen3.8-Max layer-0 raw gating. Only existing legacy CP
-    plans are retained; this gate never promotes a shape that the calibrated
-    planner previously kept serial. Hg=2 and Hg=4 had equivalent boundaries.
+    plans used this suffix before full-history reconstruction was enforced.
+    Automatic tc01 CP is disabled because those plans now regress against
+    serial execution. Hg=2 and Hg=4 had equivalent historical boundaries.
     """
     if chunk_size != CHUNK_SIZE or num_v_heads != 8:
         return False
@@ -461,8 +467,16 @@ def tc01_overlap_warmup_threshold(
     use_raw_gating: bool,
     indexed_state: bool,
     has_initial_state: bool,
+    force_candidate: bool = False,
 ) -> Optional[float]:
-    """Return the production threshold for a race-free tc01 serving ABI."""
+    """Return a historical overlap threshold only for explicit offline sweeps.
+
+    Full-prefix replay does not use the threshold to truncate history. The old
+    short-window admission table is therefore not a production performance
+    contract. Keep it available for experiments, never for automatic dispatch.
+    """
+    if not force_candidate:
+        return None
     # Raw gating can safely use the established prepare/correct fallback when a
     # non-indexed initial state is present. Only indexed state enables overlap
     # replay; precomputed gating retains the previous conservative ABI guard.
@@ -494,16 +508,28 @@ def tc01_overlap_warmup_threshold(
     return TC01_OVERLAP_WARMUP_THRESHOLD
 
 
+def _tc02_decode_prefill_shape(
+    raw_cu: Tuple[int, ...], chunk_size: int,
+    num_v_heads: int, num_k_heads: Optional[int],
+) -> bool:
+    lengths = [end - start for start, end in zip(raw_cu, raw_cu[1:])]
+    return (chunk_size == TC02_SINGLE_SEQ_CALIBRATED_CHUNK_SIZE and
+            num_v_heads == 8 and num_k_heads == 2 and 6 <= len(lengths) <= 64 and
+            8192 <= max(lengths) <= 32768 and
+            sum(length == 1 for length in lengths) == len(lengths) - 1)
+
+
 def _tc02_real_gate_cp_allowed(
     raw_cu: Tuple[int, ...],
     chunk_size: int,
     num_v_heads: int,
     num_cp_segments: int,
+    num_k_heads: Optional[int] = None,
 ) -> bool:
     """Return the conservative tc02 CP region measured with real gating.
 
     This is a final admission filter over plans produced by the existing tc02
-    model. It neither admits a new shape nor changes segment geometry. The
+    model. It neither creates a new split nor changes segment geometry. The
     aligned suffixes cover stable length regions; four integer long-tail
     rectangles retain additional underfilled packed winners without embedding
     corpus-specific floating-point effective-batch values.
@@ -521,6 +547,14 @@ def _tc02_real_gate_cp_allowed(
         num_v_heads, {}
     ).get(batch)
     if threshold is not None and max_seqlen >= threshold:
+        return True
+
+    # A one-token decode row does not add another long recurrent chain. The
+    # raw-batch table above therefore misses mixed decode/prefill batches even
+    # though their long tail still underfills the device. Keep this additional
+    # region within the measured H8/Hg2, CS32, 8K--32K, batch<=64 bounds; the
+    # existing batch1--5 decisions and all other topologies stay unchanged.
+    if _tc02_decode_prefill_shape(raw_cu, chunk_size, num_v_heads, num_k_heads):
         return True
 
     num_chunks = [_cdiv(length, chunk_size) for length in seqlens]
@@ -625,6 +659,9 @@ def _record_plan_stream(plan, ready_event, active_streams) -> None:
     """Make cached CUDA metadata ready and allocator-safe on this stream."""
     if ready_event is None:
         return
+    if active_streams is None:
+        ready_event.activate()
+        return
     first_tensor = plan[1]
     device_index = first_tensor.device.index
     stream_id = int(torch._C._cuda_getCurrentStream(device_index)[0])
@@ -642,6 +679,11 @@ def _plan_ready_event(plan):
     tensors = _plan_tensors(plan)
     if not tensors:
         return None, set()
+    if _cuda_device_properties(tensors[0].device.index) == (8, 9, 39):
+        # Lazy native import avoids module initialization cycles. The C++ entry
+        # owns every tensor, including the two derived warmup metadata tensors.
+        from .. import _C as flashqla_cute
+        return flashqla_cute._make_plan_metadata_entry(tensors), None
     stream = torch.cuda.current_stream(device=tensors[0].device)
     ready_event = torch.cuda.Event()
     ready_event.record(stream)
@@ -976,6 +1018,7 @@ def calc_cp_seqs(
     tc01_enable_overlap_candidate: bool = False,
     tc01_packed_raw_gate: bool = False,
     folded_prefill: bool = False,
+    folded_max_local_chunks: int = 0,
 ) -> Tuple[bool, Optional[torch.Tensor], Optional[torch.Tensor],
            Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Decide CP and compute the sub-sequence split for the active PPU.
@@ -983,8 +1026,11 @@ def calc_cp_seqs(
     Returns (use_cp, cp_cu_seqlens, seq_map_r2c, seq_map_c2r, ht_mask).
     Tensors are None when CP is disabled. ``tc01_force_candidate`` bypasses only
     the production real-gate admission rule; the candidate planner still rejects
-    shapes for which it cannot form a useful split. The overlap candidate is
-    admitted only when the caller can execute its race-free state ABI.
+    shapes for which it cannot form a useful split. Automatic tc01 CP
+    admission is disabled while state reconstruction preserves full history.
+    ``tc01_enable_overlap_candidate`` remains a compatibility argument, but
+    cannot admit a plan without ``tc01_force_candidate``. All tc02 decisions
+    remain on their separately calibrated path.
     ``folded_prefill`` selects the native tc02 split policy; the default keeps
     the generic kernel's architecture-specific table.
     """
@@ -1024,6 +1070,7 @@ def calc_cp_seqs(
         tc01_enable_overlap_candidate,
         tc01_packed_raw_gate,
         folded_prefill,
+        folded_max_local_chunks,
         execution_model,
         raw_cu,
     )
@@ -1041,19 +1088,15 @@ def calc_cp_seqs(
             return cached_plan
 
     if execution_model.architecture == "tc01":
-        # Keep only the measured real-gating suffix of existing legacy plans.
-        # The former 20-TFU additive candidate regressed every newly admitted
-        # shape in the complete OperatorsForge inventory and is not evaluated.
+        # Both overlap replay and the legacy prepare/correct path preserve full
+        # prefix history. The old short-window admission calibration no longer
+        # predicts a gain: measured H8/Hg1,2,4 B1..3 legacy plans also regress
+        # against serial execution. Keep CP geometry only for explicit sweeps.
         if (not tc01_force_candidate and tc01_packed_raw_gate and
                 _tc01_serial_lpt_allowed(
                     raw_cu, chunk_size, num_v_heads, num_k_heads)):
             plan = (False, None, None, None, None)
-        elif (tc01_force_candidate or
-                _tc01_real_gate_cp_allowed(raw_cu, chunk_size, num_v_heads) or
-                (tc01_enable_overlap_candidate and
-                 _tc01_overlap_warmup_allowed(
-                     raw_cu, chunk_size, num_v_heads, num_k_heads,
-                     use_packed_raw_spec=tc01_packed_raw_gate))):
+        elif tc01_force_candidate:
             plan = _calc_tc01_plan(
                 raw_cu, chunk_size, num_v_heads,
                 execution_model.physical_cu_count, 2,
@@ -1243,6 +1286,103 @@ def calc_cp_seqs(
         max_local_chunks = packed_low_grid_cap
     if full_history_segments:
         max_local_chunks = _cdiv(num_chunks[0], full_history_segments)
+    if (execution_model.physical_cu_count == 39 and
+            chunk_size == TC02_SINGLE_SEQ_CALIBRATED_CHUNK_SIZE and
+            fused_head_shards == 1 and raw_batch == 1 and H == 16 and
+            num_k_heads in (2, 4, 8) and 8192 <= max_seqlen <= 32768):
+        max_local_chunks = _cdiv(num_chunks[0], H16_LONG_CP_SEGMENTS)
+    mixed_decode_prefill = (
+        execution_model.physical_cu_count == 39 and fused_head_shards == 1 and
+        _tc02_decode_prefill_shape(raw_cu, chunk_size, H, num_k_heads))
+    if mixed_decode_prefill and raw_batch == 16 and max_seqlen >= 28 * 1024:
+        # Twenty-four long segments plus fifteen decode rows make 39 tasks per
+        # head. This reduces prepare/correct work and avoids a partial CU wave.
+        max_local_chunks = _cdiv(max(num_chunks), H8_MIXED_LONG_CP_SEGMENTS)
+    # Private N64 decode/prefill wave: selected one-token requests retain
+    # their original single segments, while the one long request uses nine
+    # balanced full-history segments (72 meaningful H8 CTAs <= 78 resident).
+    private_h8_n64_long_wave = (
+        execution_model.architecture == "tc02" and
+        execution_model.physical_cu_count == 39 and chunk_size == 32 and
+        fused_head_shards == 1 and raw_batch == 64 and H == 8 and
+        num_k_heads == 2 and mixed_decode_prefill and
+        8192 <= max_seqlen < 16384)
+    if private_h8_n64_long_wave:
+        max_local_chunks = _cdiv(max(num_chunks), 9)
+    # Private 890P experiment: 64 CTAs fit under the measured 78-CTA residency
+    # ceiling; preserve the existing full-history metadata construction below.
+    if (execution_model.architecture == "tc02" and
+            execution_model.physical_cu_count == 39 and
+            chunk_size == 32 and fused_head_shards == 1 and raw_batch == 1 and
+            H == 16 and num_k_heads in (2, 4, 8) and 4096 <= max_seqlen < 6144):
+        max_local_chunks = _cdiv(num_chunks[0], 4)
+    # Private measured-wave experiment: fill two resident waves (144/156 CTAs).
+    if (execution_model.architecture == "tc02" and
+            execution_model.physical_cu_count == 39 and
+            chunk_size == 32 and fused_head_shards == 1 and raw_batch == 1 and
+            H == 16 and num_k_heads == 4 and 6144 <= max_seqlen < 8192):
+        max_local_chunks = _cdiv(num_chunks[0], 9)
+    # Private current-890P experiment: expose parallel full-history segments
+    # without overflowing the measured two-CTA-per-CU resident wave (78 CTAs).
+    # Private H8 single-request wave: <=9 segments expose <=72 resident CTAs.
+    # Existing CP admission and full-history construction are retained.
+    if (execution_model.architecture == "tc02" and
+            execution_model.physical_cu_count == 39 and chunk_size == 32 and
+            fused_head_shards == 1 and raw_batch == 1 and H == 8 and
+            num_k_heads in (2, 4) and 1024 <= max_seqlen < 4096):
+        max_local_chunks = max(4, _cdiv(num_chunks[0], 9))
+    # Private medium single-request wave: full history, <=78 resident CTAs.
+    private_mid_single_wave = (
+        execution_model.architecture == "tc02" and
+        execution_model.physical_cu_count == 39 and chunk_size == 32 and
+        fused_head_shards == 1 and raw_batch == 1 and
+        ((H == 16 and num_k_heads == 4 and 768 <= max_seqlen < 1024) or
+         (H == 16 and num_k_heads in (2, 4, 8) and 1024 <= max_seqlen < 1409) or
+         (H == 24 and num_k_heads == 8 and 1024 <= max_seqlen < 2049)))
+    if private_mid_single_wave:
+        max_local_chunks = _cdiv(num_chunks[0], 78 // H)
+    # Private wide-N3 full-history wave budget. Each logical sequence keeps
+    # its own chunk-aligned segment construction and final partial-token tail.
+    private_wide_n3_wave = (
+        execution_model.architecture == "tc02" and
+        execution_model.physical_cu_count == 39 and chunk_size == 32 and
+        fused_head_shards == 1 and raw_batch == 3 and min(seqlens) > 0 and
+        total_chunks < 3 * max(num_chunks) and
+        ((H == 16 and num_k_heads == 4 and 8192 <= raw_cu[-1] <= 16384 and
+          4096 <= max_seqlen < 12288) or
+         (H == 24 and num_k_heads == 8 and 4096 <= raw_cu[-1] <= 8192 and
+          4096 <= max_seqlen < 8192)))
+    if private_wide_n3_wave:
+        segment_budget = 9 if H == 16 else 6
+        max_local_chunks = next(
+            cap for cap in range(4, max(num_chunks) + 1)
+            if sum(_cdiv(chunks, cap) for chunks in num_chunks) <= segment_budget)
+    # Private N3 full-history experiment: one <=72-CTA resident wave.
+    # Guard, prepare and correct algorithms/predicates remain unchanged.
+    private_h8_n3_wave = (
+        execution_model.architecture == "tc02" and
+        execution_model.physical_cu_count == 39 and chunk_size == 32 and
+        fused_head_shards == 1 and raw_batch == 3 and H == 8 and
+        num_k_heads in (2, 4) and min(seqlens) > 0 and
+        1024 <= max_seqlen < 4096 and total_chunks < 3 * max(num_chunks))
+    if private_h8_n3_wave:
+        max_local_chunks = next(
+            cap for cap in range(4, max(num_chunks) + 1)
+            if sum(_cdiv(chunks, cap) for chunks in num_chunks) <= 9)
+    private_h8_n2_wave = (
+        execution_model.architecture == "tc02" and
+        execution_model.physical_cu_count == 39 and chunk_size == 32 and
+        fused_head_shards == 1 and raw_batch == 2 and H == 8 and
+        num_k_heads in (2, 4) and min(seqlens) > 0 and
+        1024 <= max_seqlen < 4096 and total_chunks < 2 * max(num_chunks))
+    if private_h8_n2_wave:
+        max_local_chunks = next(
+            cap for cap in range(4, max(num_chunks) + 1)
+            if sum(_cdiv(chunks, cap) for chunks in num_chunks) <= 9)
+    tuned_folded = folded_prefill and folded_max_local_chunks != 0
+    if tuned_folded:
+        max_local_chunks = (max(num_chunks) if folded_max_local_chunks < 0
+                            else folded_max_local_chunks)
     cp_cu_seqlens = []
     ht_mask = []
     seq_map_c2r = []
@@ -1482,16 +1622,38 @@ def calc_cp_seqs(
     use_cp = (
         occupancy_ok and has_split and max_seqlen >= min_tokens and
         (bool(full_history_segments) or _tc02_real_gate_cp_allowed(
-            raw_cu, chunk_size, H, num_cp_segments
+            raw_cu, chunk_size, H, num_cp_segments, num_k_heads
         ))
     )
 
+    # Bypass only the historical performance admission for this private scope.
+    # The has-split invariant, full-history warmup and precision guard remain.
+    if (private_h8_n2_wave or private_h8_n3_wave or private_mid_single_wave or
+            private_wide_n3_wave or private_h8_n64_long_wave):
+        use_cp = has_split
+
+    if tuned_folded:
+        use_cp = has_split
+
     warmup_metadata = None
     if use_cp:
+        # Positive cold decisions need device tables. Reject before any H2D
+        # allocation; negative CPU-only plans remain usable during capture.
+        if (execution_model.architecture == "tc02" and
+                execution_model.physical_cu_count == 39 and raw_cu_seqlens.is_cuda):
+            with torch.cuda.device(raw_cu_seqlens.device):
+                if torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError("positive CP metadata cold miss must be warmed before capture")
         segment_chunks = [
             _cdiv(cp_cu_seqlens[i + 1] - cp_cu_seqlens[i], chunk_size)
             for i in range(num_cp_segments)
         ]
+        if mixed_decode_prefill and (raw_batch >= 32 or
+                (raw_batch == 16 and max_seqlen >= 28 * 1024)):
+            # Only predecessor transitions are consumed by correct_h0. A final
+            # or unsplit segment still runs fused_fwd, but needs no prepare_h.
+            segment_chunks = [0 if ht_mask[i] else chunks
+                              for i, chunks in enumerate(segment_chunks)]
         warmup_metadata = (
             torch.tensor(
                 [c for c in segment_chunks for _ in range(H)],

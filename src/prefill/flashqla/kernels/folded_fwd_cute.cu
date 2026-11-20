@@ -1060,7 +1060,7 @@ __global__ void __launch_bounds__(HV < 32 ? 128 : 256, 2)
 #define FF_BODY_FOLDED 1
 #define FF_BODY_PREPARE 1
 #define FF_BODY_LEGACY_TC01 1
-#include "fused_fwd_cute_body.inc"
+#include "folded_fwd_cute_body.inc"
 #undef FF_BODY_LEGACY_TC01
 #undef FF_BODY_PREPARE
 #undef FF_BODY_FOLDED
@@ -1104,7 +1104,7 @@ __global__ void __launch_bounds__(128, 2)
 #define FF_BODY_FOLDED 1
 #define FF_BODY_PREPARE 1
 #define FF_BODY_LEGACY_TC01 1
-#include "fused_fwd_cute_body.inc"
+#include "folded_fwd_cute_body.inc"
 #undef FF_BODY_LEGACY_TC01
 #undef FF_BODY_PREPARE
 #undef FF_BODY_FOLDED
@@ -1298,7 +1298,7 @@ gdn_folded_forward_kernel(
   const int folded_sequence = blockIdx.x / 2;
 #define FF_BODY_FOLDED 1
 #define FF_BODY_INDEXED_TC01 1
-#include "fused_fwd_cute_body.inc"
+#include "folded_fwd_cute_body.inc"
 #undef FF_BODY_INDEXED_TC01
 #undef FF_BODY_FOLDED
 #endif
@@ -1613,7 +1613,7 @@ void launch_folded_correct_bf16(
   correct_h0_cute_kernel<E, Groups, false, 4, Padding, FirstSegment>
       <<<raw_batch * heads * 2, 256, bytes, stream>>>(
           corrected, pool, indices, static_cast<const E*>(ht), static_cast<const E*>(mt),
-          fallback, mapping, cp_batch, raw_batch, heads, 1, 1, false, false);
+          fallback, mapping, cp_batch, raw_batch, heads, 1, 1, false, false, nullptr, 0);
 }
 
 }  // namespace

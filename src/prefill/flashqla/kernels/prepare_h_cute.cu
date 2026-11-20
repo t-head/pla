@@ -77,6 +77,7 @@
 #include <type_traits>
 
 #include "flashqla_cute_traits.cuh"
+#include "prefill/flashqla/common/prepare_policy.h"
 
 // K .swzl port default ON (matches fused_fwd's FF_K_SWZL default).  Eliminates
 // KT_buf and the CTA-wide K->KT smem transpose loop.
@@ -790,40 +791,60 @@ __global__ void __launch_bounds__(128, 6) ph_precompute_x_kernel(
 // 16B-vector copy instead of scattered 2B stores. Arithmetic, accumulation
 // order and rounding match ph_precompute_x_kernel element for element.
 
-template <typename Element>
-__global__ void __launch_bounds__(PH_WG * PH_X_GROUP, 4)
+template <typename Element, int Group = PH_X_GROUP, bool PhysicalSlots = false>
+__global__ void __launch_bounds__(PH_WG * Group, 4)
 ph_precompute_x_group_kernel(
     const Element* k, const Element* a, const float* beta, Element* x,
     const int* cu_seqlens, int batch_size, int H, int Hg) {
 #if defined(FLASHQLA_ARCH_150) && PH_XY_FACTOR
   using CE = typename fq::ElementTraits<Element>::CuteType;
   int chunk = blockIdx.x;
-  const int key_head = blockIdx.y;
+  const int value_head_base = blockIdx.y * Group;
+  const int key_head = value_head_base / (H / Hg);
   int seq = 0, start = 0, end = 0;
-  for (; seq < batch_size; ++seq) {
+  if constexpr (PhysicalSlots) {
+    // Existing X address is ((cts / PH_CS + seq) * H + head).
+    // Sequence slot bases cu[seq]/PH_CS + seq are strictly increasing;
+    // binary-search physical slots and return for the padding gaps.
+    int lo = 0, hi = batch_size;
+    while (lo < hi) {
+      const int mid = lo + (hi - lo) / 2;
+      const int slot_base = cu_seqlens[mid] / PH_CS + mid;
+      if (slot_base <= int(blockIdx.x)) lo = mid + 1;
+      else hi = mid;
+    }
+    seq = lo - 1;
+    if (seq < 0) return;
     start = cu_seqlens[seq];
     end = cu_seqlens[seq + 1];
-    const int chunks = (end - start + PH_CS - 1) / PH_CS;
-    if (chunk < chunks) break;
-    chunk -= chunks;
+    chunk = int(blockIdx.x) - (start / PH_CS + seq);
+    if (chunk < 0 || chunk >= (end - start + PH_CS - 1) / PH_CS) return;
+  } else {
+    for (; seq < batch_size; ++seq) {
+      start = cu_seqlens[seq];
+      end = cu_seqlens[seq + 1];
+      const int chunks = (end - start + PH_CS - 1) / PH_CS;
+      if (chunk < chunks) break;
+      chunk -= chunks;
+    }
+    if (seq == batch_size) return;
   }
-  if (seq == batch_size) return;
   const int cts = start + chunk * PH_CS;
   const int actual = min(PH_CS, end - cts);
   const int group = threadIdx.x / PH_WG;
   const int tx = threadIdx.x % PH_WG;
-  const int head = key_head * PH_X_GROUP + group;
+  const int head = value_head_base + group;
   __shared__ Element K_buf[PH_ELEM_K];
-  __shared__ Element A_buf[PH_X_GROUP][PH_ELEM_A];
-  __shared__ float b[PH_X_GROUP][PH_CS];
-  __shared__ __align__(16) Element stage[PH_X_GROUP][PH_DK * PH_X_STAGE_LD];
+  __shared__ Element A_buf[Group][PH_ELEM_A];
+  __shared__ float b[Group][PH_CS];
+  __shared__ __align__(16) Element stage[Group][PH_DK * PH_X_STAGE_LD];
   if (threadIdx.x == 0) {
     ph_aiu_swzl_write_k_cs32<Element>(K_buf,
         k + (int64_t)cts * Hg * PH_DK + key_head * PH_DK, Hg * PH_DK, actual);
     CUTE_UNROLL
-    for (int g = 0; g < PH_X_GROUP; ++g) {
+    for (int g = 0; g < Group; ++g) {
       ph_aiu_load_2d_b16(A_buf[g],
-          a + (int64_t)cts * H * PH_CS + (key_head * PH_X_GROUP + g) * PH_CS,
+          a + (int64_t)cts * H * PH_CS + (value_head_base + g) * PH_CS,
           PH_CS, actual, (int64_t)H * PH_CS * sizeof(Element), PH_CS);
     }
     ph_aiu_commit();
@@ -957,7 +978,7 @@ __device__ __forceinline__ void ph_load_precomputed_x(
 // reproduces the recurrence to rel ~4e-16.
 template <typename Element, int PH_MIN_BLOCKS, bool PH_COMPUTE_MT = false,
           bool PH_COMBINED = false, bool PH_SPLIT_DV = false,
-          int PH_STREAM_H = 0, int PH_TRANSPOSED = 0>
+          int PH_STREAM_H = 0, int PH_TRANSPOSED = 0, bool SkipSelectedT1 = false>
 __global__ void __launch_bounds__(PhSmemLayout<PH_COMBINED, PH_SPLIT_DV,
                                            (PH_STREAM_H >= 3)>::NTHREADS,
                                   PH_MIN_BLOCKS)
@@ -972,7 +993,10 @@ prepare_h_cp_cute_kernel(
     const int* __restrict__ cu_seqlens,        // [batch+1]
     const int* __restrict__ num_warmup_chunks, // [batch*H]
     int batch_size, int num_tokens, int H, int Hg,
-    int64_t v_token_stride, const Element* __restrict__ precomputed_x)
+    int64_t v_token_stride, const Element* __restrict__ precomputed_x,
+    const int* __restrict__ precision_flags, const int* __restrict__ cp_to_raw,
+    const int* __restrict__ raw_to_cp, const int* __restrict__ raw_cu_seqlens,
+    int raw_batch_size)
 {
   using Layout = PhSmemLayout<PH_COMBINED, PH_SPLIT_DV, (PH_STREAM_H >= 3)>;
   static_assert(PH_TRANSPOSED >= 0 && PH_TRANSPOSED <= 2);
@@ -992,6 +1016,22 @@ prepare_h_cp_cute_kernel(
 
   const int seq_start = cu_seqlens[batch_idx];
   const int seq_end   = cu_seqlens[batch_idx + 1];
+  if constexpr (SkipSelectedT1) {
+    // CTA-uniform check before any state load, shared-memory access or barrier.
+    // Check both maps: fused uses c2r and selected-correct iterates r2c ranges.
+    // Device offsets are reread on every replay; empty/2+/split segments retain
+    // the original prepare path even if the host allocation was a T1 case.
+    const int raw_seq = cp_to_raw[batch_idx];
+    if (raw_seq >= 0 && raw_seq < raw_batch_size &&
+        raw_to_cp[raw_seq] <= batch_idx && batch_idx < raw_to_cp[raw_seq + 1]) {
+      const int raw_begin = raw_cu_seqlens[raw_seq];
+      const int raw_end = raw_cu_seqlens[raw_seq + 1];
+      if (raw_begin >= 0 && raw_end <= num_tokens && raw_end > raw_begin &&
+          raw_end - raw_begin == 1 &&
+          seq_start == raw_begin && seq_end == raw_end &&
+          precision_flags[raw_seq * Hg + kv_head_idx] != 0) return;
+    }
+  }
   const int seg_len   = seq_end - seq_start;
   const int total_chunks = (seg_len + PH_CS - 1) / PH_CS;
 
@@ -1851,12 +1891,13 @@ namespace {
 constexpr int PH_MAX_CACHED_DEVICES = 64;
 
 template <typename Element, int MinBlocks, bool ComputeMT,
-          bool Combined, bool SplitDV, int StreamH = 0, int Transposed = 0>
+          bool Combined, bool SplitDV, int StreamH = 0, int Transposed = 0,
+          bool SkipSelectedT1 = false>
 void prepare_h_configure_dynamic_smem(int device_index, int smem_bytes) {
   auto configure = [smem_bytes]() {
     if (hggcFuncSetAttribute(
             flashqla_cute::prepare_h_cp_cute_kernel<
-                Element, MinBlocks, ComputeMT, Combined, SplitDV, StreamH, Transposed>,
+                Element, MinBlocks, ComputeMT, Combined, SplitDV, StreamH, Transposed, SkipSelectedT1>,
             hggcFuncAttributeMaxDynamicSharedMemorySize,
             smem_bytes) != hggcSuccess) {
       hggcGetLastError();
@@ -1883,7 +1924,9 @@ void launch_prepare_h_cp_cute(
     int batch_size, int num_tokens, int H, int Hg, int dtype_tag,
     int64_t v_token_stride,
     int device_index, int num_cu, int compute_capability,
-    void* precomputed_x, hggcStream_t stream)
+    void* precomputed_x, const int* precision_flags, const int* cp_to_raw,
+    const int* raw_to_cp, const int* raw_cu_seqlens, int raw_batch_size,
+    hggcStream_t stream)
 {
   if (compute_capability != 80 && compute_capability != 89) {
     throw std::runtime_error(
@@ -1893,9 +1936,12 @@ void launch_prepare_h_cp_cute(
   dim3 grid(grid_size);
   dim3 tc01_grid(grid_size, 2);
   const bool is_tc01 = compute_capability == 80;
-  const bool stream_target = !is_tc01 && num_cu == 39 && precomputed_x &&
-      num_tokens == 8192 && ((H == 12 && Hg == 4 && batch_size == 6) ||
-                             (H == 6 && Hg == 2 && batch_size == 12));
+  const bool selected_t1 = precision_flags && cp_to_raw && raw_to_cp && raw_cu_seqlens &&
+      compute_capability == 89 && num_cu == 39 && raw_batch_size == 64 &&
+      H == 8 && (Hg == 2 || Hg == 4);
+  const bool stream_target = precomputed_x &&
+      flashqla::tc02_precompute_x_allowed(
+          compute_capability, num_cu, num_tokens, H, Hg, batch_size);
   const int stream_mode = stream_target ? 3 : 0;
   // PH_XY_FACTOR is a compile-time 0 for the tc01 image, but it stays in this
   // condition instead of becoming an #if: a preprocessor guard would leave the
@@ -1904,7 +1950,43 @@ void launch_prepare_h_cp_cute(
   // image lacks a kernel the host launches fails at run time with "empty
   // kernel launch" / invalid device function -- even though ZW-M890P executes
   // the ppu0015 image. stream_target already excludes tc01 at run time.
-  if (PH_XY_FACTOR && stream_mode >= 3 &&
+  // Private single-factor experiment, scoped to the measured N64 CP9 case.
+  const bool physical_x_slots = compute_capability == 89 && num_cu == 39 &&
+      H == 8 && Hg == 2 && batch_size == 72 && num_tokens == 8255;
+  if (PH_XY_FACTOR && stream_mode >= 3 && physical_x_slots) {
+    dim3 x_grid((num_tokens + 31) / 32 + batch_size, H / 4);
+    if (dtype_tag == 0) {
+      flashqla_cute::ph_precompute_x_group_kernel<__half, 4, true><<<x_grid, 512, 0, stream>>>(
+          reinterpret_cast<const __half*>(k), reinterpret_cast<const __half*>(a), beta,
+          reinterpret_cast<__half*>(precomputed_x), cu_seqlens, batch_size, H, Hg);
+    } else {
+      flashqla_cute::ph_precompute_x_group_kernel<__ppu_bfloat16, 4, true><<<x_grid, 512, 0, stream>>>(
+          reinterpret_cast<const __ppu_bfloat16*>(k), reinterpret_cast<const __ppu_bfloat16*>(a), beta,
+          reinterpret_cast<__ppu_bfloat16*>(precomputed_x), cu_seqlens, batch_size, H, Hg);
+    }
+  } else if (PH_XY_FACTOR && stream_mode >= 3 && (H / Hg) % 4 == 0) {
+    dim3 x_grid((num_tokens + 31) / 32 + batch_size, H / 4);
+    if (dtype_tag == 0) {
+      flashqla_cute::ph_precompute_x_group_kernel<__half, 4><<<x_grid, 512, 0, stream>>>(
+          reinterpret_cast<const __half*>(k), reinterpret_cast<const __half*>(a), beta,
+          reinterpret_cast<__half*>(precomputed_x), cu_seqlens, batch_size, H, Hg);
+    } else {
+      flashqla_cute::ph_precompute_x_group_kernel<__ppu_bfloat16, 4><<<x_grid, 512, 0, stream>>>(
+          reinterpret_cast<const __ppu_bfloat16*>(k), reinterpret_cast<const __ppu_bfloat16*>(a), beta,
+          reinterpret_cast<__ppu_bfloat16*>(precomputed_x), cu_seqlens, batch_size, H, Hg);
+    }
+  } else if (PH_XY_FACTOR && stream_mode >= 3 && H == 2 * Hg) {
+    dim3 x_grid((num_tokens + 31) / 32 + batch_size, H / 2);
+    if (dtype_tag == 0) {
+      flashqla_cute::ph_precompute_x_group_kernel<__half, 2><<<x_grid, 256, 0, stream>>>(
+          reinterpret_cast<const __half*>(k), reinterpret_cast<const __half*>(a), beta,
+          reinterpret_cast<__half*>(precomputed_x), cu_seqlens, batch_size, H, Hg);
+    } else {
+      flashqla_cute::ph_precompute_x_group_kernel<__ppu_bfloat16, 2><<<x_grid, 256, 0, stream>>>(
+          reinterpret_cast<const __ppu_bfloat16*>(k), reinterpret_cast<const __ppu_bfloat16*>(a), beta,
+          reinterpret_cast<__ppu_bfloat16*>(precomputed_x), cu_seqlens, batch_size, H, Hg);
+    }
+  } else if (PH_XY_FACTOR && stream_mode >= 3 &&
       H == flashqla_cute::PH_X_GROUP * Hg) {
     dim3 x_grid((num_tokens + 31) / 32 + batch_size, Hg);
     constexpr int x_threads = flashqla_cute::PH_WG * flashqla_cute::PH_X_GROUP;
@@ -1943,27 +2025,37 @@ void launch_prepare_h_cp_cute(
         reinterpret_cast<ElementType*>(ht), reinterpret_cast<ElementType*>(mt), \
         cu_seqlens, num_warmup_chunks, \
         batch_size, num_tokens, H, Hg, v_token_stride, \
-        reinterpret_cast<const ElementType*>(precomputed_x)); \
+        reinterpret_cast<const ElementType*>(precomputed_x), \
+        precision_flags, cp_to_raw, raw_to_cp, raw_cu_seqlens, raw_batch_size); \
   } while (0)
 
-#define PH_LAUNCH_COMBINED_T(ElementType, StreamH, Transposed) \
+#define PH_LAUNCH_COMBINED_T(ElementType, StreamH, Transposed, SkipT1) \
   do { \
     constexpr int MinBlocks = StreamH ? 2 : 1; \
     constexpr int SmemBytes = flashqla_cute::PhSmemLayout<true, false, (StreamH >= 3)>::TOTAL; \
     prepare_h_configure_dynamic_smem< \
-        ElementType, MinBlocks, false, true, false, StreamH, Transposed>( \
+        ElementType, MinBlocks, false, true, false, StreamH, Transposed, SkipT1>( \
             device_index, SmemBytes); \
-    flashqla_cute::prepare_h_cp_cute_kernel<ElementType, MinBlocks, false, true, false, StreamH, Transposed> \
+    flashqla_cute::prepare_h_cp_cute_kernel<ElementType, MinBlocks, false, true, false, StreamH, Transposed, SkipT1> \
         <<<grid, dim3(512), SmemBytes, stream>>>( \
         reinterpret_cast<const ElementType*>(k), reinterpret_cast<const ElementType*>(v), \
         reinterpret_cast<const ElementType*>(a), g, beta, \
         reinterpret_cast<ElementType*>(ht), reinterpret_cast<ElementType*>(mt), \
         cu_seqlens, num_warmup_chunks, \
         batch_size, num_tokens, H, Hg, v_token_stride, \
-        reinterpret_cast<const ElementType*>(precomputed_x)); \
+        reinterpret_cast<const ElementType*>(precomputed_x), \
+        precision_flags, cp_to_raw, raw_to_cp, raw_cu_seqlens, raw_batch_size); \
   } while (0)
 
-  if (is_tc01) {
+  if (selected_t1) {
+    if (dtype_tag == 0) {
+      if (stream_target) PH_LAUNCH_COMBINED_T(__half, 3, 2, true);
+      else PH_LAUNCH_COMBINED_T(__half, 0, 0, true);
+    } else {
+      if (stream_target) PH_LAUNCH_COMBINED_T(__ppu_bfloat16, 3, 2, true);
+      else PH_LAUNCH_COMBINED_T(__ppu_bfloat16, 0, 0, true);
+    }
+  } else if (is_tc01) {
     constexpr int PH_CU_COUNT = 39;
     if (dtype_tag == 0) {
       if (grid_size > PH_CU_COUNT * 2) {
@@ -1983,11 +2075,11 @@ void launch_prepare_h_cp_cute(
       }
     }
   } else if (dtype_tag == 0) {
-    if (stream_target) PH_LAUNCH_COMBINED_T(__half, 3, 2);
-    else PH_LAUNCH_COMBINED_T(__half, 0, 0);
+    if (stream_target) PH_LAUNCH_COMBINED_T(__half, 3, 2, false);
+    else PH_LAUNCH_COMBINED_T(__half, 0, 0, false);
   } else {
-    if (stream_target) PH_LAUNCH_COMBINED_T(__ppu_bfloat16, 3, 2);
-    else PH_LAUNCH_COMBINED_T(__ppu_bfloat16, 0, 0);
+    if (stream_target) PH_LAUNCH_COMBINED_T(__ppu_bfloat16, 3, 2, false);
+    else PH_LAUNCH_COMBINED_T(__ppu_bfloat16, 0, 0, false);
   }
 
 #undef PH_LAUNCH_COMBINED_T

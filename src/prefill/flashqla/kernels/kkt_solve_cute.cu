@@ -38,7 +38,7 @@ void name( \
     const void* K, const float* beta, void* A, \
     const int* cu_seqlens, const int* chunk_indices, \
     int H, int Hg, int num_chunks, int num_tokens, int dtype_tag, \
-    int device_index, int num_cu, \
+    int device_index, int num_cu, int sequences, \
     hggcStream_t stream)
 
 DECLARE_KKT_ARCH_LAUNCHER(launch_kkt_solve_cute_tc01);
@@ -48,7 +48,7 @@ void launch_kkt_solve_cute(
     const void* K, const float* beta, void* A,
     const int* cu_seqlens, const int* chunk_indices,
     int H, int Hg, int num_chunks, int num_tokens, int dtype_tag,
-    int device_index, int num_cu, int compute_capability,
+    int device_index, int num_cu, int compute_capability, int sequences,
     hggcStream_t stream) {
     decltype(&launch_kkt_solve_cute_tc01) launcher = nullptr;
     if (compute_capability == 80) {
@@ -62,7 +62,7 @@ void launch_kkt_solve_cute(
     launcher(
         K, beta, A, cu_seqlens, chunk_indices,
         H, Hg, num_chunks, num_tokens, dtype_tag,
-        device_index, num_cu, stream);
+        device_index, num_cu, sequences, stream);
 }
 
 #undef DECLARE_KKT_ARCH_LAUNCHER
