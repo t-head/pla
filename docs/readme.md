@@ -39,6 +39,7 @@ python scripts/build.py --mode tuned
 # Build one selectable namespace.
 python scripts/build.py --namespace pla.decode
 python scripts/build.py --namespace pla.decode.gdn.v_last
+python scripts/build.py --namespace pla.decode.gdn_replayssm
 python scripts/build.py --namespace pla.decode.kda_mtp_sglang
 python scripts/build.py --namespace pla.prefill.flashqla
 python scripts/build.py --namespace pla.prefill.flashkdapro
@@ -319,6 +320,30 @@ fused_sigmoid_gating_delta_rule_forward(
 ```
 
 Dispatch between the small- and big-batch paths is automatic.
+
+## Decode: GDN ReplaySSM
+
+The common API and the two framework adapters share one compiled extension.
+Import `gdn_replay_decode`, `gdn_replay_verify`, or `gdn_replay_materialize`
+from `pla.decode.gdn_replayssm` when managing replay mappings and history
+directly. The SGLang adapter exposes `gdn_replayssm_spec_decode`,
+`commit_gdn_replayssm_spec`, and `commit_gdn_replayssm_circular`.
+
+The HLM adapter exposes `fused_recurrent_gated_delta_rule_cached_replay_update`
+and `commit_gdn_cached_replay_history_layers` in
+`pla.decode.gdn_replayssm_hlm`. Cached verification takes Q/K in `[B, T, H, K]`,
+V in `[B, T, HV, V]`, state in `[slots, HV, V, K]`, two banks of history,
+and per-slot count and bank tensors. It supports fixed `T <= 8` and history
+capacity `T <= L <= 16`. The caller advances count and bank after accepting
+the verified prefix. When `old_count + T > L`, inline mode folds the old
+prefix into state and writes the verified window at offset zero in the
+other bank. Layered mode uses the separate commit API and a device work list.
+
+The PPU1.5 fast path for `H=16`, `HV=48`, `K=V=128`, `T=4`, and `B=1` or
+`2` uses a BF16 input and history, FP32 state, and contiguous int32 metadata.
+It supports packed QKV with raw BF16 gates and separate Q/K/V with processed
+FP32 gates. Other shapes are selected by the cached dispatcher. The caller
+owns the tensors and stream ordering for the entire verify and commit cycle.
 
 ## Decode: SGLang KDA MTP
 
