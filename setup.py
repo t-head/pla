@@ -36,6 +36,9 @@ Namespaces and their compiled artifacts:
     pla.decode.gdn.v_last       -> pla/decode/gdn/v_last/_C.*.so         (src/decode/v-last/**)
     pla.decode.kda_replayssm_sglang -> pla/decode/kda_replayssm_sglang/_C.*.so
     pla.decode.kda_replayssm_vllm   -> pla/decode/kda_replayssm_vllm/_C.*.so
+    pla.decode.gdn_replayssm       -> pla/decode/gdn_replayssm/_C.*.so
+    pla.decode.gdn_replayssm_sglang -> shared gdn_replayssm extension
+    pla.decode.gdn_replayssm_hlm    -> shared gdn_replayssm extension
     pla.prefill.flashqla        -> pla/prefill/flashqla/_C.*.so          (src/prefill/flashqla/**)
     pla.prefill.flashkdapro     -> pla/prefill/flashkdapro/_C.*.so       (src/prefill/flashkdapro/**)
 
@@ -96,6 +99,8 @@ here = os.path.abspath(os.path.dirname(__file__))
 # ---------------------------------------------------------------------------
 ALL_NAMESPACES = ("pla.decode", "pla.decode.gdn.v_last",
                   "pla.decode.kda_replayssm_sglang", "pla.decode.kda_replayssm_vllm",
+                  "pla.decode.gdn_replayssm", "pla.decode.gdn_replayssm_sglang",
+                  "pla.decode.gdn_replayssm_hlm",
                   "pla.prefill.flashqla", "pla.prefill.flashkdapro")
 
 
@@ -323,6 +328,64 @@ for kda_namespace in ("pla.decode.kda_replayssm_sglang", "pla.decode.kda_replays
             extra_link_args=[],
         )
     )
+
+
+# ---------------------------------------------------------------------------
+# pla.decode.gdn_replayssm and its Python adapters
+# ---------------------------------------------------------------------------
+if any(ns in NAMESPACES for ns in (
+    "pla.decode.gdn_replayssm", "pla.decode.gdn_replayssm_sglang", "pla.decode.gdn_replayssm_hlm"
+)):
+    gdn_replayssm_dir = os.path.join(here, "src", "decode", "gdn_replayssm")
+    gdn_replayssm_sdk, _ = PPUBuildExtension._find_toolchain()
+    gdn_replayssm_cxx = ['-O3']
+    gdn_replayssm_compat = gdn_replayssm_sdk / 'CUDA_SDK' / 'include'
+    if (gdn_replayssm_compat / 'cuda_runtime.h').is_file():
+        gdn_replayssm_cxx.append(f'-I{gdn_replayssm_compat}')
+    cached_ppu15 = os.path.join(gdn_replayssm_dir, "gdn_replayssm_cached_ppu15.cu")
+    extension = Extension(
+        name='pla.decode.gdn_replayssm._C',
+        sources=[
+            os.path.join(gdn_replayssm_dir, "gdn_replayssm_host.cpp"),
+            os.path.join(gdn_replayssm_dir, "gdn_replayssm.cu"),
+            cached_ppu15,
+        ],
+        depends=[
+            os.path.join(gdn_replayssm_dir, "gdn_replayssm_abi.h"),
+            os.path.join(gdn_replayssm_dir, "gdn_replayssm_commit.cuh"),
+            os.path.join(gdn_replayssm_dir, "gdn_replayssm_sglang_metadata.cuh"),
+            os.path.join(gdn_replayssm_dir, "gdn_replayssm_project.cuh"),
+            os.path.join(gdn_replayssm_dir, "gdn_replayssm_materialize.cuh"),
+            os.path.join(gdn_replayssm_dir, "gdn_replayssm_cached.cuh"),
+            os.path.join(gdn_replayssm_dir, "gdn_replayssm_cached_tensor.cuh"),
+            *sorted(str(header) for header in
+                    (Path(gdn_replayssm_dir) / "cached_ppu15").glob("*.cuh")),
+        ],
+        extra_compile_args={
+            'cxx': gdn_replayssm_cxx,
+            'hgcc': [
+                '-x', 'hg',
+                '-O3',
+                '-std=c++17',
+                '--use_fast_math',
+                '-lineinfo',
+                '-mllvm', '-ppu-patch-fence-ppu=false',
+                '-mllvm', '-wno-loop-miss-transform',
+                '-mllvm', '-ppu-cg-to-kp1=true',
+                '-mllvm', '-ppu-fix-uninit=true',
+                '-mllvm', '-ppu-force-warpage=true',
+                '-mllvm', '-sort-copy-before-coalesce=true',
+                '-mllvm', '-ppu-eliminate-early-v2s=true',
+                '-mllvm', '-ppu-pref-fma-reuse=true',
+                '--threads', HGCC_THREADS,
+                '-arch=ppu_10', '-arch=ppu_15',
+            ],
+        },
+        include_dirs=[os.path.join(here, "src")],
+        extra_link_args=[],
+    )
+    extension.ppu15_sources = [cached_ppu15]
+    ext_modules.append(extension)
 
 
 # ---------------------------------------------------------------------------

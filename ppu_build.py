@@ -233,12 +233,22 @@ class PPUBuildExtension(build_ext):
         if hasattr(extension, "fla_builder"):
             _, manifest = extension.fla_builder.compile_objects(self, extension)
 
+        ppu15_sources = getattr(extension, "ppu15_sources", ())
+        portable_sources = [path for path in extension.sources if path not in ppu15_sources]
         objects = self.compile_sources(
-            extension.sources,
+            portable_sources,
             output_dir,
             extension,
             depends=extension.depends,
         )
+        if ppu15_sources:
+            # Keep tc02-only stubs in an object that carries a single device image.
+            compile_args = dict(extension.extra_compile_args)
+            compile_args["hgcc"] = [flag for flag in compile_args["hgcc"] if flag != "-arch=ppu_10"]
+            objects += self.compile_sources(
+                ppu15_sources, output_dir / "ppu15", extension, compile_args,
+                depends=extension.depends,
+            )
         objects += list(extension.extra_objects or [])
         link_command = self._link(extension, objects, self.get_ext_fullpath(extension.name))
 
