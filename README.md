@@ -82,9 +82,9 @@ The standard `pla.prefill.flashqla` build includes folded prefill kernels for
 39-CU M890P devices with BF16 inputs, head dimension 128, and an indexed FP32
 state pool. Pre-activated inputs use the tc02 length thresholds and measured
 layout overrides. Packed raw inputs use folded prefill for measured, unpadded
-layouts with auto-CP enabled. The selected layouts include single-sequence
-8K/32K with 24 value heads and 8 Q/K heads, single-sequence 32K with 12/4
-heads, and the exact mixed-batch layouts in `FOLDED_TC02_PACKED_RAW`.
+layouts with auto-CP enabled. `FOLDED_TC02_PACKED_RAW` keys admission by value
+heads, Q/K heads, and the complete sequence offsets. It includes measured
+single-sequence and mixed-batch layouts from the GDN prefill case lists.
 
 Packed raw keeps the established FP32 sigmoid for the FP64 repair guard.
 Other packed layouts use the established dispatch, including the calibrated
