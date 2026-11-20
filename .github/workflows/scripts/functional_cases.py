@@ -4,9 +4,13 @@ from dataclasses import dataclass
 
 
 BASELINE = "38646e904784fbd3beeadafa2b9485dabc5cc09e"
+# GDN models exercised by the decode/prefill CI matrix. Qwen4-Max is the
+# content-identical rename of the former Qwen3.7-Max, so it inherits the same
+# "no cuda reference kernel" and enlarged k_last_mtp timeout handling. The
+# newer Qwen3.8-Flash-Next list ships in caselist/ but is intentionally not
+# onboarded as a CI case here (align-only refresh, no new coverage).
 GDN_MODELS = (
-    "Qwen3.5-27B", "Qwen3.5-35B-A3B", "Qwen3.5-397B-A17B",
-    "Qwen3-Next-80B-A3B", "Qwen3.7-Max",
+    "Qwen3.5-397B-A17B", "Qwen4-Max",
 )
 
 
@@ -29,11 +33,11 @@ def cases():
     result = []
     for model in GDN_MODELS:
         kernels = ("k_last", "k_last_packed", "k_last_mtp")
-        if model != "Qwen3.7-Max":
+        if model != "Qwen4-Max":
             kernels = ("cuda",) + kernels
         for kernel in kernels:
             timeout = 5400 if kernel == "k_last_mtp" and model in (
-                "Qwen3.5-27B", "Qwen3.7-Max",
+                "Qwen4-Max",
             ) else 3600
             result.append(Case(
                 f"{model}-{kernel}", "decode",

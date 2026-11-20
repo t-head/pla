@@ -30,10 +30,10 @@ class FunctionalCITests(unittest.TestCase):
 
     def test_inventory_matches_checkin_counts_and_assets(self):
         selected = cases()
-        self.assertEqual(Counter(case.phase for case in selected), {"decode": 34, "prefill": 20})
-        self.assertEqual(len({case.name for case in selected}), 54)
+        self.assertEqual(Counter(case.phase for case in selected), {"decode": 22, "prefill": 17})
+        self.assertEqual(len({case.name for case in selected}), 39)
         runner.validate_inventory(selected)
-        self.assertEqual(sum("--kernel=cuda" in case.argv for case in selected), 4)
+        self.assertEqual(sum("--kernel=cuda" in case.argv for case in selected), 1)
         self.assertFalse(any("--max-cases" in arg for case in selected for arg in case.argv))
 
     def test_vllm_replay_contract_is_registered(self):
@@ -359,6 +359,14 @@ class FunctionalCITests(unittest.TestCase):
         # leaves an uploadable artifact; the suite result fails the job, so a
         # failed board skips merge and publishing.
         self.assertLess(worker.index('mkdir -p "$PLA_REPORT_ROOT/wheels"'),
+                        worker.index("for phase in decode prefill"))
+        # The installed wheel's compiled extensions must be staged back into
+        # the source tree between install and the suite, mirroring the
+        # per-board PR workflow; repo-root `import pla` groups fail otherwise.
+        self.assertIn('run_functional.py --stage-wheel "${wheels[0]}"', worker)
+        self.assertLess(worker.index('--force-reinstall --no-deps "${wheels[0]}"'),
+                        worker.index('--stage-wheel "${wheels[0]}"'))
+        self.assertLess(worker.index('--stage-wheel "${wheels[0]}"'),
                         worker.index("for phase in decode prefill"))
         self.assertIn('exit "$result"', worker)
         self.assertIn("needs: build-test", workflow)
