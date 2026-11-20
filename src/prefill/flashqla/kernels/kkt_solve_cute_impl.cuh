@@ -1450,7 +1450,7 @@ constexpr int KKT_GROUP_OFF_GRAM = KKT_GROUP_OFF_K + KKT_CS * KKT_DK * 2;
 constexpr int KKT_GROUP_SMEM_BYTES = KKT_GROUP_OFF_GRAM + KKT_CS * KKT_CS * 4;
 
 #if defined(FLASHQLA_ARCH_150)
-template <typename Element>
+template <typename Element, int GroupsPerKey = 1>
 __global__ void __launch_bounds__(KKT_NThreads, 12)
 kkt_solve_group_cute_kernel(
     Element* __restrict__ A_out,
@@ -1462,11 +1462,16 @@ kkt_solve_group_cute_kernel(
     const int tx = threadIdx.x;
     const int warp = tx >> 5;
     const int lane = tx & 31;
+    static_assert(KKT_NThreads == 128 &&
+        (GroupsPerKey == 1 || GroupsPerKey == 2), "four warps per head group");
     const int task = blockIdx.x;
-    if (task >= num_chunks * Hg) return;
+    if (task >= num_chunks * Hg * GroupsPerKey) return;
 
-    const int global_chunk = task / Hg;
-    const int key_head = task % Hg;
+    // GroupsPerKey=1 retains the existing chunk/key-head ownership exactly.
+    // GVA8 uses two CTAs per key head, each solving four distinct value heads.
+    const int global_chunk = task / (Hg * GroupsPerKey);
+    const int key_head = (task / GroupsPerKey) % Hg;
+    const int value_group = task % GroupsPerKey;
     const int seq_idx = chunk_indices ? chunk_indices[global_chunk * 2] : 0;
     const int local_chunk = chunk_indices
         ? chunk_indices[global_chunk * 2 + 1] : global_chunk;
@@ -1490,8 +1495,9 @@ kkt_solve_group_cute_kernel(
     kkt_aiu_commit();
 
     const int heads_per_k = H / Hg;
-    const bool solver = warp < heads_per_k;
-    const int head = key_head * heads_per_k + warp;
+    const int local_value_head = value_group * 4 + warp;
+    const bool solver = local_value_head < heads_per_k;
+    const int head = key_head * heads_per_k + local_value_head;
     const float beta_r = (solver && lane < actual)
         ? beta[(int64_t)(chunk_start + lane) * H + head] : 0.0f;
 
@@ -1534,7 +1540,7 @@ kkt_solve_group_cute_kernel(
     }
 }
 #else
-template <typename Element>
+template <typename Element, int GroupsPerKey = 1>
 __global__ void __launch_bounds__(KKT_NThreads, 12)
 kkt_solve_group_cute_kernel(
     Element* __restrict__, const Element* __restrict__,
@@ -1613,13 +1619,13 @@ void kkt_configure_pair_dynamic_smem(int device_index, int smem_bytes) {
         });
 }
 
-template <typename Element>
+template <typename Element, int GroupsPerKey = 1>
 void kkt_configure_group_dynamic_smem(int device_index, int smem_bytes) {
     static std::once_flag configured[KKT_MAX_CACHED_DEVICES];
     kkt_configure_dynamic_smem_once(
         configured, device_index, [smem_bytes]() {
             return hggcFuncSetAttribute(
-                FLASHQLA_KKT_NAMESPACE::kkt_solve_group_cute_kernel<Element>,
+                FLASHQLA_KKT_NAMESPACE::kkt_solve_group_cute_kernel<Element, GroupsPerKey>,
                 hggcFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
         });
 }
@@ -1634,7 +1640,7 @@ void FLASHQLA_KKT_LAUNCHER(
     const int* cu_seqlens,
     const int* chunk_indices,
     int H, int Hg, int num_chunks, int num_tokens, int dtype_tag,
-    int device_index, int num_cu,
+    int device_index, int num_cu, int sequences,
     hggcStream_t stream)
 {
     // The host pass has no __HGGC_ARCH__.  Each wrapper supplies its host
@@ -1734,9 +1740,31 @@ void FLASHQLA_KKT_LAUNCHER(
     int grid_x = total_tasks;
 #else
     int grid_x = total_tasks < persist ? total_tasks : persist;
-    const bool use_group = nsm == 39 && num_tokens == 8192 &&
-        ((H == 12 && Hg == 4) || (H == 6 && Hg == 2));
+    const bool use_group = nsm == 39 &&
+        ((num_tokens == 8192 &&
+          ((H == 12 && Hg == 4) || (H == 6 && Hg == 2))) ||
+         (H == 24 && Hg == 8 && num_tokens >= 1024 && num_tokens <= 16384));
     dim3 group_grid(num_chunks * Hg > 0 ? num_chunks * Hg : 1);
+    // Private measured T1211 neighborhood. Exact N1 full-packed calls omit
+    // chunk_indices; packed/padded calls keep their prior dispatch unchanged.
+    const bool use_group8 = num_cu == 39 && single_sequence &&
+        ((H == 16 && Hg == 2 && ((sequences == 1 && num_tokens == 847) ||
+          (num_tokens >= 1024 && num_tokens < 1409))) ||
+         (H == 32 && Hg == 4 && num_tokens >= 128 && num_tokens < 256) ||
+         ((num_tokens == 24 || num_tokens == 48) && ((H == 64 && Hg == 8) || (H == 128 && Hg == 16))));
+    const bool medium_h8_group = sequences == 2 && !single_sequence && H == 8 &&
+        ((Hg == 2 && num_tokens == 1041 && num_chunks == 33) ||
+         (Hg == 4 && num_tokens == 920 && num_chunks == 29));
+    const bool use_group_small = num_cu == 39 && (medium_h8_group || (single_sequence &&
+        ((H == 24 && Hg == 8 && num_tokens == 823) ||
+         (H == 16 && Hg == 8 && num_tokens == 508) ||
+         (H == 8 && Hg == 4 && num_tokens >= 1024 && num_tokens < 1409) ||
+         (H == 16 && Hg == 8 && num_tokens >= 1024 && num_tokens < 1409) ||
+         (H == 16 && Hg == 4 && num_tokens >= 768 && num_tokens < 1024) ||
+         (H == 32 && Hg == 8 && num_tokens >= 24 && num_tokens < 65) ||
+         (H == 32 && Hg == 16 && num_tokens >= 96 && num_tokens < 128) ||
+         ((num_tokens == 24 || num_tokens == 48) && Hg == 16 && (H == 48 || H == 64)))));
+    dim3 group8_grid(use_group8 ? num_chunks * Hg * 2 : 1);
     // Adjacent value heads share one K head exactly when the value-to-key head
     // ratio is even.  Keep odd ratios on the one-head kernel so a pair never
     // crosses a K-head boundary.
@@ -1795,7 +1823,15 @@ void FLASHQLA_KKT_LAUNCHER(
 #else
 #define KKT_LAUNCH(ElementType, TAG) \
     do { \
-      if (use_group) { \
+      if (use_group8) { \
+        kkt_configure_group_dynamic_smem<ElementType, 2>( \
+            device_index, group_smem_bytes); \
+        FLASHQLA_KKT_NAMESPACE::kkt_solve_group_cute_kernel<ElementType, 2> \
+            <<<group8_grid, block, group_smem_bytes, stream>>>( \
+                reinterpret_cast<ElementType*>(A), \
+                reinterpret_cast<const ElementType*>(K), beta, cu_seqlens, \
+                chunk_indices, H, Hg, num_chunks, num_tokens); \
+      } else if (use_group || use_group_small) { \
         kkt_configure_group_dynamic_smem<ElementType>( \
             device_index, group_smem_bytes); \
         FLASHQLA_KKT_NAMESPACE::kkt_solve_group_cute_kernel<ElementType> \

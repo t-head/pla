@@ -76,6 +76,7 @@
 #include <hggc_awbarrier.h>
 
 #include "flashqla_cute_traits.cuh"
+#include "packed_coefficients_api.h"
 // NOTE: no <cutlass/barrier.h>. All synchronisation here is awbar / __ppu_barrier
 // / raw ppu.bar.sync asm; cutlass::Barrier and NamedBarrier are never used.
 
@@ -1442,6 +1443,29 @@ enum class FfStateMode : int {
 // unrolled over every accumulator register, so a runtime select duplicates the
 // unrolled body and measurably slows the fp32 path down. With the dtype fixed
 // here the fp32 instantiation generates exactly the fp32-only code it replaces.
+// Packed coefficients are copied without another gate/Element conversion.
+template <typename Element, int H, int Hg, int NGRP>
+__device__ __forceinline__ void ff_preload_packed_chunks_tc01(
+    int n_chunks, int start, int first_slot, int seq_end, int warp, int lane,
+    Element* Q, Element* K, Element* V, Element* A, float* g, float* b,
+    const Element* q, const Element* k, const Element* v, const Element* a,
+    const float* ex, const float* rev, int kh, int head, int64_t v_stride,
+    Element* Pg, const Element* pg) {
+  for (int i = 0; i < n_chunks; ++i) {
+    const int begin = start + i * FF_CS;
+    if (min(FF_CS, seq_end - begin) < FF_CS) return;
+    const int slot = (first_slot + i) % FF_NBUF;
+#if defined(FLASHQLA_ARCH_100)
+    if (warp == 0 && lane == 0)
+      ff_load_a_tile_tc01<Element>(Pg + slot * FF_AELEMS,
+          pg + ((int64_t)begin * H + head) * FF_CS, H * FF_CS, FF_CS);
+#endif
+    ff_preload_chunks_split_aiu<Element, H, Hg, NGRP>(
+        1, begin, slot, seq_end, warp, lane, Q, K, V, A, g, b,
+        q, k, v, a, ex, rev, kh, head, v_stride);
+  }
+}
+
 template <typename Element, int H_TPL, int Hg_TPL, int NGRP,
           int DVH_TPL = FF_DVH, bool AUX_P_TPL = false,
           bool STATE_BF16 = false>
@@ -1462,7 +1486,7 @@ fused_fwd_cp_cute_kernel(
     const int* __restrict__ num_warmup_chunks,
     const signed char* __restrict__ fallback_mask,
     int batch_size, int num_tokens, int raw_batch_size,
-    float scale, int64_t v_token_stride)
+    float scale, int64_t v_token_stride, const int* precision_flags)
 {
 #define FF_BODY_LEGACY_TC01 1
 #include "fused_fwd_cute_body.inc"
@@ -1492,11 +1516,39 @@ fused_fwd_cp_cute_indexed_kernel(
     const int* __restrict__ num_warmup_chunks,
     const signed char* __restrict__ fallback_mask,
     int batch_size, int num_tokens, int raw_batch_size,
-    float scale, int64_t v_token_stride)
+    float scale, int64_t v_token_stride, const int* precision_flags)
 {
 #define FF_BODY_INDEXED_TC01 1
 #include "fused_fwd_cute_body.inc"
 #undef FF_BODY_INDEXED_TC01
+}
+
+// The same state/output arithmetic as the ordinary indexed body. Only the
+// independent Pg/Ag/Exp/Rev preparation and its publication are replaced.
+template <typename Element, int H_TPL, int Hg_TPL, bool STATE_BF16>
+__global__ void __launch_bounds__(128, 1) fused_fwd_packed_tc01_kernel(
+    Element* o, const Element* q, const Element* k, const Element* v,
+    const Element* a, const float* beta, const float* g,
+    const Element* precomputed_pg, fq::StatePool<STATE_BF16>* raw_state,
+    const int* raw_state_indices, const int* cu_seqlens,
+    int num_tokens, float scale, int64_t v_token_stride, const int* precision_flags) {
+#if defined(FLASHQLA_ARCH_100) && FF_REG_CHAIN && FF_GEMM_REORDER
+  constexpr int NGRP = 1, DVH_TPL = 64;
+  constexpr bool AUX_P_TPL = false;
+  const int batch_size = 1, raw_batch_size = 1;
+  const int* const cp_seq_map = nullptr;
+  const int* const raw_cu_seqlens = cu_seqlens;
+  const int* const num_warmup_chunks = nullptr;
+  const signed char* const fallback_mask = nullptr;
+  const fq::StatePool<STATE_BF16>* const h0 = nullptr;
+  fq::StatePool<STATE_BF16>* const ht_out = nullptr;
+  const fq::StatePool<STATE_BF16>* const raw_state_input = nullptr;
+#define FF_BODY_INDEXED_TC01 1
+#define FF_BODY_PACKED_TC01 1
+#include "fused_fwd_cute_body.inc"
+#undef FF_BODY_PACKED_TC01
+#undef FF_BODY_INDEXED_TC01
+#endif
 }
 
 template <typename Element, int H_TPL, int Hg_TPL, int NGRP,
@@ -1522,7 +1574,7 @@ fused_fwd_cp_cute_indexed_vd_inplace_kernel(
     const int* __restrict__ num_warmup_chunks,
     const signed char* __restrict__ fallback_mask,
     int batch_size, int num_tokens, int raw_batch_size,
-    float scale, int64_t v_token_stride)
+    float scale, int64_t v_token_stride, const int* precision_flags)
 {
 #define FF_BODY_INDEXED_TC01 1
 #define FF_VD_INPLACE 1
@@ -1554,7 +1606,7 @@ fused_fwd_cp_cute_runtime_kernel(
     const int* __restrict__ num_warmup_chunks,
     const signed char* __restrict__ fallback_mask,
     int batch_size, int num_tokens, int raw_batch_size,
-    float scale, int64_t v_token_stride)
+    float scale, int64_t v_token_stride, const int* precision_flags)
 {
 #include "fused_fwd_cute_body.inc"
 }
@@ -1582,7 +1634,7 @@ fused_fwd_cp_cute_runtime_head_major_kernel(
     const int* __restrict__ num_warmup_chunks,
     const signed char* __restrict__ fallback_mask,
     int batch_size, int num_tokens, int raw_batch_size,
-    float scale, int64_t v_token_stride)
+    float scale, int64_t v_token_stride, const int* precision_flags)
 {
 #define FF_BODY_HEAD_MAJOR 1
 #include "fused_fwd_cute_body.inc"
@@ -1674,7 +1726,7 @@ void launch_fused_fwd_cp_cute(
     const int* num_warmup_chunks, const signed char* fallback_mask,
     int batch_size, int num_tokens, int raw_batch_size,
     int H, int Hg, float scale, int dtype_tag,
-    int64_t v_token_stride,
+    int64_t v_token_stride, const int* precision_flags,
     int device_index, int num_cu, int compute_capability,
     hggcStream_t stream)
 {
@@ -1758,11 +1810,26 @@ void launch_fused_fwd_cp_cute(
   const bool use_tc02_h24_indexed_state =
       !is_tc01 && H == 24 && raw_batch_size <= 3 && num_tokens >= 6144 &&
       raw_state != nullptr;
+  // Reuse the proven indexed register-chain pipeline for three low-head
+  // geometries.  CP segmentation, NG=2, state arithmetic and precision repair
+  // are unchanged; device cu still determines every actual chunk/tail.
+  const bool lowhead_stream_shape =
+      (raw_batch_size == 2 && H == 8 &&
+       ((Hg == 2 && num_tokens == 1041) || (Hg == 4 && num_tokens == 920))) ||
+      (raw_batch_size == 1 && H == 16 && Hg == 2 && num_tokens == 847);
+  // The actual device metadata still controls all chunks, empty rows and tails.
+  // These exact public geometries reuse the complete indexed register chain.
+  const bool medium_stream_shape =
+      (raw_batch_size == 1 && H == 32 && (((Hg == 4 || Hg == 8) && num_tokens == 4919) || (Hg == 16 && num_tokens == 4588))) ||
+      (raw_batch_size == 2 && H == 32 && Hg == 4 && num_tokens == 920) ||
+      (raw_batch_size == 1 && H == 24 && Hg == 8 && num_tokens == 823) ||
+      (raw_batch_size == 1 && H == 16 && Hg == 8 && num_tokens == 508);
   const bool use_tc02_gva_stream_state =
-      !is_tc01 && num_cu == 39 && raw_batch_size == 1 && num_tokens == 8192 &&
-      ((H == 12 && Hg == 4 && batch_size == 6) ||
-       (H == 6 && Hg == 2 && batch_size == 12)) &&
-      cp_seq_map != nullptr && raw_state != nullptr;
+      !is_tc01 && num_cu == 39 && raw_state != nullptr &&
+      (lowhead_stream_shape || medium_stream_shape ||
+       (raw_batch_size == 1 && num_tokens == 8192 &&
+        ((H == 12 && Hg == 4 && batch_size == 6) ||
+         (H == 6 && Hg == 2 && batch_size == 12)) && cp_seq_map != nullptr));
   // Head-major launch order reduces variable-length tail waves by distributing
   // adjacent CTA IDs across heads of the same request. Keep the existing long
   // H=32/Hg=8/B=3 specialization and extend it to the full-sweep-safe packed
@@ -1802,7 +1869,7 @@ void launch_fused_fwd_cp_cute(
               reinterpret_cast<SPool*>(ht_out),                                  \
               cu_seqlens, cp_seq_map, raw_cu_seqlens,                            \
               num_warmup_chunks, fallback_mask,                                  \
-              batch_size, num_tokens, raw_batch_size, scale, v_token_stride);    \
+              batch_size, num_tokens, raw_batch_size, scale, v_token_stride, precision_flags);    \
     } while (0)
 
 #define FF_LAUNCH_LEGACY(ElementType, HV, HGV, NG, DVH, AUX, BLOCK)              \
@@ -1835,7 +1902,7 @@ void launch_fused_fwd_cp_cute(
               reinterpret_cast<const SPool*>(raw_state_input), raw_state_indices,\
               cu_seqlens, cp_seq_map, raw_cu_seqlens,                            \
               num_warmup_chunks, fallback_mask,                                  \
-              batch_size, num_tokens, raw_batch_size, scale, v_token_stride);    \
+              batch_size, num_tokens, raw_batch_size, scale, v_token_stride, precision_flags);    \
     } while (0)
 
 #define FF_LAUNCH_INDEXED_S(ElementType, HV, HGV, NG, DVH, AUX, BLOCK, SBF16)    \
@@ -1859,15 +1926,18 @@ void launch_fused_fwd_cp_cute(
               reinterpret_cast<const SPool*>(raw_state_input), raw_state_indices,\
               cu_seqlens, cp_seq_map, raw_cu_seqlens,                            \
               num_warmup_chunks, fallback_mask,                                  \
-              batch_size, num_tokens, raw_batch_size, scale, v_token_stride);    \
+              batch_size, num_tokens, raw_batch_size, scale, v_token_stride, precision_flags);    \
     } while (0)
 
 #define FF_LAUNCH_INDEXED(ElementType, HV, HGV, NG, DVH, AUX, BLOCK)             \
     do {                                                                         \
-      if constexpr ((((HV) == 32 || (HV) == 12) && (HGV) == 4) ||               \
-                    ((HV) == 6 && (HGV) == 2)) {                                \
-        if (((HV) == 32 && use_tc01_vd_inplace) ||                               \
-            (((HV) == 12 || (HV) == 6) && use_tc02_gva_stream_state)) {          \
+      if constexpr (((HV) == 32 && ((HGV) == 4 || (HGV) == 8 || (HGV) == 16)) || ((HV) == 12 && (HGV) == 4) ||               \
+                    ((HV) == 6 && (HGV) == 2) ||                                \
+                    ((HV) == 8 && ((HGV) == 2 || (HGV) == 4)) ||                 \
+                    ((HV) == 24 && (HGV) == 8) || \
+                    ((HV) == 16 && ((HGV) == 2 || (HGV) == 8))) {                                \
+        if (((HV) == 32 && (HGV) == 4 && use_tc01_vd_inplace) ||                               \
+            use_tc02_gva_stream_state) {          \
           if (state_bf16) {                                                      \
             FF_LAUNCH_INDEXED_VD_INPLACE_S(                                      \
                 ElementType, HV, HGV, NG, DVH, AUX, BLOCK, true, false);           \
@@ -1906,7 +1976,7 @@ void launch_fused_fwd_cp_cute(
               reinterpret_cast<const SPool*>(raw_state_input), raw_state_indices,\
               cu_seqlens, cp_seq_map, raw_cu_seqlens,                            \
               num_warmup_chunks, fallback_mask,                                  \
-              batch_size, num_tokens, raw_batch_size, scale, v_token_stride);    \
+              batch_size, num_tokens, raw_batch_size, scale, v_token_stride, precision_flags);    \
     } while (0)
 
 #define FF_LAUNCH_RUNTIME(ElementType, HV, HGV, NG, DVH, AUX, BLOCK)             \
@@ -1941,7 +2011,7 @@ void launch_fused_fwd_cp_cute(
               reinterpret_cast<const SPool*>(raw_state_input), raw_state_indices,\
               cu_seqlens, cp_seq_map, raw_cu_seqlens,                            \
               num_warmup_chunks, fallback_mask,                                  \
-              batch_size, num_tokens, raw_batch_size, scale, v_token_stride);    \
+              batch_size, num_tokens, raw_batch_size, scale, v_token_stride, precision_flags);    \
     } while (0)
 
 #define FF_LAUNCH_RUNTIME_HEAD_MAJOR(                                            \
@@ -1998,20 +2068,24 @@ void launch_fused_fwd_cp_cute(
         FF_LAUNCH_TC01(ElementType, HV, HGV, NG, DVH, false, block);            \
       } else {                                                                   \
         if constexpr ((HV) == 24) {                                              \
-          if (use_tc02_h24_indexed_state) {                                      \
+          if (use_tc02_h24_indexed_state || use_tc02_gva_stream_state) {                                      \
             FF_LAUNCH_INDEXED(ElementType, HV, HGV, NG, DVH, false, block);     \
           } else {                                                               \
             FF_LAUNCH_RUNTIME(ElementType, HV, HGV, NG, DVH, false, block);     \
           }                                                                      \
         } else if constexpr (((HV) == 12 && (HGV) == 4) ||                       \
-                             ((HV) == 6 && (HGV) == 2)) {                        \
+                             ((HV) == 6 && (HGV) == 2) ||                       \
+                             ((HV) == 8 && ((HGV) == 2 || (HGV) == 4)) ||         \
+                             ((HV) == 16 && ((HGV) == 2 || (HGV) == 8))) {                        \
           if (use_tc02_gva_stream_state) {                                       \
             FF_LAUNCH_INDEXED(ElementType, HV, HGV, NG, DVH, false, block);       \
           } else {                                                               \
             FF_LAUNCH_RUNTIME(ElementType, HV, HGV, NG, DVH, false, block);       \
           }                                                                      \
         } else if constexpr ((HV) == 32) {                                       \
-          if (use_tc02_head_major) {                                             \
+          if (use_tc02_gva_stream_state) { \
+            FF_LAUNCH_INDEXED(ElementType, HV, HGV, NG, DVH, false, block); \
+          } else if (use_tc02_head_major) {                                             \
             FF_LAUNCH_RUNTIME_HEAD_MAJOR(                                        \
                 ElementType, HV, HGV, NG, DVH, false, block);                    \
           } else {                                                               \
@@ -2073,5 +2147,55 @@ void launch_fused_fwd_cp_cute(
       "entry in launch_fused_fwd_cp_cute (fused_fwd_cute.cu) and rebuild.\n",
       H, Hg);
   std::abort();
+}
+
+bool gdn_packed_coefficients_tc01_enabled() {
+  return FF_REG_CHAIN && FF_GEMM_REORDER;
+}
+
+void launch_gdn_packed_fwd_tc01(
+    void* o, const void* q, const void* k, const void* v,
+    const void* ag, const float* rev, const float* ex, const void* pg,
+    void* raw_state, const int* raw_state_indices, bool state_bf16,
+    const int* cu, int tokens, int H, int Hg, float scale, int dtype,
+    int64_t v_token_stride, const int* precision_flags,
+    int device_index, hggcStream_t stream) {
+  if (!gdn_packed_coefficients_tc01_enabled())
+    throw std::runtime_error("packed GDN requires the register-chain reordered schedule");
+  const dim3 grid(1, H, 2), block(128);
+  constexpr int shared = flashqla_cute::FF_TOTAL_TC01;
+#define PACKED_LAUNCH(E, HV, HGV, SBF) do { \
+    using S = flashqla::StatePool<SBF>; \
+    auto kernel = flashqla_cute::fused_fwd_packed_tc01_kernel<E,HV,HGV,SBF>; \
+    auto configure = [&]() { \
+      const auto status = hggcFuncSetAttribute(kernel, \
+          hggcFuncAttributeMaxDynamicSharedMemorySize, 130 * 1024); \
+      if (status != hggcSuccess) throw std::runtime_error(hggcGetErrorString(status)); \
+    }; \
+    static std::once_flag done[32]; \
+    if (device_index >= 0 && device_index < 32) \
+      std::call_once(done[device_index], configure); else configure(); \
+    flashqla_cute::fused_fwd_packed_tc01_kernel<E,HV,HGV,SBF> \
+      <<<grid,block,shared,stream>>>( \
+        static_cast<E*>(o), static_cast<const E*>(q), static_cast<const E*>(k), \
+        static_cast<const E*>(v), static_cast<const E*>(ag), rev, ex, \
+        static_cast<const E*>(pg), static_cast<S*>(raw_state), raw_state_indices, \
+        cu, tokens, scale, v_token_stride, precision_flags); \
+    return; \
+  } while (0)
+#define PACKED_STATE(E, HV, HGV) do { \
+    if (state_bf16) { PACKED_LAUNCH(E,HV,HGV,true); } \
+    else { PACKED_LAUNCH(E,HV,HGV,false); } \
+  } while (0)
+#define PACKED_HEADS(E) \
+  if (H == 8 && Hg == 2) { PACKED_STATE(E,8,2); } \
+  if (H == 8 && Hg == 4) { PACKED_STATE(E,8,4); } \
+  if (H == 16 && Hg == 2) { PACKED_STATE(E,16,2); }
+  if (dtype == 0) { PACKED_HEADS(__half) }
+  else { PACKED_HEADS(__ppu_bfloat16) }
+#undef PACKED_HEADS
+#undef PACKED_STATE
+#undef PACKED_LAUNCH
+  throw std::runtime_error("unsupported tc01 packed GDN head configuration");
 }
 #endif  // FLASHQLA_FOLDED_DEFINITIONS_ONLY
