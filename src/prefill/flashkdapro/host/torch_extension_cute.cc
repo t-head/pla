@@ -62,10 +62,12 @@
 #include <cstdlib>
 #include <functional>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <set>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -824,6 +826,78 @@ int cp_cu_count() {
     return cached[device];
 }
 
+enum class Tc02CpRecipe : uint8_t {
+    kSerial, kCp4, kCp6, kCp8, kCp12, kCp4Bv16, kCp8Bv16,
+};
+
+struct Tc02CpLayout {
+    uint16_t heads;
+    uint16_t batch;
+    uint16_t tokens;
+    uint32_t offset_start;
+    Tc02CpRecipe recipe;
+};
+
+struct Tc02CpParameters {
+    int bv;
+    int segments;
+    int min_segment_tiles;
+};
+
+constexpr Tc02CpParameters kTc02CpParameters[] = {
+    {32, 0, 32}, {32, 4, 8}, {32, 6, 12}, {32, 8, 16},
+    {32, 12, 16}, {16, 4, 8}, {16, 8, 16},
+};
+
+#include "prefill/flashkdapro/common/tc02_prefill_cp_schedules.inc"
+
+bool explicit_tc02_cp_config() {
+    for (const char* name : {"PLA_FLASHKDA_CP", "PLA_FLASHKDA_CP_BV",
+            "PLA_FLASHKDA_CP_SEG_TILES", "PLA_FLASHKDA_CP_MAX_H",
+            "PLA_FLASHKDA_CP_BALANCE", "PLA_FLASHKDA_CP_MULT",
+            "PLA_FLASHKDA_CP_STATE_FP16", "PLA_FLASHKDA_K1_FMA_SPLIT",
+            "PLA_FLASHKDA_K1_THREADS", "PLA_FLASHKDA_K1_CPC",
+            "PLA_FLASHKDA_K2_NOWS", "PLA_FLASHKDA_K2_DVSPLIT",
+            "PLA_FLASHKDA_K2_DKSPLIT", "PLA_FLASHKDA_K2_DKLEADER"}) {
+        const char* value = std::getenv(name);
+        if (value && *value) return true;
+    }
+    return false;
+}
+
+CpConfig select_tc02_cp_config(
+    int T, int H, int N, const std::vector<int64_t>& offsets,
+    flashkda::host_runtime::PpuArchitecture architecture, CpConfig config) {
+    if (architecture != flashkda::host_runtime::PpuArchitecture::kTc02 ||
+            config.mode != 1 || N <= 0 || offsets.size() != size_t(N) + 1 || offsets.back() != T)
+        return config;
+    const auto key_of = [](const Tc02CpLayout& layout) {
+        return std::make_tuple(int(layout.heads), int(layout.batch), int(layout.tokens));
+    };
+    const auto key = std::make_tuple(H, N, T);
+    const auto end = std::end(kTc02CpLayouts);
+    auto row = std::lower_bound(std::begin(kTc02CpLayouts), end, key,
+        [&](const Tc02CpLayout& layout, const auto& value) { return key_of(layout) < value; });
+    for (; row != end && key_of(*row) == key; ++row) {
+        if (!std::equal(offsets.begin(), offsets.end(), kTc02CpOffsets + row->offset_start))
+            continue;
+        if (cp_cu_count() != 39 || explicit_tc02_cp_config()) return config;
+        if (row->recipe == Tc02CpRecipe::kSerial) {
+            config.mode = 0;
+            return config;
+        }
+        const auto& parameters = kTc02CpParameters[static_cast<size_t>(row->recipe)];
+        config.mode = 2;
+        config.bv = parameters.bv;
+        config.balance = true;
+        config.mult_set = true;
+        config.mult = parameters.segments;
+        config.min_seg_tiles = parameters.min_segment_tiles;
+        return config;
+    }
+    return config;
+}
+
 // The complete host-only candidate gate.  Raw offsets are only resolved after
 // this passes, so non-target shapes never pay a varlen cu_seqlens D2H read.
 bool cp_dispatch_candidate(
@@ -1001,10 +1075,13 @@ std::shared_ptr<CachedCpPlan> build_cached_cp_plan(
 std::shared_ptr<CachedCpPlan> get_or_build_cp_plan(
     int T_total, int H, int N, bool is_varlen, const torch::Tensor& cu_t,
     const c10::optional<std::vector<int64_t>>& raw_cu_opt,
-    const torch::Tensor& device_ref, const c10::cuda::CUDAStream& stream) {
-    const CpConfig requested = cp_config_from_env();
+    const torch::Tensor& device_ref, const c10::cuda::CUDAStream& stream,
+    bool use_measured_schedule = false) {
+    CpConfig requested = cp_config_from_env();
     const int device = device_ref.get_device();
     const auto architecture = flashkda::host_runtime::current_architecture();
+    if (use_measured_schedule && is_varlen && raw_cu_opt.has_value())
+        requested = select_tc02_cp_config(T_total, H, N, *raw_cu_opt, architecture, requested);
     if (!cp_dispatch_candidate(
             T_total, H, N, is_varlen, architecture, requested))
         return std::make_shared<CachedCpPlan>();
@@ -1474,7 +1551,9 @@ void flashkda_fwd_dense(
     // only establish stream ordering/lifetime on a newly seen stream.
     auto cp_cached = get_or_build_cp_plan(
         T_total, H, N, is_varlen, cu_t, raw_cu_seqlens_opt,
-        q, torch_stream);
+        q, torch_stream, lower_bound == -5.0 && indexed_state && state_is_fp32 &&
+        has_state_in && has_state_out && q.is_contiguous() && k.is_contiguous() &&
+        v.is_contiguous() && g.is_contiguous() && beta.is_contiguous());
     const CpPlan& cp = cp_cached->plan;
     const torch::Tensor& seg_tbl_d = cp_cached->seg_tbl_d;
     const torch::Tensor& seq_seg_d = cp_cached->seq_seg_d;
@@ -1878,7 +1957,8 @@ std::vector<torch::Tensor> flashkda_cp_stages(
 py::dict flashkda_cp_plan(int64_t T_total, int64_t H,
                           c10::optional<torch::Tensor> cu_seqlens_opt,
                           c10::optional<std::vector<int64_t>>
-                              raw_cu_seqlens_opt) {
+                              raw_cu_seqlens_opt,
+                          bool use_measured_schedule) {
     if (pla::sanity::enabled()) {
         TORCH_CHECK(T_total > 0 && T_total <= std::numeric_limits<int>::max() &&
                         H > 0 && H <= std::numeric_limits<int>::max(),
@@ -1925,7 +2005,11 @@ py::dict flashkda_cp_plan(int64_t T_total, int64_t H,
         TORCH_CHECK(N <= std::numeric_limits<int>::max() / H,
                     "PLA_SANITY_CHECK [flashkda_cp_plan]: N*H exceeds kernel int32 ABI");
     }
-    const CpConfig config = cp_config_from_env();
+    CpConfig config = cp_config_from_env();
+    if (use_measured_schedule && is_varlen && raw_cu_seqlens_opt.has_value()) {
+        config = select_tc02_cp_config(int(T_total), int(H), N, raw_cu,
+            flashkda::host_runtime::current_architecture(), config);
+    }
     CpPlan cp = plan_cp_dispatch(
         int(T_total), int(H), N, is_varlen, config,
         [&](std::vector<int64_t>& seq_len, std::vector<int64_t>& tok_begin) {
@@ -1987,11 +2071,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("raw_cu_seqlens") =
               c10::optional<std::vector<int64_t>>());
     m.def("flashkda_cp_plan", &flashkda_cp_plan,
-          "Probe the CP dispatch decision for a shape (no kernel launch)",
+          "Probe CP dispatch. The measured schedule assumes the qualified indexed FP32 input contract.",
           py::arg("T_total"), py::arg("H"),
           py::arg("cu_seqlens") = c10::optional<torch::Tensor>(),
           py::arg("raw_cu_seqlens") =
-              c10::optional<std::vector<int64_t>>());
+              c10::optional<std::vector<int64_t>>(),
+          py::arg("use_measured_schedule") = false);
     m.def("flashkda_cp_stages", &flashkda_cp_stages,
           "CP debug: K1 + pre_scan + merge only -> (chain_state, carries)",
           py::arg("q"), py::arg("k"), py::arg("v"), py::arg("g"), py::arg("beta"),

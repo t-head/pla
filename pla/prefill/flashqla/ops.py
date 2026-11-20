@@ -52,6 +52,7 @@ from .. import _sanity
 from . import _C as flashqla_cute
 from .private.tc02_folded_schedules import (
     FOLDED_TC02_PACKED_RAW,
+    FOLDED_TC02_PREACTIVATED_SCHEDULES,
     FOLDED_TC02_SCHEDULES,
 )
 from .private.cp_preprocess import (
@@ -518,7 +519,15 @@ def chunk_gated_delta_rule_fwd(
         short_folded_range |= (batch <= 4 and longest >= 768 and valid_num_tokens >= 512 * batch)
         short_folded_range |= (Hg == 2 and batch <= 32 and longest >= 8192 and
                                valid_num_tokens - longest <= 3 * (batch - 1))
-    folded_max_local_chunks = FOLDED_TC02_SCHEDULES.get((H, Hg, raw_cu))
+    schedule_key = (H, Hg, raw_cu)
+    folded_max_local_chunks = FOLDED_TC02_SCHEDULES.get(schedule_key)
+    if (auto_cp and not use_raw_gating and valid_num_tokens == num_tokens and
+            overlap_warmup_threshold is None and not force_tc01_cp_candidate):
+        measured = FOLDED_TC02_PREACTIVATED_SCHEDULES.get(schedule_key)
+        if (measured is not None and indexed_state and q.dtype == torch.bfloat16 and
+                initial_state.dtype == torch.float32 and normalize_qk and
+                _cuda_device_properties(q.device.index) == (8, 9, 39)):
+            folded_max_local_chunks = measured
     packed_short = (
         indexed_state and ((H == 8 and Hg in (2, 4) and batch in (11, 22)) or
                            (H == 48 and Hg == 16 and 11 <= batch <= 128)) and
@@ -527,7 +536,7 @@ def chunk_gated_delta_rule_fwd(
     grouped_packed_folded = packed_short and H == 48 and Hg == 16 and batch <= 128
     packed_raw_folded = (
         auto_cp and valid_num_tokens == num_tokens
-        and (H, Hg, raw_cu) in FOLDED_TC02_PACKED_RAW
+        and schedule_key in FOLDED_TC02_PACKED_RAW
     )
     use_folded = (
         os.environ.get("PLA_FLASHQLA_TC02_FOLDED", "1") != "0"
