@@ -146,6 +146,29 @@ class PPUBuildExtensionTests(unittest.TestCase):
         self.assertNotIn("nvcc", ninja)
         self.assertNotIn("CUDA_HOME", ninja)
 
+    def test_opt_in_compatibility_headers_are_host_only(self):
+        source = self.root / "adapter.cpp"
+        source.touch()
+        include = self.root / "CUDA_SDK" / "include"
+        include.mkdir(parents=True)
+        self.command._ppu_sdk = self.root
+        extension = FakeExtension("package._C", [str(source)], extra_compile_args={"cxx": ["-O3"]})
+        output = self.root / "objects"
+        obj = self.command._object_path(output, source)
+        self.command._run_ninja = lambda _: obj.touch()
+        for requested, has_header in ((True, False), (True, True), (False, True)):
+            with self.subTest(requested=requested, has_header=has_header):
+                if has_header:
+                    (include / "cuda_runtime.h").touch()
+                extension.ppu_cuda_compat_headers = requested
+                self.command.compile_sources(extension.sources, output, extension)
+                ninja = (output / "build.ninja").read_text()
+                hgcc = ninja.split("rule hgcc_compile\n", 1)[1].splitlines()[0]
+                cxx = ninja.split("rule cxx_compile\n", 1)[1].splitlines()[0]
+                self.assertNotIn(str(include), hgcc)
+                self.assertEqual(f"-O3 -I{include}" in cxx, requested and has_header)
+                self.assertEqual(extension.extra_compile_args["cxx"], ["-O3"])
+
     def test_header_dependency_is_emitted_for_kkt_consumers(self):
         header = self.root / "kkt_solve_cute_impl.cuh"
         header.write_text("#pragma once\n")

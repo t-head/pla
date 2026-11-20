@@ -36,6 +36,9 @@ State is stored natively and written back in place; the recurrence accumulates i
 Related namespaces:
 
     pla.decode.kda              Kimi Delta Attention decode
+    pla.decode.gdn_replayssm    Shared GDN ReplaySSM compute APIs and kernels
+    pla.decode.gdn_replayssm_sglang   SGLang-compatible GDN ReplaySSM APIs
+    pla.decode.gdn_replayssm_hlm      TensorRT-LLM-compatible cached GDN ReplaySSM APIs
     pla.decode.kda_replayssm_sglang   SGLang KDA ReplaySSM verify + commit
     pla.decode.kda_mtp_sglang        Compatibility API for SGLang ReplaySSM
     pla.decode.private          tunable entry points (auto-tune only)

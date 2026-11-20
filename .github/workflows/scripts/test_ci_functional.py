@@ -30,8 +30,8 @@ class FunctionalCITests(unittest.TestCase):
 
     def test_inventory_matches_checkin_counts_and_assets(self):
         selected = cases()
-        self.assertEqual(Counter(case.phase for case in selected), {"decode": 22, "prefill": 17})
-        self.assertEqual(len({case.name for case in selected}), 39)
+        self.assertEqual(Counter(case.phase for case in selected), {"decode": 25, "prefill": 17})
+        self.assertEqual(len({case.name for case in selected}), 42)
         runner.validate_inventory(selected)
         self.assertEqual(sum("--kernel=cuda" in case.argv for case in selected), 1)
         self.assertFalse(any("--max-cases" in arg for case in selected for arg in case.argv))
@@ -41,6 +41,19 @@ class FunctionalCITests(unittest.TestCase):
         self.assertEqual((case.phase, case.timeout, case.report), ("decode", 1800, "markers"))
         self.assertEqual(case.argv, ("tests/test_kda_replayssm_vllm.py", "--phase=functional"))
         self.assertIn("pla/decode/kda_replayssm_vllm", runner.EXTENSION_DIRS)
+
+    def test_gdn_replay_uses_one_extension_and_exercises_each_api(self):
+        self.assertEqual({path for path in runner.EXTENSION_DIRS if path.startswith("pla/decode/gdn_replayssm")},
+                         {"pla/decode/gdn_replayssm"})
+        replay_cases = {case.name: case for case in cases() if case.name.startswith("gdn-replayssm-")}
+        self.assertEqual({name: case.argv[0] for name, case in replay_cases.items()}, {
+            "gdn-replayssm-common": "tests/test_gdn_replay_contracts.py",
+            "gdn-replayssm-sglang": "tests/test_gdn_replay.py",
+            "gdn-replayssm-hlm": "tests/test_gdn_replay_cached.py",
+        })
+        for case in replay_cases.values():
+            self.assertEqual((case.phase, case.report), ("decode", "exit"))
+            self.assertIn("--device=cuda:0", case.argv)
 
     def test_replay_phase_inventory_preserves_strict_assessment(self):
         # Execute only case registration, without importing torch or calling a
@@ -102,7 +115,8 @@ class FunctionalCITests(unittest.TestCase):
         wheel = self.make_wheel()
         with redirect_stdout(io.StringIO()):
             runner.stage_wheel(wheel, self.root)
-        self.assertEqual(len(list(self.root.rglob("*.so"))), 7)
+        self.assertEqual({str(binary.relative_to(self.root)) for binary in self.root.rglob("*.so")},
+                         {f"{directory}/_C.test.so" for directory in runner.EXTENSION_DIRS})
         self.assertEqual((self.root / runner.BUILD_MANIFEST).read_bytes(), b"{}")
         self.assertEqual((self.root / "pla/__init__.py").read_bytes(), b"# source\n")
 

@@ -66,6 +66,9 @@ python scripts/build.py --namespace pla.prefill.flashkdapro
 |---|---|
 | `pla.decode` | k-last GDN/KDA decode, packed decode, and KDA compatibility APIs |
 | `pla.decode.gdn.v_last` | v-last GDN decode |
+| `pla.decode.gdn_replayssm` | Common GDN replay decode, verify, and materialize APIs |
+| `pla.decode.gdn_replayssm_sglang` | SGLang GDN verify, cursor advance, and accepted-prefix commit |
+| `pla.decode.gdn_replayssm_hlm` | TensorRT-LLM-compatible cached GDN replay and layered commit |
 | `pla.decode.kda_replayssm_sglang` | SGLang KDA ReplaySSM verification and state commit |
 | `pla.decode.kda_mtp_sglang` | Compatibility API and build selector for SGLang ReplaySSM |
 | `pla.decode.kda_replayssm_vllm` | Paged KDA ReplaySSM verify and accepted-prefix commit for vLLM |
