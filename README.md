@@ -76,6 +76,23 @@ For API signatures, tensor contracts, environment variables, and detailed usage,
 see the [PLA API Reference](docs/readme.md). Prefill implementation details are
 available in the [prefill guide](docs/prefill_readme.md).
 
+### M890P GDN long prefill
+
+The standard `pla.prefill.flashqla` build includes folded prefill kernels for
+39-CU M890P devices with BF16 inputs, head dimension 128, and an indexed FP32
+state pool. The existing forward APIs select them when the mean valid length
+per sequence reaches 512 tokens for 8 Q/K and 24 value heads, 1K for other
+single-sequence inputs, or 4K for other batches. Batches with 32, 64, or 128
+value heads require at least 4K valid tokens per sequence. At 64 or 128 value
+heads, the longest sequence must also be no more than twice the shortest.
+Batched MHA and the single-sequence 8K CP kernels for 6 and
+12 value heads retain their established paths. Folded prefill supports lengths
+above 64K with FP32 coefficient preparation and CP transitions to control
+accumulated error. Shorter sequences use the precision selected for their head
+configuration and CP schedule. Full CP prefix history is preserved. Regression
+coverage includes packed tails, nonconsecutive state slots, all supported
+heads and long weak-decay recurrences.
+
 ### vLLM KDA ReplaySSM
 
 `kda_replay_verify` reads paged checkpoints, returns BF16 attention output,

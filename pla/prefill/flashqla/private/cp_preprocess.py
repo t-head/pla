@@ -975,6 +975,7 @@ def calc_cp_seqs(
     tc01_force_candidate: bool = False,
     tc01_enable_overlap_candidate: bool = False,
     tc01_packed_raw_gate: bool = False,
+    folded_prefill: bool = False,
 ) -> Tuple[bool, Optional[torch.Tensor], Optional[torch.Tensor],
            Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Decide CP and compute the sub-sequence split for the active PPU.
@@ -984,6 +985,8 @@ def calc_cp_seqs(
     the production real-gate admission rule; the candidate planner still rejects
     shapes for which it cannot form a useful split. The overlap candidate is
     admitted only when the caller can execute its race-free state ABI.
+    ``folded_prefill`` selects the native tc02 split policy; the default keeps
+    the generic kernel's architecture-specific table.
     """
     if _sanity.enabled():
         _sanity.check(chunk_size > 0 and num_v_heads > 0,
@@ -1020,6 +1023,7 @@ def calc_cp_seqs(
         tc01_force_candidate,
         tc01_enable_overlap_candidate,
         tc01_packed_raw_gate,
+        folded_prefill,
         execution_model,
         raw_cu,
     )
@@ -1085,6 +1089,28 @@ def calc_cp_seqs(
         chunk_size == TC02_SINGLE_SEQ_CALIBRATED_CHUNK_SIZE and
         raw_cu == (0, 8192) else 0
     )
+    if folded_prefill and raw_batch == 1:
+        chunks = num_chunks[0]
+        cu_count = execution_model.physical_cu_count
+        # Measured minimum chunk count and balanced segment count for the
+        # split-DV pipeline. Keep the calibrated shorter cases unchanged.
+        narrow_target = {4: (512, 13), 6: (512, 13), 8: (256, 8),
+                         16: (256, 4)}.get(H)
+        if cu_count == 39 and narrow_target and chunks >= narrow_target[0]:
+            full_history_segments = narrow_target[1]
+        elif H <= 8:
+            full_history_segments = min(chunks, max(1, cu_count // H))
+        elif (H, num_k_heads) == (12, 4) and max_seqlen > 8192:
+            # Thirteen segments fill complete output waves on 39 CUs.
+            full_history_segments = (13 if cu_count == 39 and chunks >= 480
+                                     else min(12, chunks // 64))
+        elif (H, num_k_heads) == (24, 8) and cu_count == 39:
+            # Eight segments reduce state correction through the 32K prefill
+            # chunk, while thirteen fill the long-sequence output grid.
+            if 480 <= chunks <= 1024:
+                full_history_segments = 8
+            elif chunks >= 13 * 64:
+                full_history_segments = 13
     packed_low_grid_cap = _tc02_packed_low_grid_cap(
         H, seqlens, num_chunks, chunk_size
     )
@@ -1159,6 +1185,11 @@ def calc_cp_seqs(
             # Six segments were the stable complete-API winner from 6K to 24K:
             # fewer lengthen the fused path and more add preprocessing without
             # exposing another useful CU wave.
+            max_local_chunks = _cdiv(max_chunks, 6)
+        elif (folded_prefill and H == 24 and num_k_heads == 8
+              and 24576 < max_seqlen <= 32768):
+            # The native folded pipeline uses six balanced segments for the
+            # long cache-hit workload; generic kernels retain their own table.
             max_local_chunks = _cdiv(max_chunks, 6)
         elif _is_h32_hg16_mid_segment_override(
                 H, num_k_heads, max_seqlen, chunk_size):

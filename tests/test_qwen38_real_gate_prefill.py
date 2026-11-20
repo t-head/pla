@@ -7,6 +7,7 @@ bitwise identical to the original OperatorsForge checkpoint audit.
 """
 
 import hashlib
+import math
 from pathlib import Path
 from unittest.mock import patch
 
@@ -14,9 +15,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from pla.prefill.flashqla import chunk_gated_delta_rule_fwd
-from pla.prefill.flashqla.private.cp_preprocess import CHUNK_SIZE, calc_cp_seqs
+from pla.prefill.flashqla.ops import SUPPORTED_HEAD_CONFIGS
+from prefill_utils import ref_gdr, tensor_metrics
 
+from pla.prefill.flashqla import chunk_gated_delta_rule_fwd, gdn_prefill_packed_qkv_fwd
+from pla.prefill.flashqla.private.cp_preprocess import CHUNK_SIZE, calc_cp_seqs
 
 D = 128
 H = 8
@@ -263,7 +266,9 @@ def _fallback_mask(pattern, segments, heads):
     return mask.to(device="cuda", dtype=torch.int8)
 
 
-def _check_correct_h0(heads, segments, dtype, offset, raw_mode, pattern, capture):
+def _check_correct_h0(
+    heads, segments, dtype, offset, raw_mode, pattern, capture, *, folded=False,
+):
     from pla.prefill.flashqla import ops
 
     shape = (segments, heads, D, D)
@@ -279,11 +284,22 @@ def _check_correct_h0(heads, segments, dtype, offset, raw_mode, pattern, capture
     head = torch.arange(heads, device="cuda")[None, :]
     scale = 2.0 ** -(1 + (seg + 2 * head) % 3).float()
     mt = (torch.eye(D, device="cuda") * scale[..., None, None]).to(dtype)
+    if folded:
+        mt_storage = torch.empty(size + offset, device="cuda", dtype=dtype)
+        shifted_mt = mt_storage[offset:].view(shape)
+        shifted_mt.copy_(mt)
+        mt = shifted_mt
+        assert mt.is_contiguous() and mt.storage_offset() == offset
     mask = _fallback_mask(pattern, segments, heads)
     mapping = torch.tensor([0, segments], dtype=torch.int32, device="cuda")
     raw = torch.ones((3, heads, D, D), device="cuda") if raw_mode != "none" else None
     indices = torch.tensor([2], dtype=torch.int32, device="cuda") if raw_mode == "indexed" else None
-    kwargs = dict(raw_h0=raw, raw_h0_indices=indices, raw_h0_k_last=raw_mode == "indexed")
+    kwargs = dict(
+        raw_h0=raw,
+        raw_h0_indices=indices,
+        raw_h0_k_last=raw_mode == "indexed",
+        folded=folded,
+    )
     expected = []
     state = torch.zeros((heads, D, D), device="cuda") if raw is None else raw[0].clone()
     decay = (mask.float() * scale)[..., None, None]
@@ -340,6 +356,16 @@ def test_correct_h0_mixed_fallback(heads, segments, dtype, offset, raw_mode, pat
     # Offset 0 takes the 890P pipeline, whose mt prefetch and wait depend on
     # the current and next masks; offset 1 takes the scalar path.
     _check_correct_h0(heads, segments, dtype, offset, raw_mode, pattern, capture)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a PPU device")
+@pytest.mark.parametrize("offset", [0, 1])
+def test_folded_fp32_correction_mt_offset(offset):
+    if torch.cuda.get_device_capability() != (8, 9):
+        pytest.skip("requires an M890P device")
+    _check_correct_h0(
+        12, 6, torch.float32, offset, "indexed", "alternate", False, folded=True,
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a PPU device")
@@ -558,7 +584,8 @@ def test_cp_fresh_prefix_history(dtype, state_dtype, threshold, output_final_sta
             assert fused.call_args.args[7] is not None
             warmup.assert_not_called()
             if threshold is not None and form != "legacy":
-                assert torch.all(fused.call_args.args[-1] == 1)
+                _, _, fallback_mask = fused.call_args.args[18:21]
+                assert torch.all(fallback_mask == 1)
             else:
                 assert fused.call_args.args[13].numel() > 0
         torch.testing.assert_close(
@@ -597,14 +624,15 @@ def test_overlap_without_initial_state_preserves_full_warmup():
             overlap_warmup_threshold=-4.0, force_tc01_cp_candidate=True)
         warmup.assert_not_called()
         assert fused.call_args.args[7] is not None
-        assert fused.call_args.args[-3] is None
-        assert torch.all(fused.call_args.args[-1] == 1)
+        raw_state_input, num_warmup, fallback_mask = fused.call_args.args[18:21]
+        assert raw_state_input is None
+        assert torch.all(fallback_mask == 1)
         cp_cu = fused.call_args.args[6]
         full_chunks = torch.div(
             cp_cu[1:] - cp_cu[:-1] + CHUNK_SIZE - 1,
             CHUNK_SIZE, rounding_mode="floor")
         assert torch.equal(
-            fused.call_args.args[-2].view(-1, heads),
+            num_warmup.view(-1, heads),
             full_chunks[:, None].expand(-1, heads))
     assert result[4] is None
     assert not torch.count_nonzero(result[2])
@@ -617,6 +645,7 @@ def test_overlap_without_initial_state_preserves_full_warmup():
 @pytest.mark.parametrize("output_final_state", [False, True])
 def test_tc01_lpt_sequence_mapping(dtype, state_dtype, form, output_final_state):
     import itertools
+
     from pla.prefill.flashqla import gdn_prefill_packed_qkv_fwd, ops
 
     if torch.cuda.get_device_capability() != (8, 0):
@@ -776,3 +805,375 @@ def test_prepare_h_partial_tail_chunk_reads_inside_segment(dtype):
     assert torch.isfinite(ht.float()).all() and torch.isfinite(mt.float()).all()
     first, second = ht.view(len(offsets) - 1, heads, D, D)
     assert torch.equal(first, second)
+
+
+# Folded long-prefill regression: full history, packed tails and resident state.
+@pytest.fixture(scope="module")
+def folded_precision():
+    if not torch.cuda.is_available() or not torch.cuda.get_device_name().startswith(
+        "ZW-M890"
+    ):
+        pytest.skip("requires a PPU M890P")
+    if torch.cuda.get_device_properties("cuda").multi_processor_count != 39:
+        pytest.skip("requires the 39-CU folded prefill schedule")
+    precision = torch.get_float32_matmul_precision()
+    tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.set_float32_matmul_precision("highest")
+    torch.backends.cuda.matmul.allow_tf32 = False
+    yield
+    torch.set_float32_matmul_precision(precision)
+    torch.backends.cuda.matmul.allow_tf32 = tf32
+
+
+def assert_folded_close(actual, expected):
+    cosine, relative, finite = tensor_metrics(actual, expected)
+    assert finite and cosine > 0.999 and relative < 0.05, (cosine, relative, finite)
+
+
+_REFERENCE_GEMM_BATCH_LIMIT = 65535
+
+
+def folded_prefill_reference(q, k, v, g, beta, offsets, initial_state):
+    # The FP32 reference batches one GEMM per (chunk, value head). Start
+    # each slice on a sequence-local chunk boundary and carry its final state.
+    chunks_per_slice = min(32768 // CHUNK_SIZE, _REFERENCE_GEMM_BATCH_LIMIT // v.size(2))
+    slice_size = chunks_per_slice * CHUNK_SIZE
+    outputs, final_states = [], []
+    for seq, (start, stop) in enumerate(zip(offsets, offsets[1:])):
+        state = initial_state[seq : seq + 1]
+        for begin in range(start, stop, slice_size):
+            sl = slice(begin, min(begin + slice_size, stop))
+            qf, kf = q[:, sl].float(), k[:, sl].float()
+            qf = qf * (qf.square().sum(-1, keepdim=True) + 1e-6).rsqrt()
+            kf = kf * (kf.square().sum(-1, keepdim=True) + 1e-6).rsqrt()
+            _, output, _, _, state = ref_gdr.chunk_gated_delta_rule_fwd(
+                qf, kf, v[:, sl].float(), g[:, sl], beta[:, sl],
+                initial_state=state,
+                chunk_size=CHUNK_SIZE,
+            )
+            outputs.append(output)
+        final_states.append(state)
+    return torch.cat(outputs, dim=1), torch.cat(final_states, dim=0)
+
+
+@pytest.mark.parametrize(
+    "lengths,physical,packed,auto_cp,expect_folded,heads,qk_heads",
+    [
+        (*case, 24, 8)
+        for case in [
+            ((32768,), 32768, False, True, True),
+            ((32768,), 32768, False, False, True),
+            ((8193, 8191), 16416, True, True, True),
+            ((32749,), 32768, True, True, True),
+            ((65536,), 65536, False, True, True),
+            ((65537,), 65600, True, True, True),
+            ((98304,), 98304, False, True, True),
+            ((131072,), 131072, False, True, True),
+            ((32768, 32768, 32768, 32768), 131072, True, True, True),
+            ((511,), 512, True, True, False),
+            ((512,), 512, True, True, True),
+            ((512, 512), 1024, True, True, True),
+        ]
+    ]
+    + [
+        ((4097,), 4160, True, True, True, h, hg)
+        for h, hg in sorted(SUPPORTED_HEAD_CONFIGS)
+    ]
+    + [
+        ((4096, 4096), 8192, True, True, h != hg, h, hg)
+        for h, hg in sorted(SUPPORTED_HEAD_CONFIGS)
+    ]
+    + [
+        ((32749,), 32768, True, True, True, 12, 4),
+        ((4095, 8192), 12288, True, True, False, 32, 8),
+        ((128, 16256), 16384, True, True, False, 64, 8),
+        ((4096, 8192), 12288, True, True, True, 64, 16),
+        ((4096, 8193), 12352, True, True, False, 64, 16),
+        ((4096, 32768), 36864, True, True, False, 128, 16),
+        ((1, 32767), 32768, True, True, True, 24, 8),
+        ((1023,), 1024, True, True, False, 4, 2),
+        ((1024,), 1024, True, True, True, 4, 2),
+        ((8192,), 8192, True, True, False, 6, 2),
+        ((8192,), 8192, True, True, False, 12, 4),
+    ],
+)
+@torch.inference_mode()
+def test_folded_prefill(
+    folded_precision,
+    lengths,
+    physical,
+    packed,
+    auto_cp,
+    expect_folded,
+    heads,
+    qk_heads,
+    monkeypatch,
+):
+    from pla.prefill.flashqla import _C
+
+    prepare = _C.folded_coefficients
+    calls = []
+
+    def track(*args, **kwargs):
+        calls.append(args[-1])
+        return prepare(*args, **kwargs)
+
+    monkeypatch.setattr(_C, "folded_coefficients", track)
+    torch.manual_seed(20261118)
+    q = torch.randn(1, physical, qk_heads, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn(1, physical, heads, 128, device="cuda", dtype=torch.bfloat16) * 0.1
+    gates = torch.randn(physical, 2 * heads, device="cuda", dtype=torch.bfloat16)
+    raw_a, raw_b = gates[:, :heads], gates[:, heads:]
+    alog = torch.linspace(-2, -1, heads, device="cuda")
+    bias = torch.zeros(heads, device="cuda")
+    g = (-alog.exp() * F.softplus(raw_a.float() + bias))[None].contiguous()
+    beta = raw_b.float().sigmoid().bfloat16().float()[None].contiguous()
+    offsets = (0, *torch.tensor(lengths).cumsum(0).tolist())
+    cu = torch.tensor(offsets, device="cuda", dtype=torch.int32)
+    indices = torch.tensor(
+        [3, 1, 5, 0][: len(lengths)], device="cuda", dtype=torch.int32
+    )
+    initial = torch.randn(6, heads, 128, 128, device="cuda") * 0.01
+    pool = initial.clone()
+    valid = sum(lengths)
+    kkt = ref_gdr.torch_kkt_fwd
+
+    def bounded_kkt(k, g, beta, cu_seqlens, chunk_size):
+        # Check the documented GEMM limit even on runtimes that split
+        # oversized reference calls internally.
+        assert cu_seqlens is None and k.size(0) == 1
+        assert math.ceil(k.size(1) / chunk_size) * g.size(-1) <= _REFERENCE_GEMM_BATCH_LIMIT
+        return kkt(k, g, beta, cu_seqlens, chunk_size)
+
+    monkeypatch.setattr(ref_gdr, "torch_kkt_fwd", bounded_kkt)
+    expected, expected_state = folded_prefill_reference(
+        q, k, v, g, beta, offsets, initial[indices].transpose(-1, -2).contiguous(),
+    )
+    common = dict(
+        initial_state=pool,
+        initial_state_indices=indices,
+        raw_cu_seqlens=offsets,
+        auto_cp=auto_cp,
+        output_final_state=True,
+    )
+    if packed:
+        qk_width, v_width = qk_heads * 128, heads * 128
+        width = 2 * qk_width + v_width
+        storage = torch.full(
+            (physical, width + 64), 0.125, device="cuda", dtype=q.dtype
+        )
+        qkv = storage[:, 17 : 17 + width]
+        qkv[:, :qk_width].copy_(q.reshape(physical, qk_width))
+        qkv[:, qk_width : 2 * qk_width].copy_(k.reshape(physical, qk_width))
+        qkv[:, 2 * qk_width :].copy_(v.reshape(physical, v_width))
+        inputs = (storage, gates, alog, bias)
+        saved = [x.clone() for x in inputs]
+        result = gdn_prefill_packed_qkv_fwd(
+            qkv,
+            raw_a,
+            raw_b,
+            alog,
+            bias,
+            cu,
+            num_qk_heads=qk_heads,
+            num_v_heads=heads,
+            **common,
+        )
+    else:
+        inputs = (q, k, v, g, beta)
+        saved = [x.clone() for x in inputs]
+        result = chunk_gated_delta_rule_fwd(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            cu_seqlens=cu,
+            normalize_qk=True,
+            **common,
+        )
+    assert bool(calls) == expect_folded
+    if calls:
+        assert calls == [(heads, qk_heads) != (24, 8) or max(lengths) > 65536]
+    assert_folded_close(result[2][:, :valid], expected)
+    assert_folded_close(pool[indices], expected_state.transpose(-1, -2))
+    assert torch.equal(result[4], pool[indices])
+    assert torch.count_nonzero(result[2][:, valid:]) == 0
+    unused = [i for i in range(6) if i not in indices.tolist()]
+    assert torch.equal(pool[unused], initial[unused])
+    for value, before in zip(inputs, saved):
+        assert torch.equal(value, before)
+
+
+@pytest.mark.parametrize("metadata_kind", ["list", "cpu_tensor", "device_tensor"])
+@torch.inference_mode()
+def test_calibrated_prefill_host_offsets(folded_precision, metadata_kind, monkeypatch):
+    from pla.prefill.flashqla import _C
+
+    def unexpected_folded(*args, **kwargs):
+        pytest.fail("8K 12/4 prefill must use the calibrated CP path")
+
+    monkeypatch.setattr(_C, "folded_coefficients", unexpected_folded)
+    tokens, heads, qk_heads = 8192, 12, 4
+    q = torch.zeros(1, tokens, qk_heads, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.zeros(1, tokens, heads, 128, device="cuda", dtype=q.dtype)
+    g = torch.zeros(1, tokens, heads, device="cuda")
+    cu = torch.tensor([0, tokens], device="cuda", dtype=torch.int32)
+    pool = torch.zeros(1, heads, 128, 128, device="cuda")
+    indices = torch.zeros(1, device="cuda", dtype=torch.int32)
+    host_offsets = [0, tokens]
+    raw_cu = {
+        "list": host_offsets,
+        "cpu_tensor": torch.tensor(host_offsets, dtype=torch.int64, device="cpu"),
+        "device_tensor": cu,
+    }[metadata_kind]
+
+    args = dict(cu_seqlens=cu, raw_cu_seqlens=raw_cu,
+                initial_state=pool, initial_state_indices=indices)
+    if metadata_kind == "device_tensor":
+        with pytest.raises(ValueError, match="raw_cu_seqlens must be a 1-D CPU"):
+            chunk_gated_delta_rule_fwd(q, q, v, g, g, **args)
+    else:
+        chunk_gated_delta_rule_fwd(q, q, v, g, g, **args)
+
+
+@pytest.mark.parametrize("fresh", [False, True])
+@pytest.mark.parametrize("heads,qk_heads", [(24, 8), (12, 4)])
+@torch.inference_mode()
+def test_folded_cp_preserves_early_history(folded_precision, fresh, heads, qk_heads):
+    total = 32768
+    q = torch.ones(1, total, qk_heads, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.zeros_like(q)
+    v = torch.zeros(1, total, heads, 128, device="cuda", dtype=q.dtype)
+    g = torch.full((1, total, heads), -1e-7, device="cuda")
+    g[:, 64] = -12
+    beta = torch.zeros_like(g)
+    indices = torch.tensor([3], device="cuda", dtype=torch.int32)
+    pool = torch.ones(5, heads, 128, 128, device="cuda")
+    value = torch.linspace(8, 24, 128, device="cuda")[None].expand(heads, -1)
+    if fresh:
+        pool[3].zero_()
+        k[:, 0, :, 0] = 1
+        v[:, 0] = value
+        beta[:, 0] = 1
+    before = pool.clone()
+    decay = g[0].double().cumsum(0).exp().float()
+    expected_state = before[3] * decay[-1, :, None, None]
+    if fresh:
+        expected_state[:, :, 0] = value * decay[-1, :, None]
+    result = chunk_gated_delta_rule_fwd(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=pool,
+        initial_state_indices=indices,
+        cu_seqlens=torch.tensor([0, total], device="cuda", dtype=torch.int32),
+        raw_cu_seqlens=(0, total),
+        normalize_qk=True,
+        output_final_state=False,
+    )
+    assert result[4] is None
+    assert_folded_close(pool[3], expected_state)
+    assert torch.equal(pool[[0, 1, 2, 4]], before[[0, 1, 2, 4]])
+
+
+@pytest.mark.parametrize("heads,qk_heads,log_decay", [(12, 4, -7.5e-7), (24, 8, -4.5e-7)])
+@torch.inference_mode()
+def test_folded_cp_keeps_small_segment_decays(folded_precision, heads, qk_heads, log_decay):
+    tokens, dimension = 32768, 128
+    q = torch.zeros((1, tokens, qk_heads, dimension), device="cuda", dtype=torch.bfloat16)
+    k = torch.zeros_like(q)
+    v = torch.zeros((1, tokens, heads, dimension), device="cuda", dtype=q.dtype)
+    g = torch.full((1, tokens, heads), log_decay, device="cuda", dtype=torch.float32)
+    beta = torch.zeros_like(g)
+    pool = torch.ones((3, heads, dimension, dimension), device="cuda", dtype=torch.float32)
+    indices = torch.tensor([1], device="cuda", dtype=torch.int32)
+    cu = torch.tensor([0, tokens], device="cuda", dtype=torch.int32)
+
+    # With beta=0, the state decays independently of the Q/K and V inputs.
+    # Each 39-CU CP segment decays by less than one BF16 rounding step near 1.
+    factor = g[0, :, 0].double().sum().exp().float()
+    expected = pool[1] * factor
+    chunk_gated_delta_rule_fwd(
+        q, k, v, g, beta, cu_seqlens=cu, raw_cu_seqlens=(0, tokens),
+        initial_state=pool, initial_state_indices=indices, auto_cp=True,
+        output_final_state=False,
+    )
+    torch.testing.assert_close(pool[1], expected, rtol=5e-4, atol=2e-5)
+    assert torch.all(pool[[0, 2]] == 1)
+
+
+@pytest.mark.parametrize("heads,qk_heads", [(24, 8), (12, 4)])
+@torch.inference_mode()
+def test_folded_packed_weak_gate_decay(folded_precision, heads, qk_heads):
+    tokens = 32768
+    qkv = torch.zeros(tokens, (2 * qk_heads + heads) * D, device="cuda", dtype=torch.bfloat16)
+    raw_a = torch.full((tokens, heads), -18, device="cuda", dtype=qkv.dtype)
+    raw_b = torch.zeros_like(raw_a)
+    alog = torch.full((heads,), 8.0, device="cuda")
+    bias = torch.zeros_like(alog)
+    pool = torch.ones((3, heads, D, D), device="cuda")
+    indices = torch.tensor([1], device="cuda", dtype=torch.int32)
+    cu = torch.tensor([0, tokens], device="cuda", dtype=torch.int32)
+    g_cum, _, _, _, _ = gdn_prefill_packed_qkv_fwd(
+        qkv, raw_a, raw_b, alog, bias, cu,
+        num_qk_heads=qk_heads, num_v_heads=heads,
+        initial_state=pool, initial_state_indices=indices,
+        raw_cu_seqlens=(0, tokens), output_final_state=False,
+    )
+
+    # The FP32 addition in log(1 + exp(-18)) rounds to one, but the
+    # preserved per-token decay reduces the state to about 0.226 at 32K.
+    gate = -math.exp(8) * math.log1p(math.exp(-18))
+    torch.testing.assert_close(
+        g_cum[0, -1], torch.full_like(g_cum[0, -1], CHUNK_SIZE * gate),
+    )
+    torch.testing.assert_close(
+        pool[1], torch.full_like(pool[1], math.exp(tokens * gate)), rtol=5e-4, atol=2e-5,
+    )
+    assert torch.all(pool[[0, 2]] == 1)
+
+
+@pytest.mark.parametrize(
+    "length,auto_cp", [(98304, True), (131072, True), (262144, True), (131072, False)]
+)
+@pytest.mark.parametrize("heads,qk_heads", [(24, 8), (12, 4)])
+@torch.inference_mode()
+def test_folded_long_weak_decay(folded_precision, length, auto_cp, heads, qk_heads):
+    torch.manual_seed(20261118)
+    q = torch.randn(1, length, qk_heads, 128, device="cuda", dtype=torch.bfloat16) * 0.1
+    k = (
+        (torch.randn(1, 1, qk_heads, 128, device="cuda", dtype=q.dtype) * 0.1)
+        .expand_as(q)
+        .contiguous()
+    )
+    v = torch.randn(1, length, heads, 128, device="cuda", dtype=q.dtype) * 0.1
+    g = torch.zeros(1, length, heads, device="cuda")
+    beta = torch.full_like(g, 0.99)
+    pool = torch.randn(3, heads, 128, 128, device="cuda") * 0.02
+    before = pool.clone()
+    indices = torch.tensor([1], device="cuda", dtype=torch.int32)
+    expected, state = folded_prefill_reference(
+        q, k, v, g, beta, (0, length), pool[indices].transpose(-1, -2).contiguous(),
+    )
+    result = chunk_gated_delta_rule_fwd(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=pool,
+        initial_state_indices=indices,
+        cu_seqlens=torch.tensor([0, length], device="cuda", dtype=torch.int32),
+        raw_cu_seqlens=(0, length),
+        normalize_qk=True,
+        auto_cp=auto_cp,
+        output_final_state=False,
+    )
+    assert_folded_close(result[2], expected)
+    assert_folded_close(pool[indices], state.transpose(-1, -2))
+    assert result[4] is None
+    assert torch.equal(pool[[0, 2]], before[[0, 2]])

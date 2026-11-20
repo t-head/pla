@@ -79,7 +79,10 @@
 // NOTE: no <cutlass/barrier.h>. All synchronisation here is awbar / __ppu_barrier
 // / raw ppu.bar.sync asm; cutlass::Barrier and NamedBarrier are never used.
 
-namespace flashqla_cute {
+#ifndef FLASHQLA_FWD_NAMESPACE
+#define FLASHQLA_FWD_NAMESPACE flashqla_cute
+#endif
+namespace FLASHQLA_FWD_NAMESPACE {
 
 namespace fq = flashqla;
 
@@ -738,7 +741,7 @@ __device__ __forceinline__ void ff_gemm_regA_swzlB_m4(
 // transposed swizzle read exposes logical [DK,CS].  Swap=true flips the atom's
 // lbo/sbo on top of Trans, which lands the fragment in TN B-operand order
 // directly instead of the loader's A-register order.
-template <typename Element, typename TC>
+template <typename Element, typename TC, bool ReverseKt = false, bool TransposeB = true>
 __device__ __forceinline__ void ff_gemm_regA_ktB_m4_acc(
     const uint32_t a_regs[FF_CS / 16][1][4], const Element* Kswz, int tidx,
     TC& ht_acc) {
@@ -760,7 +763,8 @@ __device__ __forceinline__ void ff_gemm_regA_ktB_m4_acc(
   auto rA_full = thr_mma.partition_fragment_A(dummyA);
   auto rB_full = thr_mma.partition_fragment_B(dummyB);
   CUTE_UNROLL
-  for (int kt = 0; kt < FF_CS / 16; ++kt) {
+  for (int step = 0; step < FF_CS / 16; ++step) {
+    const int kt = ReverseKt ? FF_CS / 16 - 1 - step : step;
     CUTE_UNROLL
     for (int m = 0; m < cute::size<1>(rA_full); ++m) {
       auto rA = cute::recast<uint32_t>(rA_full(cute::_, m, kt));
@@ -786,11 +790,12 @@ __device__ __forceinline__ void ff_gemm_regA_ktB_m4_acc(
   (void)tidx;
   using TsmTransB = cute::PPU0015_TSM_LD_SWZL<
       typename fq::ElementTraits<Element>::CuteType, 32, 32, /*Swap=*/true,
-      /*Trans=*/true, /*InstNum=*/1>;
+      /*Trans=*/TransposeB, /*InstNum=*/1>;
 
   cute::Tensor rH = cute::recast<float>(ht_acc);
   CUTE_UNROLL
-  for (int kt = 0; kt < FF_CS / 16; ++kt) {
+  for (int step = 0; step < FF_CS / 16; ++step) {
+    const int kt = ReverseKt ? FF_CS / 16 - 1 - step : step;
     CUTE_UNROLL
     // Four independent DK output tiles amortize each TSM load burst and leave
     // more instructions between dependent updates of the same h accumulator.
@@ -1420,6 +1425,7 @@ CUTE_DEVICE void ff_gemm_aiuAB_tc01(
 #else
 #  define FF_MIN_BLOCKS 2
 #endif
+#ifndef FLASHQLA_FOLDED_DEFINITIONS_ONLY
 enum class FfStateMode : int {
   Legacy,
   Indexed,
@@ -1583,7 +1589,11 @@ fused_fwd_cp_cute_runtime_head_major_kernel(
 #undef FF_BODY_HEAD_MAJOR
 }
 
-}  // namespace flashqla_cute
+#endif
+
+}  // namespace FLASHQLA_FWD_NAMESPACE
+
+#ifndef FLASHQLA_FOLDED_DEFINITIONS_ONLY
 
 // ============================================================
 // Host launch
@@ -2064,3 +2074,4 @@ void launch_fused_fwd_cp_cute(
       H, Hg);
   std::abort();
 }
+#endif  // FLASHQLA_FOLDED_DEFINITIONS_ONLY

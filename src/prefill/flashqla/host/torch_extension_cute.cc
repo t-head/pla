@@ -129,6 +129,24 @@ void launch_chunk_local_cumsum_qk_norm_gated_cute(
     int64_t stride_q, int64_t stride_k, int dtype_tag,
     hggcStream_t stream);
 
+// Folded kernels use the same extension, stream and tensor ownership as the
+// established stages. Coefficients are an optional internal workspace.
+void launch_folded_coefficients_cute(const void*, const void*, void*, const float*,
+    const float*, void*, const int*, const int*, int, int, int, int, float, bool, hggcStream_t);
+void launch_folded_prepare_h_cute(const void*, const void*, const void*, const int*,
+    const int*, void*, void*, int, int, int, int, int64_t, bool, hggcStream_t,
+    const float*, const int*, float*);
+void launch_folded_fwd_cute(void*, const void*, const void*, const void*, const void*,
+    const int*, const int*, const int*, const float*, float*, const int*, int, int, int,
+    int, int, int, int64_t, float, hggcStream_t);
+void launch_gdn_folded_gated_scan(const void*, const void*, const float*, const float*,
+    const int*, const int*, float*, float*, const void*, const void*, void*, void*, int,
+    int, int, int, int64_t, int64_t, int64_t, int64_t, hggcStream_t);
+void launch_gdn_correct_native(void*, const void*, const void*, const void*,
+    const signed char*, const int*, const int*, int, int, int, int, hggcStream_t, bool);
+void launch_folded_correct_fp32(void*, const void*, const void*, const void*,
+    const signed char*, const int*, const int*, int, int, hggcStream_t, bool);
+
 namespace {
 
 constexpr int kMaxCachedDevices = 64;
@@ -354,7 +372,8 @@ std::vector<torch::Tensor> chunk_local_cumsum_qk_norm_gated(
     torch::Tensor chunk_indices,
     torch::Tensor q,
     torch::Tensor k,
-    int64_t valid_num_tokens
+    int64_t valid_num_tokens,
+    bool folded
 ) {
     if (pla::bypass::enabled()) {
         if (pla::instrument::show_params()) pla::instrument::dump_metadata("flashqla.chunk_local_cumsum_qk_norm_gated",
@@ -438,7 +457,19 @@ std::vector<torch::Tensor> chunk_local_cumsum_qk_norm_gated(
     auto q_norm = torch::empty(q.sizes(), q.options());
     auto k_norm = torch::empty(k.sizes(), k.options());
     const hggcStream_t stream = pla::current_stream();
-    launch_chunk_local_cumsum_qk_norm_gated_cute(
+    if (folded) {
+        TORCH_CHECK(q.dtype() == torch::kBFloat16 &&
+                    ((a.size(1) == 24 && q.size(2) == 8) ||
+                     (a.size(1) == 12 && q.size(2) == 4)) &&
+                    logical_device_info(q).compute_capability == 89,
+                    "folded gating requires M890P BF16 with H/Hg=24/8 or 12/4");
+        launch_gdn_folded_gated_scan(
+            a.data_ptr(), b.data_ptr(), A_log.data_ptr<float>(), dt_bias.data_ptr<float>(),
+            cu_seqlens.data_ptr<int>(), chunk_indices.data_ptr<int>(),
+            g_cum.data_ptr<float>(), beta.data_ptr<float>(), q.data_ptr(), k.data_ptr(),
+            q_norm.data_ptr(), k_norm.data_ptr(), chunk_indices.size(0), qk_tokens,
+            a.size(1), q.size(2), a.stride(0), b.stride(0), q.stride(1), k.stride(1), stream);
+    } else launch_chunk_local_cumsum_qk_norm_gated_cute(
         data_ptr_b16(a), data_ptr_b16(b), A_log.data_ptr<float>(),
         dt_bias.data_ptr<float>(), cu_seqlens.data_ptr<int>(),
         chunk_indices.data_ptr<int>(), g_cum.data_ptr<float>(),
@@ -588,6 +619,60 @@ torch::Tensor kkt_solve(
     return A;
 }
 
+void check_folded_coefficients(torch::Tensor const& reference, torch::Tensor const& coefficients, int H) {
+    check_same_cuda_device(reference, coefficients, "coefficients");
+    TORCH_CHECK(reference.dtype() == torch::kBFloat16 && H > 0 && reference.size(2) > 0 &&
+                H % reference.size(2) == 0 &&
+                logical_device_info(reference).compute_capability == 89,
+                "folded prefill requires M890P BF16 with grouped value heads");
+    TORCH_CHECK(coefficients.dtype() == torch::kBFloat16 && coefficients.is_contiguous() &&
+                coefficients.dim() == 4 && coefficients.size(0) == 1 &&
+                coefficients.size(1) == reference.size(1) && coefficients.size(2) == H &&
+                coefficients.size(3) == 162, "invalid folded coefficient workspace");
+}
+
+std::tuple<torch::Tensor, torch::Tensor> folded_coefficients(torch::Tensor q, torch::Tensor k,
+    torch::Tensor beta, torch::Tensor g, torch::Tensor cu, torch::Tensor chunks, double scale, bool precise) {
+    if (pla::bypass::enabled()) {
+        if (pla::instrument::show_params()) pla::instrument::dump_metadata("flashqla.folded_coefficients",
+            {{"q", &q}, {"k", &k}, {"beta", &beta}, {"g", &g}, {"cu", &cu}, {"chunks", &chunks}});
+        return {pla::bypass::output({1, q.size(1), beta.size(2), 32}, q.options()),
+                pla::bypass::output({1, q.size(1), beta.size(2), 162}, q.options())};
+    }
+    TORCH_CHECK(q.is_cuda() && q.dim() == 4 && q.size(0) == 1 && q.size(3) == 128 &&
+                q.is_contiguous() && q.sizes() == k.sizes() && k.is_contiguous(),
+                "folded coefficients require contiguous [1,T,Hg,128] q/k");
+    check_same_cuda_device(q, k, "k");
+    check_same_b16_dtype(q, k, "k");
+    TORCH_CHECK(beta.dim() == 3 && beta.size(2) > 0, "beta must be [1,T,H]");
+    const int H = beta.size(2), Hg = q.size(2);
+    TORCH_CHECK(Hg > 0 && H % Hg == 0 && (precise || (H == 24 && Hg == 8)),
+                "unsupported folded coefficient head configuration");
+    for (const auto& tensor : {beta, g}) {
+        check_same_cuda_device(q, tensor, "gate");
+        TORCH_CHECK(tensor.dtype() == torch::kFloat32 && tensor.is_contiguous() &&
+                    tensor.dim() == 3 && tensor.size(0) == 1 && tensor.size(1) == q.size(1) &&
+                    tensor.size(2) == H, "g/beta must be contiguous FP32 [1,T,H]");
+    }
+    for (const auto& tensor : {cu, chunks}) {
+        check_same_cuda_device(q, tensor, "metadata");
+        TORCH_CHECK(tensor.dtype() == torch::kInt32 && tensor.is_contiguous(),
+                    "folded metadata must be contiguous int32");
+    }
+    TORCH_CHECK(cu.dim() == 1 && cu.numel() >= 2 && chunks.dim() == 2 &&
+                chunks.size(1) == 2, "invalid folded sequence metadata");
+    at::cuda::CUDAGuard device_guard(q.device());
+    // SoA storage: BF16 R[H,T,128], BF16 M[H,T,32], FP32 decay[H,T].
+    auto a = torch::empty({1, q.size(1), H, 32}, q.options());
+    auto coefficients = torch::empty({1, q.size(1), H, 162}, q.options());
+    check_folded_coefficients(q, coefficients, H);
+    launch_folded_coefficients_cute(q.data_ptr(), k.data_ptr(), a.data_ptr(),
+        beta.data_ptr<float>(), g.data_ptr<float>(), coefficients.data_ptr(), cu.data_ptr<int>(),
+        cu.numel() == 2 ? nullptr : chunks.data_ptr<int>(), chunks.size(0),
+        q.size(1), H, Hg, (float)scale, precise, pla::current_stream());
+    return {a, coefficients};
+}
+
 // correct_h0: affine-semigroup recurrence over CP segments. Returns cp_h0
 // [cp_batch, H, DK, DV], fp32 or bf16 per out_bf16. raw_h0 optional (empty
 // tensor -> no_raw variant). Indexed raw_h0 uses [slots,H,DV,DK]; legacy raw_h0
@@ -605,7 +690,9 @@ torch::Tensor correct_h0(
     c10::optional<torch::Tensor> raw_h0_opt,
     c10::optional<torch::Tensor> raw_h0_indices_opt,
     bool raw_h0_k_last,
-    bool out_bf16
+    bool out_bf16,
+    bool folded,
+    c10::optional<torch::Tensor> seeded_cp_h0
 ) {
     if (pla::bypass::enabled()) {
         if (pla::instrument::show_params()) pla::instrument::dump_metadata("flashqla.correct_h0",
@@ -648,11 +735,12 @@ torch::Tensor correct_h0(
         }
     }
     TORCH_CHECK(ht_buffer.is_cuda(), "ht_buffer must be CUDA");
-    TORCH_CHECK(ht_buffer.dtype() == torch::kFloat16 || ht_buffer.dtype() == torch::kBFloat16, "ht_buffer must be fp16 or bf16");
+    TORCH_CHECK(ht_buffer.dtype() == torch::kFloat16 || ht_buffer.dtype() == torch::kBFloat16 ||
+                (folded && ht_buffer.dtype() == torch::kFloat32), "invalid ht_buffer dtype");
     check_same_cuda_device(ht_buffer, mt_buffer, "mt_buffer");
     check_same_cuda_device(ht_buffer, fallback_mask, "fallback_mask");
     check_same_cuda_device(ht_buffer, seq_map_r2c, "seq_map_r2c");
-    check_same_b16_dtype(ht_buffer, mt_buffer, "mt_buffer");
+    TORCH_CHECK(ht_buffer.dtype() == mt_buffer.dtype(), "mt_buffer must match ht_buffer dtype");
     TORCH_CHECK(seq_map_r2c.dtype() == torch::kInt32, "seq_map_r2c must be int32");
     TORCH_CHECK(fallback_mask.dtype() == torch::kInt8, "fallback_mask must be int8");
 
@@ -667,7 +755,19 @@ torch::Tensor correct_h0(
         .dtype(out_bf16 ? torch::kBFloat16 : torch::kFloat32)
         .device(ht_buffer.device());
     // The kernel writes the first state and every following CP-segment state.
-    auto cp_h0 = torch::empty({cp_batch, H, DK, DV}, opt_f);
+    auto cp_h0 = seeded_cp_h0 ? *seeded_cp_h0
+                              : torch::empty({cp_batch, H, DK, DV}, opt_f);
+    if (seeded_cp_h0) {
+        TORCH_CHECK(folded &&
+                    (ht_buffer.dtype() == torch::kBFloat16 || ht_buffer.dtype() == torch::kFloat32) &&
+                    H == 24 && raw_h0_indices_opt && raw_batch_size == 1 &&
+                    cp_batch >= 2 && !out_bf16,
+                    "seeded correction requires a split indexed FP32 sequence");
+        check_same_cuda_device(ht_buffer, cp_h0, "seeded_cp_h0");
+        TORCH_CHECK(cp_h0.dtype() == torch::kFloat32 && cp_h0.is_contiguous() &&
+                    cp_h0.sizes() == ht_buffer.sizes(),
+                    "seeded_cp_h0 must match the FP32 corrected state layout");
+    }
 
     const auto device = logical_device_info(ht_buffer);
     const hggcStream_t stream = pla::current_stream();
@@ -711,7 +811,24 @@ torch::Tensor correct_h0(
             TORCH_CHECK(raw_h0.size(0) >= raw_batch_size,
                         "raw_h0 must have at least raw_batch_size states");
         }
-        launch_correct_h0_raw_cute(
+        if (folded) {
+            TORCH_CHECK((ht_buffer.dtype() == torch::kFloat32 || ht_buffer.dtype() == torch::kBFloat16) &&
+                        raw_h0.dtype() == torch::kFloat32 && raw_h0_k_last &&
+                        raw_h0_indices_ptr && !out_bf16 && device.compute_capability == 89,
+                        "folded correction requires an indexed M890P FP32 state pool");
+            if (ht_buffer.dtype() == torch::kFloat32) {
+                launch_folded_correct_fp32(cp_h0.data_ptr(), raw_h0.data_ptr(),
+                    ht_buffer.data_ptr(), mt_buffer.data_ptr(), fb,
+                    seq_map_r2c.data_ptr<int>(), raw_h0_indices_ptr,
+                    (int)raw_batch_size, H, stream, seeded_cp_h0.has_value());
+            } else {
+                launch_gdn_correct_native(cp_h0.data_ptr(), raw_h0.data_ptr(),
+                    ht_buffer.data_ptr(), mt_buffer.data_ptr(), fb,
+                    seq_map_r2c.data_ptr<int>(), raw_h0_indices_ptr,
+                    cp_batch, (int)raw_batch_size, H, device.index, stream,
+                    seeded_cp_h0.has_value());
+            }
+        } else launch_correct_h0_raw_cute(
             cp_h0.data_ptr(), raw_h0.data_ptr(),
             data_ptr_b16(ht_buffer), data_ptr_b16(mt_buffer),
             fb, seq_map_r2c.data_ptr<int>(), raw_h0_indices_ptr,
@@ -744,15 +861,23 @@ std::vector<torch::Tensor> prepare_h(
     torch::Tensor cu_seqlens,        // [batch+1] int32
     torch::Tensor num_warmup_chunks, // [batch*H] int32
     int64_t H,
-    int64_t Hg
+    int64_t Hg,
+    c10::optional<torch::Tensor> coefficients_opt,
+    bool precise,
+    bool skip_last_segment,
+    c10::optional<torch::Tensor> seeded_cp_h0,
+    c10::optional<torch::Tensor> initial_pool,
+    c10::optional<torch::Tensor> first_slot
 ) {
     if (pla::bypass::enabled()) {
         if (pla::instrument::show_params()) pla::instrument::dump_metadata("flashqla.prepare_h",
             {{"k", &k}, {"v", &v}, {"a", &a}, {"g", &g}, {"beta", &beta},
              {"cu_seqlens", &cu_seqlens}, {"num_warmup_chunks", &num_warmup_chunks}});
         const auto batch_heads = (cu_seqlens.numel() - 1) * H;
-        return {pla::bypass::output({batch_heads, 128, 128}, k.options()),
-                pla::bypass::output({batch_heads, 128, 128}, k.options())};
+        const auto options = k.options().dtype(
+            coefficients_opt.has_value() && precise ? torch::kFloat32 : k.scalar_type());
+        return {pla::bypass::output({batch_heads, 128, 128}, options),
+                pla::bypass::output({batch_heads, 128, 128}, options)};
     }
     const pla::sanity::Context sanity("flashqla.prepare_h", k);
     if (sanity) {
@@ -811,20 +936,55 @@ std::vector<torch::Tensor> prepare_h(
                 "v must be [1,T,H,128], head-contiguous, with a positive "
                 "token stride");
 
-    auto opt_e = torch::TensorOptions().dtype(k.dtype()).device(k.device());
+    auto opt_e = torch::TensorOptions().dtype(
+        coefficients_opt.has_value() && precise ? torch::kFloat32 : k.scalar_type()).device(k.device());
     auto ht = torch::empty({batch_size * (int)H, DK, DV}, opt_e);
     auto mt = torch::empty({batch_size * (int)H, DK, DK}, opt_e);
 
+    if (seeded_cp_h0) {
+        TORCH_CHECK(coefficients_opt && H == 24 && Hg == 8 &&
+                    initial_pool && first_slot && batch_size >= 2,
+                    "seeded prepare requires a short folded 24/8 sequence");
+        check_same_cuda_device(k, *seeded_cp_h0, "seeded_cp_h0");
+        check_same_cuda_device(k, *initial_pool, "initial_pool");
+        check_same_cuda_device(k, *first_slot, "first_slot");
+        TORCH_CHECK(seeded_cp_h0->dtype() == torch::kFloat32 &&
+                    seeded_cp_h0->is_contiguous() &&
+                    seeded_cp_h0->sizes() == at::IntArrayRef({batch_size, H, DK, DV}),
+                    "seeded_cp_h0 must be contiguous FP32 [segments,H,128,128]");
+        TORCH_CHECK(initial_pool->dtype() == torch::kFloat32 &&
+                    initial_pool->is_contiguous() && initial_pool->dim() == 4 &&
+                    initial_pool->size(0) > 0 && initial_pool->size(1) == H &&
+                    initial_pool->size(2) == DV && initial_pool->size(3) == DK &&
+                    first_slot->dtype() == torch::kInt32 && first_slot->is_contiguous() &&
+                    first_slot->numel() == 1,
+                    "seeded prepare requires a contiguous FP32 state pool and one slot");
+    }
+
     const auto device = logical_device_info(k);
     const hggcStream_t stream = pla::current_stream();
-    const bool precompute_x = device.compute_capability == 89 && device.num_cu == 39 &&
+    const bool precompute_x = !coefficients_opt.has_value() &&
+        device.compute_capability == 89 && device.num_cu == 39 &&
         T == 8192 && ((H == 12 && Hg == 4 && batch_size == 6) ||
                       (H == 6 && Hg == 2 && batch_size == 12));
     torch::Tensor x_scratch;
     if (precompute_x) {
         x_scratch = torch::empty({(T + 31) / 32 + batch_size, (int)H, DK, 32}, opt_e);
     }
-    launch_prepare_h_cp_cute(
+    if (coefficients_opt.has_value()) {
+        auto coefficients = coefficients_opt.value();
+        check_folded_coefficients(k, coefficients, H);
+        // The last segment has no continuation. Retain the full scratch shape
+        // for correct_h0, which reads only the nonterminal transitions.
+        const int prepare_batch = batch_size - (skip_last_segment && batch_size > 1);
+        launch_folded_prepare_h_cute(k.data_ptr(), v.data_ptr(), coefficients.data_ptr(),
+            cu_seqlens.data_ptr<int>(), num_warmup_chunks.data_ptr<int>(), ht.data_ptr(),
+            mt.data_ptr(), prepare_batch,
+            T, (int)H, (int)Hg, v.stride(1), precise, stream,
+            seeded_cp_h0 ? initial_pool->data_ptr<float>() : nullptr,
+            seeded_cp_h0 ? first_slot->data_ptr<int>() : nullptr,
+            seeded_cp_h0 ? seeded_cp_h0->data_ptr<float>() : nullptr);
+    } else launch_prepare_h_cp_cute(
         data_ptr_b16(k), data_ptr_b16(v), data_ptr_b16(a),
         g.data_ptr<float>(), beta.data_ptr<float>(), data_ptr_b16(ht), data_ptr_b16(mt),
         cu_seqlens.data_ptr<int>(), num_warmup_chunks.data_ptr<int>(),
@@ -866,7 +1026,8 @@ std::vector<torch::Tensor> fused_fwd(
     bool final_state_bf16,
     c10::optional<torch::Tensor> raw_state_input_opt,
     c10::optional<torch::Tensor> num_warmup_opt,
-    c10::optional<torch::Tensor> fallback_mask_opt
+    c10::optional<torch::Tensor> fallback_mask_opt,
+    c10::optional<torch::Tensor> coefficients_opt
 ) {
     if (pla::bypass::enabled()) {
         const c10::cuda::OptionalCUDAGuard guard(q.is_cuda()
@@ -1170,7 +1331,18 @@ std::vector<torch::Tensor> fused_fwd(
                     "failed to zero FlashQLA padded output tail: ",
                     hggcGetErrorString(status));
     }
-    launch_fused_fwd_cp_cute(
+    if (coefficients_opt.has_value()) {
+        auto coefficients = coefficients_opt.value();
+        check_folded_coefficients(q, coefficients, H);
+        TORCH_CHECK(raw_state_ptr && raw_state_indices_ptr &&
+                    !final_state_bf16 && !num_warmup_ptr,
+                    "folded forward requires an indexed FP32 state pool without overlap replay");
+        launch_folded_fwd_cute(o.data_ptr(), q.data_ptr(), k.data_ptr(), v.data_ptr(),
+            coefficients.data_ptr(), cu_seqlens.data_ptr<int>(), cp_seq_map_ptr,
+            raw_cu_seqlens.data_ptr<int>(), static_cast<const float*>(h0_ptr),
+            static_cast<float*>(raw_state_ptr), raw_state_indices_ptr, cp_batch, T,
+            raw_batch, device.index, (int)H, (int)Hg, v.stride(1), (float)scale, stream);
+    } else launch_fused_fwd_cp_cute(
         data_ptr_b16(o), data_ptr_b16(q), data_ptr_b16(k), data_ptr_b16(v), data_ptr_b16(a),
         beta.data_ptr<float>(), g.data_ptr<float>(),
         h0_ptr, ht_out.numel() > 0 ? ht_out.data_ptr() : nullptr,
@@ -1203,7 +1375,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "FlashQLA fused raw GDN gating, cumsum, and q/k L2 normalization",
           py::arg("a"), py::arg("b"), py::arg("A_log"), py::arg("dt_bias"),
           py::arg("cu_seqlens"), py::arg("chunk_indices"),
-          py::arg("q"), py::arg("k"), py::arg("valid_num_tokens") = -1);
+          py::arg("q"), py::arg("k"), py::arg("valid_num_tokens") = -1,
+          py::arg("folded") = false);
     m.def("get_warmup_chunks", &get_warmup_chunks,
           "FlashQLA CuTe get_warmup_chunks (Task 2)",
           py::arg("g"), py::arg("ht_mask"), py::arg("cu_seqlens"),
@@ -1212,6 +1385,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "FlashQLA CuTe kkt_solve (Task 3)",
           py::arg("K"), py::arg("beta"), py::arg("cu_seqlens"), py::arg("H"),
           py::arg("chunk_indices") = c10::optional<torch::Tensor>());
+    m.def("folded_coefficients", &folded_coefficients,
+          "FlashQLA M890P folded coefficient workspace",
+          py::arg("q"), py::arg("k"), py::arg("beta"), py::arg("g"),
+          py::arg("cu_seqlens"), py::arg("chunk_indices"), py::arg("scale"), py::arg("precise") = false);
     m.def("correct_h0", &correct_h0,
           "FlashQLA CuTe correct_h0; raw_h0_indices must index raw_h0 slots",
           py::arg("ht_buffer"), py::arg("mt_buffer"), py::arg("fallback_mask"),
@@ -1219,12 +1396,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("raw_h0") = c10::optional<torch::Tensor>(),
           py::arg("raw_h0_indices") = c10::optional<torch::Tensor>(),
           py::arg("raw_h0_k_last") = false,
-          py::arg("out_bf16") = false);
+          py::arg("out_bf16") = false, py::arg("folded") = false,
+          py::arg("seeded_cp_h0") = c10::optional<torch::Tensor>());
     m.def("prepare_h", &prepare_h,
           "FlashQLA CuTe prepare_h (Task 5)",
           py::arg("k"), py::arg("v"), py::arg("a"), py::arg("g"), py::arg("beta"),
           py::arg("cu_seqlens"), py::arg("num_warmup_chunks"),
-          py::arg("H"), py::arg("Hg"));
+          py::arg("H"), py::arg("Hg"),
+          py::arg("coefficients") = c10::optional<torch::Tensor>(),
+          py::arg("precise") = false, py::arg("skip_last_segment") = false,
+          py::arg("seeded_cp_h0") = c10::optional<torch::Tensor>(),
+          py::arg("initial_pool") = c10::optional<torch::Tensor>(),
+          py::arg("first_slot") = c10::optional<torch::Tensor>());
     m.def("fused_fwd", &fused_fwd,
           "FlashQLA CuTe fused_fwd; raw_state and raw_state_indices are paired",
           py::arg("q"), py::arg("k"), py::arg("v"), py::arg("a"),
@@ -1239,5 +1422,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("final_state_bf16") = false,
           py::arg("raw_state_input") = c10::optional<torch::Tensor>(),
           py::arg("num_warmup") = c10::optional<torch::Tensor>(),
-          py::arg("fallback_mask") = c10::optional<torch::Tensor>());
+          py::arg("fallback_mask") = c10::optional<torch::Tensor>(),
+          py::arg("coefficients") = c10::optional<torch::Tensor>());
 }
