@@ -114,7 +114,7 @@ class Arithmetic:
 
     Products/sums are FP32; fsum fixes a deterministic CPU reduction before the
     final FP32 rounding. GPU tree/FMA differences use the unchanged GDN budgets.
-    Only tensor-core-style dot operands use TF32, not the scalar new-U solve.
+    Matrix dot operands use TF32. The scalar new-U solve uses FP32.
     """
     def __init__(self, case, typed):
         self.c, self.typed = case, typed
@@ -135,8 +135,8 @@ class Arithmetic:
     def sum(self, xs):
         return self.r(math.fsum(xs))
 
-    def dot(self, x, y, tensor_core=True):
-        if self.typed and tensor_core and self.c.dtype == "float32" and self.c.dot_precision == "tf32":
+    def dot(self, x, y, matrix_dot=True):
+        if self.typed and matrix_dot and self.c.dtype == "float32" and self.c.dot_precision == "tf32":
             x, y = list(map(tf32_rtz, x)), list(map(tf32_rtz, y))
         return self.sum(self.mul(a, b) for a, b in zip(x, y))
 
