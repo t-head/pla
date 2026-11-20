@@ -45,14 +45,14 @@ def _metrics(actual, expected):
     return cosine, relative
 
 
-def _run(q, k, v, cu, state_pool, state_indices, *, gate, raw):
+def _run(q, k, v, cu, state_pool, state_indices, *, gate, raw, auto_cp=False):
     common = {
         "scale": D ** -0.5,
         "initial_state": state_pool,
         "initial_state_indices": state_indices,
         "cu_seqlens": cu,
         "output_final_state": False,
-        "auto_cp": raw,
+        "auto_cp": auto_cp,
         "normalize_qk": True,
         "raw_cu_seqlens": RAW_CU,
     }
@@ -81,7 +81,8 @@ def _run(q, k, v, cu, state_pool, state_indices, *, gate, raw):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a PPU device")
-def test_qwen38_real_gate_raw_indexed_state_prefill():
+@pytest.mark.parametrize("auto_cp", [False, True])
+def test_qwen38_real_gate_raw_indexed_state_prefill(auto_cp):
     assert hashlib.sha256(FIXTURE.read_bytes()).hexdigest() == FIXTURE_SHA256
     gate_cpu = torch.load(FIXTURE, map_location="cpu", weights_only=True)
     assert set(gate_cpu) == {"raw_gate_a", "raw_beta_b", "A_log", "dt_bias"}
@@ -106,13 +107,8 @@ def test_qwen38_real_gate_raw_indexed_state_prefill():
     raw_pool = base_pool.clone()
     activated_pool = base_pool.clone()
 
-    use_cp, _, _, _, _ = calc_cp_seqs(
-        cu, CHUNK_SIZE, H, RAW_CU, num_k_heads=HG
-    )
-    assert not use_cp
-
     raw_result = _run(
-        q, k, v, cu, raw_pool, state_indices, gate=gate, raw=True
+        q, k, v, cu, raw_pool, state_indices, gate=gate, raw=True, auto_cp=auto_cp,
     )
     activated_result = _run(
         q, k, v, cu, activated_pool, state_indices, gate=gate, raw=False
