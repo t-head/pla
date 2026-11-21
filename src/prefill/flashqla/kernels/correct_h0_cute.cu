@@ -61,6 +61,7 @@
 #include <type_traits>
 
 #include "flashqla_cute_traits.cuh"
+#include "prefill/flashqla/common/prepare_policy.h"
 
 #ifndef FLASHQLA_CORRECT_NAMESPACE
 #define FLASHQLA_CORRECT_NAMESPACE flashqla_cute
@@ -187,7 +188,8 @@ correct_h0_cute_kernel(
     const signed char* __restrict__ fallback_mask,
     const int* __restrict__ seq_map_r2c,
     int cp_batch_size, int raw_batch_size, int H, int has_raw,
-    int raw_h0_k_last, bool raw_h0_is_bf16, bool cp_h0_is_bf16)
+    int raw_h0_k_last, bool raw_h0_is_bf16, bool cp_h0_is_bf16,
+    const int* __restrict__ precision_flags, int key_heads)
 {
     // GW warps cooperate on one [DK, DVT] tile; eight warps split the M rows
     // of the MMA so each warp owns half the fragment. Every output element
@@ -212,6 +214,11 @@ correct_h0_cute_kernel(
     const int dv_tile = block_dv * NGRP + group;
 
     if (raw_batch_idx >= raw_batch_size) return;
+    // Private opt-in only: fused skips the same raw-sequence/key-head class.
+    // The complete selected output/state is repaired from its saved snapshot.
+    // This CTA owns no state consumed by any other sequence or head.
+    if (precision_flags != nullptr &&
+        precision_flags[raw_batch_idx * key_heads + head_idx / (H / key_heads)] != 0) return;
     const int seq_start = seq_map_r2c[raw_batch_idx];
     const int seq_end   = seq_map_r2c[raw_batch_idx + 1];
     const int num_iters = seq_end - seq_start - 1;
@@ -653,12 +660,16 @@ static void ch0_launch(
     int cp_batch_size, int raw_batch_size, int H,
     int has_raw, int raw_h0_k_last, bool raw_h0_is_bf16,
     bool cp_h0_is_bf16, int dtype_tag,
-    int device_index, int num_cu, int compute_capability, hggcStream_t stream) {
+    int device_index, int num_cu, int compute_capability,
+    const int* precision_flags, int key_heads, hggcStream_t stream) {
     const int effective_num_cu = num_cu > 0 ? num_cu : 39;
     // NGRP=1 duplicates the read-only mt tile but exposes four blocks per
     // head. Use it only when every DV tile fits in one physical-CU wave; past
     // that point NGRP=2 has the same wave count and its shared mt load wins.
-    const bool use_one_group = raw_batch_size * H * 4 <= effective_num_cu;
+    const bool mixed_pipe_shape = compute_capability == 89 && num_cu == 39 &&
+        raw_batch_size == 16 && H == 8 && cp_batch_size >= 19 && cp_batch_size <= 64;
+    const bool use_one_group = raw_batch_size * H * 4 <= effective_num_cu ||
+        mixed_pipe_shape;
     const bool raw_aligned = !has_raw ||
         reinterpret_cast<std::uintptr_t>(raw_h0) %
             (raw_h0_is_bf16 ? alignof(uint2) : alignof(float4)) == 0;
@@ -666,8 +677,8 @@ static void ch0_launch(
     const bool ht_aligned =
         reinterpret_cast<std::uintptr_t>(ht_buffer) % alignof(int4) == 0;
     const bool pipe = raw_aligned && ht_aligned &&
-        compute_capability == 89 && num_cu == 39 && raw_batch_size == 1 &&
-        ((H == 12 && cp_batch_size == 6) || (H == 6 && cp_batch_size == 12));
+        flashqla::tc02_correct_pipeline_allowed(
+            compute_capability, num_cu, raw_batch_size, H, cp_batch_size);
     const int ngrp = (use_one_group || pipe) ? 1 : 2;
     const int gw = pipe ? 8 : 4;
     int smem_bytes = ch0_smem_bytes(ngrp, pipe);
@@ -684,7 +695,7 @@ static void ch0_launch(
           cp_h0, raw_h0, raw_h0_indices, reinterpret_cast<const ElementType*>(ht_buffer), \
           reinterpret_cast<const ElementType*>(mt_buffer), fallback_mask, seq_map_r2c, \
           cp_batch_size, raw_batch_size, H, has_raw, raw_h0_k_last, \
-          raw_h0_is_bf16, cp_h0_is_bf16); \
+          raw_h0_is_bf16, cp_h0_is_bf16, precision_flags, key_heads); \
     } while (0)
 
     if (dtype_tag == 0) {
@@ -707,10 +718,11 @@ void launch_correct_h0_no_raw_cute(
     const signed char* fallback_mask, const int* seq_map_r2c,
     int cp_batch_size, int raw_batch_size, int H, bool cp_h0_is_bf16,
     int dtype_tag, int device_index, int num_cu, int compute_capability,
-    hggcStream_t stream) {
+    const int* precision_flags, int key_heads, hggcStream_t stream) {
     ch0_launch(cp_h0, nullptr, ht_buffer, mt_buffer, fallback_mask, seq_map_r2c,
                nullptr, cp_batch_size, raw_batch_size, H, 0, 0, false,
-               cp_h0_is_bf16, dtype_tag, device_index, num_cu, compute_capability, stream);
+               cp_h0_is_bf16, dtype_tag, device_index, num_cu, compute_capability,
+               precision_flags, key_heads, stream);
 }
 
 void launch_correct_h0_raw_cute(
@@ -720,10 +732,10 @@ void launch_correct_h0_raw_cute(
     int cp_batch_size, int raw_batch_size, int H, int raw_h0_k_last,
     bool raw_h0_is_bf16, bool cp_h0_is_bf16,
     int dtype_tag, int device_index, int num_cu, int compute_capability,
-    hggcStream_t stream) {
+    const int* precision_flags, int key_heads, hggcStream_t stream) {
     ch0_launch(cp_h0, raw_h0, ht_buffer, mt_buffer, fallback_mask, seq_map_r2c,
                raw_h0_indices, cp_batch_size, raw_batch_size, H, 1,
                raw_h0_k_last, raw_h0_is_bf16, cp_h0_is_bf16, dtype_tag,
-               device_index, num_cu, compute_capability, stream);
+               device_index, num_cu, compute_capability, precision_flags, key_heads, stream);
 }
 #endif  // FLASHQLA_CORRECT_KERNEL_ONLY

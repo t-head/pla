@@ -68,6 +68,17 @@ namespace flashkda_cute {
 namespace fk = flashkda;
 using cutlass::bfloat16_t;
 using BF16 = cutlass::bfloat16_t;
+
+__device__ __forceinline__ BF16 k1_bf16_exact(float x) {
+#if defined(__HGGC_ARCH__) && defined(FLASHKDA_ARCH_150)
+    BF16 result;
+    result.storage = fk::f32_to_bf16_exact_bits(x);
+    return result;
+#else
+    return BF16(x);
+#endif
+}
+
 using cute::half_t;
 
 static constexpr int CHUNK = 16;
@@ -143,10 +154,27 @@ __device__ __forceinline__ auto view16x128b(BF16* p) {
                           cute::make_stride(cute::Int<D>{}, cute::_1{})));
 }
 
+// The first Neumann MMA has already produced L^2. Reuse that tile for
+// the risk flag; no second square or inverse workspace is needed.
+__device__ __forceinline__ bool k1_conditioned_power_risk(half_t* power, int lane) {
+    float norm = 0.f;
+    if (lane < CHUNK) {
+        #pragma unroll 1
+        for (int col = 0; col < CHUNK; ++col)
+            norm += fabsf(float(power[lane * CHUNK + col]));
+        if (!isfinite(norm)) norm = INFINITY;
+    }
+    #pragma unroll
+    for (int mask = 16; mask; mask >>= 1)
+        norm = fmaxf(norm, __shfl_xor_sync(0xffffffff, norm, mask));
+    return !(norm < 1.f);
+}
+
 }  // namespace flashkda_cute
 
 #include "prefill/flashkdapro/tc01/kernel1_prepare_tc01.cuh"
 #include "prefill/flashkdapro/tc02/kernel1_prepare_tc02.cuh"
+#include "conditioned_recurrence.cuh"
 
 namespace flashkda_cute {
 
@@ -223,23 +251,32 @@ __global__ void flashkda_zero_padded_output_tail(
     const int64_t suffix_elements = int64_t(T_total - valid_tokens) * H * D;
     for (int64_t i = int(threadIdx.x); i < suffix_elements;
          i += int(blockDim.x)) {
-        out[suffix_begin + i] = BF16(0.0f);
+        out[suffix_begin + i] = k1_bf16_exact(0.0f);
     }
 }
 
 // ===================== Kernel 1: prepare =====================
 template <int NThreads, bool IsVarlen, bool UseTilePrefix,
           bool PrecomputeAffine = false, int ChunksPerCTA = 1,
-          bool FmaFront = false, bool Tc01KrContiguous = false>
-__global__ void __launch_bounds__(NThreads) flashkda_prepare_kernel(
+          bool FmaFront = false, bool Tc01KrContiguous = false,
+          bool DefaultInputs = false, int DefaultMinBlocks = 11,
+          bool DirectNeumann = false>
+#if defined(__HGGC_ARCH__) && defined(FLASHKDA_ARCH_150)
+// The higher occupancy target applies only to the raw default-input path.
+__global__ void __launch_bounds__(NThreads,
+    NThreads == 128 && !PrecomputeAffine && ChunksPerCTA == 1 && DefaultInputs ? DefaultMinBlocks : 1)
+#else
+__global__ void __launch_bounds__(NThreads)
+#endif
+flashkda_prepare_kernel(
     const BF16* __restrict__ q,       // [T_total, H, D] (token stride q_stride, D, 1)
-    const BF16* __restrict__ k,       // [T_total, H, D] (token stride k_stride, D, 1)
-    const BF16* __restrict__ g_in,    // [T_total, H, D] dense
+    const BF16* __restrict__ k,
+    const BF16* __restrict__ g_in,
     const BF16* __restrict__ beta,    // [T_total,H]
     const float* __restrict__ A_log,  // [H]
     const float* __restrict__ dt_bias,// [H, D]
     float scale, float gate_scale,
-    int T_total, int H, int beta_stride, int64_t q_stride, int64_t k_stride,
+    int T_total, int H, int beta_stride, int64_t q_token_stride, int64_t k_token_stride,
     int N, int total_tiles, int tile_count,
     const int32_t* __restrict__ cu_seqlens,
     const int* __restrict__ tile_prefix,
@@ -249,8 +286,17 @@ __global__ void __launch_bounds__(NThreads) flashkda_prepare_kernel(
     // per (head,tile), indexed by ws_idx = head*total_tiles + gtile. The Kd and
     // Qd fields are FP16 when fp16_kd_qd is true; every offset and slot size
     // stays unchanged.
-    BF16* __restrict__ ws)
+    BF16* __restrict__ ws, const BF16* __restrict__ value_input)
 {
+    const int64_t q_stride = DefaultInputs ? int64_t(H) * D : q_token_stride;
+    const int64_t k_stride = DefaultInputs ? int64_t(H) * D : k_token_stride;
+    // This tc02 specialization requires null value/ready and raw BF16.
+    // Structural/power risk classification and repair remain unchanged.
+    if constexpr (DefaultInputs) {
+        value_input = nullptr;
+        fp16_kd_qd = false;
+        ready = nullptr;
+    }
     static_assert(!PrecomputeAffine || NThreads == 128,
                   "fused affine prepare is specialized for four warps");
     static_assert(ChunksPerCTA >= 1, "ChunksPerCTA must be positive");
@@ -401,7 +447,7 @@ __global__ void __launch_bounds__(NThreads) flashkda_prepare_kernel(
                 sk[idx] = k[off + (tok0 + r) * k_stride];
                 sg[idx] = fk::bf16_to_f32(g_in[off + (tok0 + r) * rstride]);   // raw log-gate (pre-activation)
             } else {
-                sq[idx] = BF16(0); sk[idx] = BF16(0); sg[idx] = 0.0f;
+                sq[idx] = k1_bf16_exact(0); sk[idx] = k1_bf16_exact(0); sg[idx] = 0.0f;
             }
         }
     }
@@ -449,8 +495,8 @@ __global__ void __launch_bounds__(NThreads) flashkda_prepare_kernel(
 #endif
             #pragma unroll
             for (int i = 0; i < EPT; ++i) {
-                const BF16 nq = BF16(qv[i] * qn);
-                const BF16 nk = BF16(kv[i] * kn);
+                const BF16 nq = k1_bf16_exact(qv[i] * qn);
+                const BF16 nk = k1_bf16_exact(kv[i] * kn);
                 sq[row * D + col + i] = nq;
                 sk[row * D + col + i] = nk;
 #if defined(FLASHKDA_ARCH_150)
@@ -464,12 +510,13 @@ __global__ void __launch_bounds__(NThreads) flashkda_prepare_kernel(
             #pragma unroll
             for (int d = 8; d >= 1; d >>= 1)
                 qk_dot += __shfl_xor_sync(0xFFFFFFFF, qk_dot, d);
-            if (col == 0) sMqkDiag[row] = BF16(qk_dot * scale);
+            if (col == 0) sMqkDiag[row] = k1_bf16_exact(qk_dot * scale);
 #endif
         }
     }
     // --- 3. gate activation + cumsum (threads 0..127 = one column each) ---
     float a_log_exp = expf(A_log[head]);
+    float largest_gate = -INFINITY;
     for (int col = tid; col < D; col += NThreads) {
         float dt = s_dt[col];
         float sum = 0.f;
@@ -480,11 +527,38 @@ __global__ void __launch_bounds__(NThreads) flashkda_prepare_kernel(
                 gv = sg[r * D + col] + dt;
                 gv = a_log_exp * gv;
                 gv = gate_scale * fk::sigmoid_tanh_approx_f32(gv);
+                if (value_input) largest_gate = fmaxf(largest_gate, gv);
             }
             sum += gv;
             sg[r * D + col] = sum;   // cumulative sum
         }
         sgt[col] = fk::ex2_approx_ftz_f32(sum);  // ex2(g_total), same column owner
+    }
+    if (value_input) {
+        #pragma unroll
+        for (int mask = 16; mask; mask >>= 1)
+            largest_gate = fmaxf(largest_gate, __shfl_xor_sync(0xffffffff, largest_gate, mask));
+        BF16* value_slot = ws + (int64_t(head)*total_tiles+gtile)*fk::WS_SLOT_UNITS;
+        float* scales = reinterpret_cast<float*>(value_slot + fk::WS_OFF_VALUE_SCALE_U);
+        if (tid < D && (tid & 31) == 0) scales[tid >> 5] = largest_gate;
+        __syncthreads();
+        if (tid == 0)
+            *reinterpret_cast<float*>(value_slot + fk::WS_OFF_VALUE_GATE_U) =
+                fmaxf(fmaxf(scales[0],scales[1]),fmaxf(scales[2],scales[3]));
+    }
+    __syncthreads();
+
+    // Read the actual normalized BF16 keys while phase-A storage is intact.
+    // This structural class also catches low-beta value cancellation that an
+    // operator-only L^2 test cannot detect. It is not a general error bound.
+    if (tid < 32) {
+        const bool structural_class = flashkda::conditioned::exact_structural_pair(sk,actual_len,tid);
+        const float row_beta = tid < actual_len ? s_beta[tid] : 0.f;
+        const bool saturated_beta = __any_sync(0xffffffff,row_beta == 1.f);
+        if (tid == 0) {
+            BF16* flag_slot = ws + (int64_t(head)*total_tiles+gtile)*fk::WS_SLOT_UNITS;
+            *reinterpret_cast<int32_t*>(flag_slot + fk::WS_OFF_CONDITION_U) = structural_class || saturated_beta;
+        }
     }
     __syncthreads();
 
@@ -496,9 +570,9 @@ __global__ void __launch_bounds__(NThreads) flashkda_prepare_kernel(
         float ei = fk::ex2_approx_ftz_f32(-gc);
         float qf = fk::bf16_to_f32(sq[idx]);
         float kf = fk::bf16_to_f32(sk[idx]);
-        BF16 ki = BF16(kf * ei);
-        s_qd[idx] = BF16(qf * e * scale);
-        s_kd[idx] = BF16(kf * e);
+        BF16 ki = k1_bf16_exact(kf * ei);
+        s_qd[idx] = k1_bf16_exact(qf * e * scale);
+        s_kd[idx] = k1_bf16_exact(kf * e);
         s_ki[idx] = ki;
     }
     __syncthreads();
@@ -545,7 +619,7 @@ __global__ void __launch_bounds__(NThreads) flashkda_prepare_kernel(
         }
         sL[i * CHUNK + j] = x;
         // Mqk: keep lower triangle (i>=j), zero strictly-upper
-        if (i < j) sMqk[i * CHUNK + j] = BF16(0.f);
+        if (i < j) sMqk[i * CHUNK + j] = k1_bf16_exact(0.f);
 #if defined(FLASHKDA_ARCH_150)
         if (i == j) sMqk[i * CHUNK + j] = sMqkDiag[i];
 #endif
@@ -561,7 +635,7 @@ __global__ void __launch_bounds__(NThreads) flashkda_prepare_kernel(
         // kr in eight parallel K1 MMAs below.
         for (int idx = tid; idx < CHUNK * D; idx += NThreads) {
             int c = idx & (D - 1);
-            s_ki[idx] = BF16(fk::bf16_to_f32(s_ki[idx]) * sgt[c]);
+            s_ki[idx] = k1_bf16_exact(fk::bf16_to_f32(s_ki[idx]) * sgt[c]);
         }
         __syncthreads();
     }
@@ -608,7 +682,7 @@ __global__ void __launch_bounds__(NThreads) flashkda_prepare_kernel(
 #if defined(FLASHKDA_ARCH_150)
                     int src = fk::ws_kr_swzl_src_index(idx);
                     int cc = src & (D - 1);
-                    o_kr[idx] = BF16(fk::bf16_to_f32(s_ki[src]) * sgt[cc]);
+                    o_kr[idx] = k1_bf16_exact(fk::bf16_to_f32(s_ki[src]) * sgt[cc]);
 #else
                     if constexpr (Tc01KrContiguous) {
                         // Store kr^T as a contiguous [DK,CH] tile.  K2's state
@@ -618,11 +692,11 @@ __global__ void __launch_bounds__(NThreads) flashkda_prepare_kernel(
                         int cc = idx / CHUNK;
                         int row = idx % CHUNK;
                         int src = row * D + cc;
-                        o_kr[idx] = BF16(
+                        o_kr[idx] = k1_bf16_exact(
                             fk::bf16_to_f32(s_ki[src]) * sgt[cc]);
                     } else {
                         int cc = idx & (D - 1);
-                        o_kr[idx] = BF16(fk::bf16_to_f32(s_ki[idx]) * sgt[cc]);
+                        o_kr[idx] = k1_bf16_exact(fk::bf16_to_f32(s_ki[idx]) * sgt[cc]);
                     }
 #endif
                 }
@@ -649,25 +723,46 @@ __global__ void __launch_bounds__(NThreads) flashkda_prepare_kernel(
             fk::store_acc16_f16acc_1warp(acc, reinterpret_cast<__half*>(sPow), 16, lane);
         }
         __syncwarp();
+        const bool risk = k1_conditioned_power_risk(sPow, lane);
+        if (lane == 0)
+            *reinterpret_cast<int32_t*>(slot + fk::WS_OFF_CONDITION_U) |= int(risk);
         #pragma unroll
         for (int it = 0; it < 3; ++it) {
             // tmp = INV @ pow ; INV += tmp
             {
                 auto acc = fk::make_acc16_f16acc_1warp(lane);
                 fk::gemm16_ss_1warp_f16acc(view16(sINV), view16_T(sPow), lane, acc);
-                fk::store_acc16_f16acc_1warp(acc, reinterpret_cast<__half*>(sTmp), 16, lane);
+                if constexpr (DirectNeumann) {
+                    // The accumulator owns the same elements as INV. Its FP16
+                    // value can be added in place without a shared-memory copy.
+                    fk::TiledMma1WarpF16acc mma;
+                    auto inv = mma.get_thread_slice(lane).partition_C(view16(sINV));
+                    CUTE_UNROLL
+                    for (int m = 0; m < cute::size<1>(inv); ++m)
+                        CUTE_UNROLL
+                        for (int n = 0; n < cute::size<2>(inv); ++n)
+                            CUTE_UNROLL
+                            for (int v = 0; v < cute::size<0>(inv); ++v)
+                                inv(v, m, n) = half_t(float(inv(v, m, n)) + float(acc(v, m, n)));
+                } else {
+                    fk::store_acc16_f16acc_1warp(acc, reinterpret_cast<__half*>(sTmp), 16, lane);
+                    __syncwarp();
+                    for (int idx = lane; idx < CHUNK * CHUNK; idx += 32)
+                        sINV[idx] = half_t(float(sINV[idx]) + float(sTmp[idx]));
+                }
             }
-            __syncwarp();
-            for (int idx = lane; idx < CHUNK * CHUNK; idx += 32)
-                sINV[idx] = half_t(float(sINV[idx]) + float(sTmp[idx]));
             __syncwarp();
             if (it < 2) {
                 // pow = pow @ pow
                 auto acc = fk::make_acc16_f16acc_1warp(lane);
                 fk::gemm16_ss_1warp_f16acc(view16(sPow), view16_T(sPow), lane, acc);
-                fk::store_acc16_f16acc_1warp(acc, reinterpret_cast<__half*>(sTmp), 16, lane);
-                __syncwarp();
-                for (int idx = lane; idx < CHUNK * CHUNK; idx += 32) sPow[idx] = sTmp[idx];
+                // Both input fragments have already been loaded by the warp MMA.
+                auto* target = DirectNeumann ? sPow : sTmp;
+                fk::store_acc16_f16acc_1warp(acc, reinterpret_cast<__half*>(target), 16, lane);
+                if constexpr (!DirectNeumann) {
+                    __syncwarp();
+                    for (int idx = lane; idx < CHUNK * CHUNK; idx += 32) sPow[idx] = sTmp[idx];
+                }
                 __syncwarp();
             }
         }
@@ -691,7 +786,7 @@ __global__ void __launch_bounds__(NThreads) flashkda_prepare_kernel(
         BF16* sPTrans = s_kd;
         for (int idx = tid; idx < CHUNK * CHUNK; idx += NThreads) {
             int j = idx / CHUNK, i = idx % CHUNK;
-            sBmatT[idx] = BF16(float(sINV[i * CHUNK + j]) * s_beta[j]);
+            sBmatT[idx] = k1_bf16_exact(float(sINV[i * CHUNK + j]) * s_beta[j]);
         }
         __syncthreads();
 
@@ -776,7 +871,7 @@ __global__ void __launch_bounds__(NThreads) flashkda_prepare_kernel(
                     o_l[idx] = sL[idx];
             } else {
                 for (int idx = tid; idx < CHUNK * CHUNK; idx += NThreads)
-                    o_inv[idx] = BF16(float(sINV[idx]));
+                    o_inv[idx] = k1_bf16_exact(float(sINV[idx]));
             }
         }
     } else {
@@ -795,19 +890,35 @@ __global__ void __launch_bounds__(NThreads) flashkda_prepare_kernel(
 #if defined(FLASHKDA_ARCH_150)
                 int src = fk::ws_kr_swzl_src_index(idx);
                 int cc = src & (D - 1);             // src % 128 (source column)
-                o_kr[idx] = BF16(fk::bf16_to_f32(s_ki[src]) * sgt[cc]);
+                o_kr[idx] = k1_bf16_exact(fk::bf16_to_f32(s_ki[src]) * sgt[cc]);
 #else
                 int cc = idx & (D - 1);
-                o_kr[idx] = BF16(fk::bf16_to_f32(s_ki[idx]) * sgt[cc]);
+                o_kr[idx] = k1_bf16_exact(fk::bf16_to_f32(s_ki[idx]) * sgt[cc]);
 #endif
             }
         }
         for (int c = tid; c < D; c += NThreads) o_gt[c] = sgt[c];
         for (int i = tid; i < CHUNK; i += NThreads) o_beta[i] = s_beta[i];
         for (int idx = tid; idx < CHUNK * CHUNK; idx += NThreads) {
-            o_inv[idx] = BF16(float(sINV[idx]));
+            o_inv[idx] = k1_bf16_exact(float(sINV[idx]));
             if constexpr (!PrecomputeAffine)
                 o_mqk[idx] = sMqk[idx];
+        }
+    }
+    if (value_input) {
+        float* scales = reinterpret_cast<float*>(slot + fk::WS_OFF_VALUE_SCALE_U);
+        for (int feature = tid; feature < D; feature += NThreads) {
+            float maximum = 0.f;
+            #pragma unroll 1
+            for (int row = 0; row < actual_len; ++row) {
+                const int64_t off = (int64_t(tok0 + row) * H + head) * D + feature;
+                const float value = fk::bf16_to_f32(value_input[off]) * s_beta[row];
+                float square = value * value;
+                square += __shfl_xor_sync(0xffffffff, square, 2, 4);
+                square += __shfl_xor_sync(0xffffffff, square, 1, 4);
+                maximum = fmaxf(maximum, square);
+            }
+            if ((feature & 3) == 0) scales[feature / 4] = sqrtf(maximum);
         }
     }
     if constexpr (!FmaFront) if (ready != nullptr) {
@@ -916,7 +1027,7 @@ void launch_flashkda_prepare(
     int tile_offset, int tile_count, int head_offset, int head_count,
     int* ready, void* ws, bool force_plain, bool cp_fma_front,
     bool fp16_kd_qd, flashkda::KrWorkspaceLayout kr_layout,
-    hggcStream_t stream) {
+    hggcStream_t stream, const void* value_input, bool short_k1_lb8) {
     using BF16 = cutlass::bfloat16_t;
     int smem = sizeof(flashkda_cute::K1Smem);
     const bool is_tc01 =
@@ -1097,7 +1208,7 @@ void launch_flashkda_prepare(
                 q_stride, k_stride,
                 N, total_tiles, tile_count, cu_seqlens,
                 tile_prefix, tile_offset, head_offset, ready, fp16_kd_qd,
-                reinterpret_cast<BF16*>(ws));
+                reinterpret_cast<BF16*>(ws), reinterpret_cast<const BF16*>(value_input));
             auto tail = flashkda_cute::flashkda_neumann_tail_kernel<
                 decltype(varlen)::value, decltype(prefix)::value>;
             tail<<<grid, 32, 0, stream>>>(
@@ -1125,20 +1236,40 @@ void launch_flashkda_prepare(
                  auto kr_contiguous) {
         constexpr int NT = decltype(nt)::value;
         constexpr int CPC = decltype(cpc)::value;
-        auto kern = flashkda_cute::flashkda_prepare_kernel<
-            NT, decltype(varlen)::value, decltype(prefix)::value,
-            decltype(affine)::value, CPC, false,
-            decltype(kr_contiguous)::value>;
-        hggcFuncSetAttribute(kern, hggcFuncAttributeMaxDynamicSharedMemorySize, smem);
-        dim3 grid((tile_count + CPC - 1) / CPC, head_count);
-        kern<<<grid, NT, smem, stream>>>(
-            reinterpret_cast<const BF16*>(q), reinterpret_cast<const BF16*>(k),
-            reinterpret_cast<const BF16*>(g_in), reinterpret_cast<const BF16*>(beta),
-            A_log, dt_bias, scale, gate_scale, T_total, H, beta_stride,
-            q_stride, k_stride,
-            N, total_tiles, tile_count, cu_seqlens,
-            tile_prefix, tile_offset, head_offset, ready, fp16_kd_qd,
-            reinterpret_cast<BF16*>(ws));
+        auto launch_default_mode = [&](auto default_inputs, auto min_blocks, auto direct_neumann) {
+            auto kern = flashkda_cute::flashkda_prepare_kernel<
+                NT, decltype(varlen)::value, decltype(prefix)::value,
+                decltype(affine)::value, CPC, false,
+                decltype(kr_contiguous)::value, decltype(default_inputs)::value, decltype(min_blocks)::value,
+                decltype(direct_neumann)::value>;
+            hggcFuncSetAttribute(kern, hggcFuncAttributeMaxDynamicSharedMemorySize, smem);
+            dim3 grid((tile_count + CPC - 1) / CPC, head_count);
+            kern<<<grid, NT, smem, stream>>>(
+                reinterpret_cast<const BF16*>(q), reinterpret_cast<const BF16*>(k),
+                reinterpret_cast<const BF16*>(g_in), reinterpret_cast<const BF16*>(beta),
+                A_log, dt_bias, scale, gate_scale, T_total, H, beta_stride, q_stride, k_stride,
+                N, total_tiles, tile_count, cu_seqlens,
+                tile_prefix, tile_offset, head_offset, ready, fp16_kd_qd,
+                reinterpret_cast<BF16*>(ws), reinterpret_cast<const BF16*>(value_input));
+        };
+        if (!is_tc01 && value_input == nullptr && !fp16_kd_qd && ready == nullptr &&
+            q_stride == int64_t(H) * 128 && k_stride == int64_t(H) * 128) {
+            if constexpr (NT == 128 && CPC == 1 && decltype(varlen)::value
+                          && !decltype(prefix)::value && !decltype(affine)::value
+                          && !decltype(kr_contiguous)::value) {
+                if (short_k1_lb8) {
+                    // The host has already matched tc02, the CU count and the exact offsets.
+                    if ((N == 1 && H == 12 && T_total == 823) || (N == 2 && H == 8 && T_total == 920))
+                        launch_default_mode(std::true_type{}, std::integral_constant<int, 8>{}, std::true_type{});
+                    else
+                        launch_default_mode(std::true_type{}, std::integral_constant<int, 8>{}, std::false_type{});
+                    return;
+                }
+            }
+            launch_default_mode(std::true_type{}, std::integral_constant<int, 11>{}, std::false_type{});
+        } else {
+            launch_default_mode(std::false_type{}, std::integral_constant<int, 11>{}, std::false_type{});
+        }
     };
     // affine is only ever enabled on the 128-thread shape; every other thread
     // count uses the plain (non-affine) prepare.

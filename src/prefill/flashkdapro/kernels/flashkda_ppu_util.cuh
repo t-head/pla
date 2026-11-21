@@ -123,6 +123,24 @@ __forceinline__ __device__ float bf16_to_f32(BF16 x) {
 #endif
 }
 
+// tc02 round-to-nearest-even; every FP32 NaN maps to positive BF16 0x7fff.
+__forceinline__ __device__ uint16_t f32_to_bf16_exact_bits(float x) {
+#if defined(__HGGC_ARCH__) && defined(FLASHKDA_ARCH_150)
+  uint16_t bits;
+  asm("{\n"
+      " .reg .pred p;\n"
+      " .reg .b16 raw;\n"
+      " ppu.cvt.rtte.bf16.f32 raw, %1;\n"
+      " ppu.cmpp.nan.f32 p, %1, %1;\n"
+      " ppu.selp.b16 %0, 0x7fff, raw, p;\n"
+      "}\n"
+      : "=h"(bits) : "f"(x));
+  return bits;
+#else
+  return BF16(x).storage;
+#endif
+}
+
 }  // namespace flashkda
 
 namespace cute {
@@ -428,13 +446,13 @@ CUTE_DEVICE void bf16_cfrag_to_bfrag_movmatrix_batched_u32(
   CUTE_UNROLL
   for (int i = 0; i < 4; ++i) scratch[i * 32 + lane] = c_regs[i];
   __syncwarp();
-  const int row = lane & 7;
-  CUTE_UNROLL
-  for (int i = 0; i < 4; ++i) {
-    uint32_t smem_addr = static_cast<uint32_t>(
-        __cvta_generic_to_shared(scratch + i * 32 + row * 4));
-    b_regs[i] = ldmatrix_x1_trans_u32(smem_addr);
-  }
+  // Same four scratch planes and warp barriers; one transposed x4 load.
+  uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(
+      scratch + (lane >> 3) * 32 + (lane & 7) * 4));
+  asm volatile(
+      "ppu.tc02.ldmatrix.sync.aligned.x4.trans.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+      : "=r"(b_regs[0]), "=r"(b_regs[1]), "=r"(b_regs[2]), "=r"(b_regs[3])
+      : "r"(smem_addr));
   __syncwarp();
 #else
   (void)scratch;
@@ -501,7 +519,7 @@ CUTE_DEVICE void bf16_acc_to_bfrag_movmatrix_batched_u32(
     for (int n = 0; n < cute::size<2>(rC); ++n)
       CUTE_UNROLL
       for (int v = 0; v < cute::size<0>(rC); ++v) {
-        c_half[pos] = BF16(rC(v, m, n)).storage;
+        c_half[pos] = f32_to_bf16_exact_bits(rC(v, m, n));
         ++pos;
       }
   uint32_t c_regs[4];

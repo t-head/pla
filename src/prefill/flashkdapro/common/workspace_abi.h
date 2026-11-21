@@ -60,6 +60,9 @@ inline constexpr int WS_OFF_INV_U = 6144;
 inline constexpr int WS_OFF_MQK_U = 6400;
 inline constexpr int WS_OFF_GT_U = 6656;
 inline constexpr int WS_OFF_BETA_U = 6912;             // fp32[16]
+inline constexpr int WS_OFF_CONDITION_U = 6944;        // int32 tile risk flag
+inline constexpr int WS_OFF_VALUE_SCALE_U = 6946;      // fp32[32], DV groups of 4
+inline constexpr int WS_OFF_VALUE_GATE_U = WS_OFF_VALUE_SCALE_U + 2 * 32; // fp32 max log2 decay
 inline constexpr int WS_SLOT_UNITS = 7040;
 inline constexpr int WS_SLOT_BYTES = WS_SLOT_UNITS * 2;
 static_assert(WS_OFF_QD_U == WS_OFF_KD_U + WS_KD_U);
@@ -69,6 +72,10 @@ static_assert(WS_OFF_MQK_U == WS_OFF_INV_U + WS_INV_U);
 static_assert(WS_OFF_GT_U == WS_OFF_MQK_U + WS_INV_U);
 static_assert(WS_OFF_BETA_U == WS_OFF_GT_U + WS_GT_U);
 static_assert(WS_SLOT_UNITS >= WS_OFF_BETA_U + 2 * WS_CHUNK);
+static_assert(WS_OFF_CONDITION_U >= WS_OFF_BETA_U + 2 * WS_CHUNK);
+static_assert(WS_SLOT_UNITS >= WS_OFF_CONDITION_U + 2);
+static_assert(WS_SLOT_UNITS >= WS_OFF_VALUE_SCALE_U + 2 * 32);
+static_assert(WS_SLOT_UNITS >= WS_OFF_VALUE_GATE_U + 2);
 
 // CP segment-table fields.  WSBASE indexes the same workspace slot ABI above.
 inline constexpr int KDA_SEG_STRIDE = 4;

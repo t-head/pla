@@ -87,6 +87,7 @@
  */
 #include <hggc_runtime.h>
 #include <hggc_fp16.h>
+#include <hggc_bf16.h>
 #include <cutlass/bfloat16.h>
 #include <type_traits>
 #include "prefill/flashkdapro/common/launch_api.h"
@@ -192,7 +193,7 @@ __device__ __forceinline__ uint16_t k2n_state_as_bf16_bits(FP16 x) {
 }
 
 __device__ __forceinline__ uint16_t k2n_state_as_bf16_bits(float x) {
-    return BF16(x).storage;
+    return fk::f32_to_bf16_exact_bits(x);
 }
 
 __device__ __forceinline__ uint16_t k2n_state_bits(BF16 x) {
@@ -205,6 +206,19 @@ __device__ __forceinline__ uint16_t k2n_state_bits(FP16 x) {
 
 __device__ __forceinline__ uint32_t k2n_state_bits(float x) {
     return __float_as_uint(x);
+}
+
+template <bool Packed, typename StateT>
+__device__ __forceinline__ uint32_t k2n_pack_bf16_pair(StateT lo, StateT hi) {
+#if defined(FLASHKDA_ARCH_150)
+    if constexpr (Packed) {
+        static_assert(std::is_same_v<StateT, float>);
+        union { __ppu_bfloat162 pair; uint32_t word; } bits;
+        bits.pair = __floats2bfloat162_rn(lo, hi);
+        return bits.word;
+    }
+#endif
+    return fk::pack_half2_u32(k2n_state_as_bf16_bits(lo), k2n_state_as_bf16_bits(hi));
 }
 
 template <bool Fp16State>
@@ -245,7 +259,7 @@ struct K2NConfig {
     static_assert(NThreads == 32 || NThreads == 64
                   || NThreads == 128 || NThreads == 160 || NThreads == 256,
                   "nows supports 32, 64, 128, 160, or 256 compute threads");
-    static_assert(CtaDV == 16 || CtaDV == 32 || CtaDV == DV,
+    static_assert(CtaDV == 16 || CtaDV == 32 || CtaDV == 64 || CtaDV == DV,
                   "nows CTA value tile must be 16, 32, or the full DV");
     static constexpr int NWARPS = NThreads / WARP;
     static_assert(DKSplitWarps == 1 || DKSplitWarps == 2
@@ -642,10 +656,17 @@ template <int NThreads, bool IsVarlen, bool HasStateIn, bool HasStateOut,
           bool UseSegTable = false, bool PreScan = false,
           bool Tc01KrTranspose = false,
           bool Tc01VectorOutput = false,
-          bool Fp16State = false>
+          bool Fp16State = false, bool PublishZeroSlices = false>
+// Only the full-DV, unsplit, non-leader tc02 path uses the higher target.
 __global__ void __launch_bounds__(
     K2NLaunchConfig<NThreads>::NThreads,
-    K2NLaunchConfig<NThreads>::MinBlocksPerCU)
+#if defined(__HGGC_ARCH__) && (__HGGC_ARCH__ == 150)
+    (NThreads == 256 && CtaDV == DV && DKSplitWarps == 1 && !DedicatedLeader)
+        ? 3 : K2NLaunchConfig<NThreads>::MinBlocksPerCU
+#else
+    K2NLaunchConfig<NThreads>::MinBlocksPerCU
+#endif
+)
 flashkda_recurrence_nows_kernel(
     BF16* __restrict__ o,             // [T_total, H, DV]
     const BF16* __restrict__ v,       // [T_total, H, DV] (token stride v_stride, DV, 1)
@@ -663,7 +684,8 @@ flashkda_recurrence_nows_kernel(
     //                  may end on a partial CH tile)
     //   [2] ws_tile_base (absolute workspace tile index of the first tile)
     //   [3] reserved
-    const int* __restrict__ seg_tbl = nullptr)
+    const int* __restrict__ seg_tbl = nullptr,
+    int32_t* __restrict__ zero_slices = nullptr)
 {
     static_assert(DV % CtaDV == 0, "CTA value tile must divide DV");
     static_assert(DKB % DKSplitWarps == 0,
@@ -689,6 +711,8 @@ flashkda_recurrence_nows_kernel(
     constexpr int COLB = C::COLB;
     constexpr int LOCAL_DKB = DKB / DKSplitWarps;
     constexpr int ZSPLIT = DV / CtaDV;
+    constexpr bool PackedState = UseSegTable && NThreads == 128 && CtaDV == 64
+                              && DKSplitWarps == 1 && !DedicatedLeader && !Fp16State;
     using StorageStateT = typename std::conditional<Fp16State, FP16, BF16>::type;
 #if defined(FLASHKDA_ARCH_150)
     constexpr bool Fp32MasterState = !UseSegTable || !Fp16State;
@@ -866,6 +890,7 @@ flashkda_recurrence_nows_kernel(
                     rstate[ml][bi][e] = k2n_state_from_f32<StateT>(0.f);
     }
 
+    bool exact_zero = false;
     for (int t = 0; t < t_tiles; ++t) {
         int actual = min(CH, seq_len - t * CH);
         int ws_idx = head * total_tiles + tile_base + t;
@@ -996,9 +1021,8 @@ flashkda_recurrence_nows_kernel(
                                 k2n_state_bits(rstate[ml][0][2 * i]),
                                 k2n_state_bits(rstate[ml][0][2 * i + 1]));
                         } else {
-                            c_regs[i] = fk::pack_half2_u32(
-                                k2n_state_as_bf16_bits(rstate[ml][0][2 * i]),
-                                k2n_state_as_bf16_bits(rstate[ml][0][2 * i + 1]));
+                            c_regs[i] = k2n_pack_bf16_pair<PackedState>(
+                                rstate[ml][0][2 * i], rstate[ml][0][2 * i + 1]);
                         }
                     }
                     NOWS_CFRAG_TO_BFRAG(c_regs, b_regs, lane, warpScr);
@@ -1031,9 +1055,8 @@ flashkda_recurrence_nows_kernel(
                                 k2n_state_bits(rstate[ml][1][2 * i]),
                                 k2n_state_bits(rstate[ml][1][2 * i + 1]));
                         } else {
-                            c_regs[i] = fk::pack_half2_u32(
-                                k2n_state_as_bf16_bits(rstate[ml][1][2 * i]),
-                                k2n_state_as_bf16_bits(rstate[ml][1][2 * i + 1]));
+                            c_regs[i] = k2n_pack_bf16_pair<PackedState>(
+                                rstate[ml][1][2 * i], rstate[ml][1][2 * i + 1]);
                         }
                     }
                     NOWS_CFRAG_TO_BFRAG(c_regs, b_regs, lane, warpScr);
@@ -1216,7 +1239,7 @@ flashkda_recurrence_nows_kernel(
                 float val = vv - rvsub(e);
                 if constexpr (!DedicatedLeader)
                     val *= beta_part(e);
-                c_half[e] = BF16(val).storage;
+                c_half[e] = fk::f32_to_bf16_exact_bits(val);
             }
             uint32_t c_regs[4], vbeta_b[4];
             CUTE_UNROLL
@@ -1271,8 +1294,8 @@ flashkda_recurrence_nows_kernel(
                             int c = ccol[e];
                             if (r < actual) {
                                 uint32_t pair = fk::pack_half2_u32(
-                                    BF16(ro1(e)).storage,
-                                    BF16(ro1(e + 1)).storage);
+                                    fk::f32_to_bf16_exact_bits(ro1(e)),
+                                    fk::f32_to_bf16_exact_bits(ro1(e + 1)));
                                 *reinterpret_cast<uint32_t*>(
                                     o_head + int64_t(r) * row_stride + c) = pair;
                             }
@@ -1344,7 +1367,7 @@ flashkda_recurrence_nows_kernel(
                     int c = ccol[e];
                     if (r < actual) {
                         uint32_t pair = fk::pack_half2_u32(
-                            BF16(ro1(e)).storage, BF16(ro1(e + 1)).storage);
+                            fk::f32_to_bf16_exact_bits(ro1(e)), fk::f32_to_bf16_exact_bits(ro1(e + 1)));
                         *reinterpret_cast<uint32_t*>(
                             o_head + int64_t(r) * row_stride + c) = pair;
                     }
@@ -1429,6 +1452,7 @@ flashkda_recurrence_nows_kernel(
         __syncthreads();   // recycle double-buffered smem for chunk t+2
         if constexpr (PreScan) {
             if (m_dead) {
+                if constexpr (PublishZeroSlices) exact_zero = true;
                 // Chunk t+1's prefetch is already in flight and targets the
                 // staging buffer the epilogue reuses for the state image.
                 if (tid == 0) k2n_aiu_wait_group<0>();
@@ -1436,6 +1460,14 @@ flashkda_recurrence_nows_kernel(
                 break;
             }
         }
+    }
+
+    if constexpr (PublishZeroSlices) {
+        static_assert(PreScan && CtaDV == 64 && !Fp16State);
+        // Each transition slice has one writer. The launch boundary publishes
+        // both proofs before the merge can consume them.
+        if (chain_m && tid == 0)
+            zero_slices[(seq * H + head) * ZSPLIT + dv_tile] = exact_zero;
     }
 
     // ===== Store final state St^T -> final_state[slot,h,dv,dk] =====
@@ -1499,7 +1531,7 @@ void launch_flashkda_recurrence_nows(
     bool init_state_is_fp32, bool final_state_is_fp32,
     int T_total, int H, int N, int total_tiles, const int32_t* cu_seqlens,
     bool is_varlen, bool has_state_in, bool has_state_out,
-    flashkda::KrWorkspaceLayout kr_layout, hggcStream_t stream) {
+    flashkda::KrWorkspaceLayout kr_layout, hggcStream_t stream, int preferred_dv) {
     using BF16 = cutlass::bfloat16_t;
     namespace fkn = flashkda_cute_nows;
     const bool is_tc01 = flashkda::host_runtime::current_device_is_tc01();
@@ -1690,7 +1722,7 @@ void launch_flashkda_recurrence_nows(
         && (atoi(eds) == 16 || atoi(eds) == 32);
     bool use_dvsplit = has_dvsplit_override
         ? (valid_dvsplit_override && (is_varlen || N == 1))
-        : auto_dvsplit;
+        : (auto_dvsplit || preferred_dv != 0);
     // The host's immutable workspace-layout decision is authoritative. It has
     // already validated the exact BV/DK schedule; force entry to the matching
     // consumer even if another thread mutates a diagnostic env afterwards.
@@ -1745,7 +1777,7 @@ void launch_flashkda_recurrence_nows(
                            && T_total < 256) ? 16 : 32;
             }
         }
-        int requested_bv = has_dvsplit_override ? atoi(eds) : auto_bv;
+        int requested_bv = has_dvsplit_override ? atoi(eds) : (preferred_dv ? preferred_dv : auto_bv);
         bool use_bv16 = requested_bv == 16;
         const char* edk = getenv("PLA_FLASHKDA_K2_DKSPLIT");
         bool auto_bv16_dk4lead = N == 1 && use_bv16 && T_total >= 4096
@@ -1836,7 +1868,7 @@ void launch_flashkda_recurrence_nows(
                     reinterpret_cast<const BF16*>(ws),
                     state_in, state_out,
                     T_total, H, N, total_tiles, cu_seqlens, tile_prefix,
-                    /*seg_tbl=*/nullptr);
+                    /*seg_tbl=*/nullptr, /*zero_slices=*/nullptr);
             };
             auto pick_state = [&](auto si, auto so) {
                 if (compact_bf16_state)
@@ -2018,8 +2050,12 @@ void launch_flashkda_recurrence_nows(
     // (seq,head).  Reached by full-DV single-sequence launches (H>64) and all
     // varlen (B>1) launches.  The 256-thread template gives each warp one
     // 16-column block and halves per-warp work when the launch fits one
-    // resident wave (N==1, T>=256, H<=78); otherwise the 128-thread template.
-    bool use_256 = N == 1 && T_total >= 256 && H <= 78;
+    // resident wave (N==1, T>=256, H<=78). The tc02 FP32 master state also
+    // benefits at H96: one DV16 tile per warp avoids the two-tile register
+    // pressure of the 128-thread form. Paired complete-call measurements over
+    // 508--31801 tokens reduced latency by about 30%, with both state dtypes.
+    bool use_256 = N == 1 && T_total >= 256 &&
+        (H <= 78 || (!is_tc01 && H == 96));
 
     auto run = [&](auto nt, auto vl, auto si, auto so, auto compact_state,
                    auto vec_output_tag) {
@@ -2043,7 +2079,7 @@ void launch_flashkda_recurrence_nows(
             reinterpret_cast<const BF16*>(beta), reinterpret_cast<const BF16*>(ws),
             state_in, state_out,
             T_total, H, N, total_tiles, cu_seqlens, tile_prefix,
-            /*seg_tbl=*/nullptr);
+            /*seg_tbl=*/nullptr, /*zero_slices=*/nullptr);
     };
     auto pick_state = [&](auto nt, auto vl, auto si, auto so,
                           auto vec_output_tag) {
@@ -2112,7 +2148,7 @@ void launch_flashkda_cp_prescan(
     const void* v, int64_t v_stride, const void* beta, const void* ws,
     void* chain_state, bool fp16_state,
     int T_total, int H, int n_seg, int total_tiles,
-    const int* seg_tbl, int bv, hggcStream_t stream) {
+    const int* seg_tbl, int bv, hggcStream_t stream, bool automatic_nt256) {
     using BF16 = cutlass::bfloat16_t;
     namespace fkn = flashkda_cute_nows;
     auto go = [&](auto nt_tag, auto bv_tag, auto fp16_tag) {
@@ -2140,7 +2176,7 @@ void launch_flashkda_cp_prescan(
             reinterpret_cast<const BF16*>(ws),
             state_in, state_out,
             T_total, H, n_seg, total_tiles,
-            /*cu_seqlens=*/nullptr, /*tile_prefix=*/nullptr, seg_tbl);
+            /*cu_seqlens=*/nullptr, /*tile_prefix=*/nullptr, seg_tbl, /*zero_slices=*/nullptr);
     };
     auto pick = [&](auto nt_tag, auto bv_tag) {
         if (fp16_state) go(nt_tag, bv_tag, std::true_type{});
@@ -2150,8 +2186,17 @@ void launch_flashkda_cp_prescan(
         pick(std::integral_constant<int, 32>{}, std::integral_constant<int, 16>{});
     else if (bv == 32)
         pick(std::integral_constant<int, 64>{}, std::integral_constant<int, 32>{});
-    else
-        pick(std::integral_constant<int, 128>{}, std::integral_constant<int, 128>{});
+    else if (bv == 64)
+        pick(std::integral_constant<int, 128>{}, std::integral_constant<int, 64>{});
+    else {
+        const char* threads_env = getenv("PLA_FLASHKDA_TC02_CP_FULL_DV_NT256");
+        const bool use_nt256 = !flashkda::host_runtime::current_device_is_tc01()
+            && (automatic_nt256 || (threads_env && threads_env[0] == '1' && threads_env[1] == '\0'));
+        if (use_nt256)
+            pick(std::integral_constant<int, 256>{}, std::integral_constant<int, 128>{});
+        else
+            pick(std::integral_constant<int, 128>{}, std::integral_constant<int, 128>{});
+    }
 }
 
 void launch_flashkda_cp_segment(
@@ -2159,7 +2204,7 @@ void launch_flashkda_cp_segment(
     const void* carries, bool fp16_state, void* final_state,
     const int32_t* final_state_indices, bool final_state_is_fp32,
     int T_total, int H, int n_seg, int total_tiles,
-    const int* seg_tbl, int bv, hggcStream_t stream) {
+    const int* seg_tbl, int bv, hggcStream_t stream, bool automatic_nt256) {
     using BF16 = cutlass::bfloat16_t;
     namespace fkn = flashkda_cute_nows;
     const bool compact_bf16_state = final_state == nullptr
@@ -2194,7 +2239,7 @@ void launch_flashkda_cp_segment(
                 reinterpret_cast<const BF16*>(ws),
                 state_in, state_out,
                 T_total, H, n_seg, total_tiles,
-                /*cu_seqlens=*/nullptr, /*tile_prefix=*/nullptr, seg_tbl);
+                /*cu_seqlens=*/nullptr, /*tile_prefix=*/nullptr, seg_tbl, /*zero_slices=*/nullptr);
         };
         auto pick_state = [&](auto store_final_tag) {
             if (fp16_state)
@@ -2211,6 +2256,35 @@ void launch_flashkda_cp_segment(
         go(std::integral_constant<int, 32>{}, std::integral_constant<int, 16>{});
     else if (bv == 32)
         go(std::integral_constant<int, 64>{}, std::integral_constant<int, 32>{});
-    else
-        go(std::integral_constant<int, 128>{}, std::integral_constant<int, 128>{});
+    else if (bv == 64)
+        go(std::integral_constant<int, 128>{}, std::integral_constant<int, 64>{});
+    else {
+        const char* threads_env = getenv("PLA_FLASHKDA_TC02_CP_FULL_DV_NT256");
+        const bool use_nt256 = !flashkda::host_runtime::current_device_is_tc01()
+            && (automatic_nt256 || (threads_env && threads_env[0] == '1' && threads_env[1] == '\0'));
+        if (use_nt256)
+            go(std::integral_constant<int, 256>{}, std::integral_constant<int, 128>{});
+        else
+            go(std::integral_constant<int, 128>{}, std::integral_constant<int, 128>{});
+    }
+}
+
+void launch_flashkda_cp_prescan_zero_flags(
+    const void* v, const void* beta, const void* ws, void* chain, int32_t* zero_slices,
+    int tokens, int heads, int segments, int tiles, const int* table, hggcStream_t stream) {
+    namespace fkn = flashkda_cute_nows;
+    constexpr int threads = 128, value_rows = 64;
+    using S = fkn::K2NSmem<threads, value_rows>;
+    auto kernel = fkn::flashkda_recurrence_nows_kernel<
+        threads, false, false, true, true, value_rows, 1, false,
+        /*UseSegTable=*/true, /*PreScan=*/true, false, false, false,
+        /*PublishZeroSlices=*/true>;
+    auto input = fkn::make_k2n_state_in_accessor<true>(nullptr, nullptr, false);
+    auto output = fkn::make_k2n_state_out_accessor<true>(chain, nullptr, false);
+    hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, S::SMEM_BYTES);
+    kernel<<<dim3(segments, heads, 2 * (fkn::DV / value_rows)), threads, S::SMEM_BYTES, stream>>>(
+        nullptr, static_cast<const fkn::BF16*>(v), int64_t(heads) * fkn::DV,
+        static_cast<const fkn::BF16*>(beta),
+        static_cast<const fkn::BF16*>(ws), input, output, tokens, heads, segments, tiles,
+        nullptr, nullptr, table, zero_slices);
 }

@@ -224,7 +224,7 @@ class Tc01RealGatePlannerTest(unittest.TestCase):
                     self._raw_cu(*lengths), chunk_size, heads, key_heads
                 ))
 
-    def test_tc01_overlap_flag_promotes_only_the_new_planner_region(self):
+    def test_tc01_overlap_flag_cannot_enable_production_cp(self):
         cu = self._cu(16384, 16384)
         with mock.patch.object(
             cp, "_device_execution_model", side_effect=self._tc01_device_model
@@ -242,11 +242,11 @@ class Tc01RealGatePlannerTest(unittest.TestCase):
             )
 
         self.assertFalse(default_plan[0])
-        self.assertTrue(overlap_plan[0])
+        self.assertFalse(overlap_plan[0])
         self.assertFalse(unsupported_plan[0])
         self.assertEqual(len(cp._cp_plan_cache), 3)
 
-    def test_tc01_p1_h16_hg2_uses_exact_five_segment_full_wave_plan(self):
+    def test_tc01_forced_p1_candidate_preserves_segment_geometry(self):
         raw_cu = self._raw_cu(14309, 2075)
         cu = self._cu(14309, 2075)
         b1_cu = self._cu(8346)
@@ -257,10 +257,12 @@ class Tc01RealGatePlannerTest(unittest.TestCase):
             overlap_plan = cp.calc_cp_seqs(
                 cu, 32, 16, num_k_heads=2,
                 tc01_enable_overlap_candidate=True,
+                tc01_force_candidate=True,
             )
             b1_plan = cp.calc_cp_seqs(
                 b1_cu, 32, 16, num_k_heads=2,
                 tc01_enable_overlap_candidate=True,
+                tc01_force_candidate=True,
             )
             raw_overlap_plan = cp.calc_cp_seqs(
                 cu, 32, 16, num_k_heads=2,
@@ -269,13 +271,13 @@ class Tc01RealGatePlannerTest(unittest.TestCase):
                 tc01_force_candidate=True,
             )
             threshold = cp.tc01_overlap_warmup_threshold(
-                cu, raw_cu, 32, 16, 2,
+                cu, raw_cu, 32, 16, 2, force_candidate=True,
                 use_raw_gating=False,
                 indexed_state=True,
                 has_initial_state=True,
             )
             raw_threshold = cp.tc01_overlap_warmup_threshold(
-                cu, raw_cu, 32, 16, 2,
+                cu, raw_cu, 32, 16, 2, force_candidate=True,
                 use_raw_gating=True,
                 indexed_state=True,
                 has_initial_state=True,
@@ -336,7 +338,7 @@ class Tc01RealGatePlannerTest(unittest.TestCase):
                 cu, 32, 16, num_k_heads=2,
                 tc01_enable_overlap_candidate=True)
             self.assertTrue(forced[0])
-            self.assertTrue(activated[0])
+            self.assertFalse(activated[0])
         with mock.patch.object(
             cp, "_device_execution_model", side_effect=self._tc02_device_model
         ), mock.patch.object(cp, "_tc01_serial_lpt_allowed") as guard:
@@ -382,7 +384,7 @@ class Tc01RealGatePlannerTest(unittest.TestCase):
                     use_packed_raw_spec=True,
                 ))
 
-    def test_tc01_p2_measured_plans_use_validated_boundaries(self):
+    def test_tc01_forced_p2_candidates_preserve_historical_boundaries(self):
         cases = (
             ((8192,), 16, 2,
              [0, 1664, 3328, 4992, 6656, 8192], -0.75, False),
@@ -432,9 +434,10 @@ class Tc01RealGatePlannerTest(unittest.TestCase):
                         cu, 32, heads, num_k_heads=key_heads,
                         tc01_enable_overlap_candidate=True,
                         tc01_packed_raw_gate=use_raw_gating,
+                        tc01_force_candidate=True,
                     )
                     threshold = cp.tc01_overlap_warmup_threshold(
-                        cu, raw_cu, 32, heads, key_heads,
+                        cu, raw_cu, 32, heads, key_heads, force_candidate=True,
                         use_raw_gating=use_raw_gating,
                         indexed_state=True,
                         has_initial_state=True,
@@ -457,7 +460,7 @@ class Tc01RealGatePlannerTest(unittest.TestCase):
                     raw_cu = self._raw_cu(*lengths)
                     cu = self._cu(*lengths)
                     self.assertIsNone(cp.tc01_overlap_warmup_threshold(
-                        cu, raw_cu, 32, heads, key_heads,
+                        cu, raw_cu, 32, heads, key_heads, force_candidate=True,
                         use_raw_gating=False,
                         indexed_state=True,
                         has_initial_state=True,
@@ -496,13 +499,13 @@ class Tc01RealGatePlannerTest(unittest.TestCase):
                         raw_cu, heads, key_heads
                     ), (segments, expected_threshold))
                     self.assertEqual(cp.tc01_overlap_warmup_threshold(
-                        cu, raw_cu, 32, heads, key_heads,
+                        cu, raw_cu, 32, heads, key_heads, force_candidate=True,
                         use_raw_gating=True,
                         indexed_state=True,
                         has_initial_state=True,
                     ), expected_threshold)
                     self.assertEqual(cp.tc01_overlap_warmup_threshold(
-                        cu, raw_cu, 32, heads, key_heads,
+                        cu, raw_cu, 32, heads, key_heads, force_candidate=True,
                         use_raw_gating=False,
                         indexed_state=True,
                         has_initial_state=True,
@@ -534,18 +537,22 @@ class Tc01RealGatePlannerTest(unittest.TestCase):
             cp, "_device_execution_model", side_effect=self._tc01_device_model
         ):
             self.assertEqual(cp.tc01_overlap_warmup_threshold(
+                force_candidate=True,
                 *common, use_raw_gating=True, indexed_state=True,
                 has_initial_state=True,
             ), -4.0)
             self.assertEqual(cp.tc01_overlap_warmup_threshold(
+                force_candidate=True,
                 *common, use_raw_gating=True, indexed_state=False,
                 has_initial_state=False,
             ), -4.0)
             self.assertEqual(cp.tc01_overlap_warmup_threshold(
+                force_candidate=True,
                 *common, use_raw_gating=True, indexed_state=False,
                 has_initial_state=True,
             ), -4.0)
             self.assertIsNone(cp.tc01_overlap_warmup_threshold(
+                force_candidate=True,
                 *common, use_raw_gating=False, indexed_state=True,
                 has_initial_state=True,
             ))
@@ -553,6 +560,7 @@ class Tc01RealGatePlannerTest(unittest.TestCase):
             cp, "_device_execution_model", side_effect=self._tc02_device_model
         ):
             self.assertIsNone(cp.tc01_overlap_warmup_threshold(
+                force_candidate=True,
                 *common, use_raw_gating=True, indexed_state=True,
                 has_initial_state=True,
             ))
@@ -576,17 +584,17 @@ class Tc01RealGatePlannerTest(unittest.TestCase):
             for lengths, heads, expected_cp in cases:
                 with self.subTest(lengths=lengths, heads=heads):
                     plan = cp.calc_cp_seqs(self._cu(*lengths), 32, heads)
-                    self.assertEqual(plan[0], expected_cp)
-                    self.assertEqual(plan[1] is not None, expected_cp)
+                    self.assertEqual(plan, (False, None, None, None, None))
 
-    def test_tc01_admitted_shape_uses_one_legacy_plan(self):
+    def test_tc01_forced_shape_uses_one_legacy_plan(self):
         cu = self._cu(10000)
         with mock.patch.object(
             cp, "_device_execution_model", side_effect=self._tc01_device_model
         ), mock.patch.object(
             cp, "_calc_tc01_plan", wraps=cp._calc_tc01_plan
         ) as tc01_plan:
-            plan = cp.calc_cp_seqs(cu, 32, 8, num_k_heads=2)
+            plan = cp.calc_cp_seqs(cu, 32, 8, num_k_heads=2,
+                                   tc01_force_candidate=True)
 
         self.assertTrue(plan[0])
         tc01_plan.assert_called_once()
@@ -602,11 +610,11 @@ class Tc01RealGatePlannerTest(unittest.TestCase):
             with mock.patch.dict(os.environ, {cp.TC01_TFU_MODEL_ENV: "1"}):
                 env1_plan = cp.calc_cp_seqs(cu, 32, 8, num_k_heads=2)
 
-        self.assertTrue(env0_plan[0])
+        self.assertFalse(env0_plan[0])
         self.assertIs(env1_plan, env0_plan)
         self.assertEqual(len(cp._cp_plan_cache), 1)
 
-    def test_hg_does_not_change_tc01_real_gate_boundary(self):
+    def test_hg_does_not_enable_automatic_tc01_cp(self):
         with mock.patch.object(
             cp, "_device_execution_model", side_effect=self._tc01_device_model
         ):
@@ -617,9 +625,8 @@ class Tc01RealGatePlannerTest(unittest.TestCase):
                 self._cu(4000, 4000, 24000), 32, 8, num_k_heads=4
             )
 
-        self.assertTrue(hg2_plan[0])
-        self.assertTrue(hg4_plan[0])
-        self.assertEqual(hg2_plan[1].tolist(), hg4_plan[1].tolist())
+        self.assertEqual(hg2_plan, (False, None, None, None, None))
+        self.assertEqual(hg4_plan, hg2_plan)
 
     def test_tc02_h8_hg2_long_single_uses_balanced_segments(self):
         cases = (
@@ -639,6 +646,49 @@ class Tc01RealGatePlannerTest(unittest.TestCase):
                         self._cu(length), 32, 8, num_k_heads=key_heads)
                     self.assertTrue(plan[0])
                     self.assertEqual(plan[1].numel() - 1, expected_segments)
+
+    def test_tc02_h16_long_single_keeps_balanced_owners(self):
+        with mock.patch.object(
+            cp, "_device_execution_model", side_effect=self._tc02_device_model
+        ):
+            for key_heads in (2, 4, 8):
+                for length in (8192, 8193, 8346, 16694, 31801, 32767, 32768):
+                    with self.subTest(length=length, key_heads=key_heads):
+                        plan = cp.calc_cp_seqs(
+                            self._cu(length), 32, 16, num_k_heads=key_heads)
+                        self.assertTrue(plan[0])
+                        offsets = plan[1].tolist()
+                        self.assertEqual(len(offsets) - 1, 9)
+                        self.assertEqual((offsets[0], offsets[-1]), (0, length))
+                        self.assertTrue(all(x % 32 == 0 for x in offsets[:-1]))
+                        chunks = [(end - start + 31) // 32
+                                  for start, end in zip(offsets, offsets[1:])]
+                        self.assertLessEqual(max(chunks) - min(chunks), 1)
+                        self.assertEqual(plan[2].tolist(), [0, 9])
+                        self.assertEqual(plan[3].tolist(), [0] * 9)
+                        self.assertEqual(plan[4].tolist(), [0] * 8 + [1])
+
+    def test_tc02_h16_long_override_stays_in_measured_region(self):
+        for length, chunk, key_heads, units in (
+            (8191, 32, 2, 39), (32769, 32, 2, 39),
+            (31801, 64, 2, 39), (31801, 32, 1, 39),
+            (31801, 32, 16, 39), (31801, 32, 2, 38),
+        ):
+            with self.subTest(length=length, chunk=chunk,
+                              key_heads=key_heads, units=units):
+                model = cp._planner_execution_model_from_properties(8, 9, units)
+                with mock.patch.object(cp, "_device_execution_model", return_value=model):
+                    plans = []
+                    # An unmeasured neighbor can naturally have nine segments.
+                    # Changing this calibration must leave its plan unchanged.
+                    for target in (9, 13):
+                        cp._cp_plan_cache.clear()
+                        with mock.patch.object(cp, "H16_LONG_CP_SEGMENTS", target):
+                            plan = cp.calc_cp_seqs(
+                                self._cu(length), chunk, 16, num_k_heads=key_heads)
+                        plans.append(tuple(x.tolist() if hasattr(x, "tolist") else x
+                                           for x in plan))
+                self.assertEqual(plans[0], plans[1])
 
     def test_tc02_semantics_and_cache_ignore_tc01_env(self):
         cu = self._cu(448)
@@ -661,6 +711,81 @@ class Tc01RealGatePlannerTest(unittest.TestCase):
         self.assertEqual(cached_model.architecture, "tc02")
         self.assertEqual(cached_model.fused_cu_count, 39)
         self.assertEqual(cached_model.fused_head_shards, 1)
+
+    def test_all_supported_topologies_remain_serial(self):
+        import ast
+        import itertools
+
+        root = Path(__file__).resolve().parents[4]
+        tree = ast.parse((root / "pla/prefill/flashqla/ops.py").read_text())
+        heads = next(ast.literal_eval(node.value.args[0]) for node in tree.body
+                     if isinstance(node, ast.Assign) and any(
+                         isinstance(target, ast.Name) and
+                         target.id == "SUPPORTED_HEAD_CONFIGS"
+                         for target in node.targets))
+        with mock.patch.object(cp, "_device_execution_model",
+                               side_effect=self._tc01_device_model):
+            for h, hg in sorted(heads):
+                for batch, total in itertools.product(
+                        range(1, 9), (8191, 8192, 16384, 23999, 24000, 32768)):
+                    lengths = (total - batch + 1,) + (1,) * (batch - 1)
+                    cu, raw = self._cu(*lengths), self._raw_cu(*lengths)
+                    for packed in (False, True):
+                        with self.subTest(h=h, hg=hg, batch=batch, total=total,
+                                          packed=packed):
+                            plan = cp.calc_cp_seqs(
+                                cu, 32, h, raw, num_k_heads=hg,
+                                tc01_packed_raw_gate=packed,
+                                tc01_enable_overlap_candidate=True)
+                            self.assertEqual(plan, (False, None, None, None, None))
+                            for indexed, has_state in itertools.product((False, True), repeat=2):
+                                self.assertIsNone(cp.tc01_overlap_warmup_threshold(
+                                    cu, raw, 32, h, hg, use_raw_gating=packed,
+                                    indexed_state=indexed, has_initial_state=has_state))
+
+    def test_force_then_default_keeps_separate_cached_decisions(self):
+        cu, raw = self._cu(8192), (0, 8192)
+        with mock.patch.object(cp, "_device_execution_model",
+                               side_effect=self._tc01_device_model):
+            forced = cp.calc_cp_seqs(cu, 32, 16, raw, num_k_heads=2,
+                                     tc01_force_candidate=True)
+            self.assertTrue(forced[0])
+            self.assertEqual(forced[1].tolist(), [0, 1664, 3328, 4992, 6656, 8192])
+            for enabled in (False, True):
+                default = cp.calc_cp_seqs(cu, 32, 16, raw, num_k_heads=2,
+                                         tc01_enable_overlap_candidate=enabled)
+                self.assertEqual(default, (False, None, None, None, None))
+                self.assertIs(default, cp.calc_cp_seqs(
+                    cu, 32, 16, raw, num_k_heads=2,
+                    tc01_enable_overlap_candidate=enabled))
+            self.assertIs(forced, cp.calc_cp_seqs(
+                cu, 32, 16, raw, num_k_heads=2, tc01_force_candidate=True))
+
+    def test_production_does_not_materialize_overlap_candidate(self):
+        with mock.patch.object(cp, "_device_execution_model",
+                               side_effect=self._tc01_device_model), \
+                mock.patch.object(cp, "_calc_tc01_plan") as candidate:
+            for packed in (False, True):
+                for h, lengths in ((16, (8192,)), (8, (10000,)),
+                                   (8, (32768,)), (8, (8000, 24000)),
+                                   (8, (4000, 4000, 24000))):
+                    cp.calc_cp_seqs(self._cu(*lengths), 32, h, num_k_heads=2,
+                                    tc01_enable_overlap_candidate=True,
+                                    tc01_packed_raw_gate=packed)
+            candidate.assert_not_called()
+
+    def test_tc02_ignores_overlap_compatibility_flag(self):
+        with mock.patch.object(cp, "_device_execution_model",
+                               side_effect=self._tc02_device_model):
+            for h, hg in ((6, 2), (12, 4), (16, 2), (32, 4)):
+                cu = self._cu(8192)
+                plain = cp.calc_cp_seqs(cu, 32, h, num_k_heads=hg)
+                flagged = cp.calc_cp_seqs(cu, 32, h, num_k_heads=hg,
+                                         tc01_enable_overlap_candidate=True)
+                self.assertEqual(plain[0], flagged[0])
+                for left, right in zip(plain[1:], flagged[1:]):
+                    self.assertEqual(None if left is None else left.tolist(),
+                                     None if right is None else right.tolist())
 
 
 class Tc02RealGatePlannerTest(unittest.TestCase):
@@ -821,6 +946,143 @@ class Tc02RealGatePlannerTest(unittest.TestCase):
                 self.assertFalse(plan[0])
                 self.assertEqual(plan[1:], (None, None, None, None))
 
+    def test_tc02_h8_decode_prefill_regression_restores_split(self):
+        lengths = (1,) * 15 + (31800,)
+        raw = self._raw_cu(*lengths)
+        with mock.patch.object(
+            cp, "_device_execution_model", side_effect=self._tc02_device_model
+        ):
+            plan = cp.calc_cp_seqs(
+                self._cu(*lengths), 32, 8, num_k_heads=2)
+            cached = cp.calc_cp_seqs(
+                self._cu(*lengths), 32, 8, num_k_heads=2)
+        self.assertTrue(plan[0])
+        self.assertIs(plan, cached)
+        self.assertEqual(plan[1].numel(), 40)
+        self.assertEqual(plan[2].tolist(), list(range(16)) + [39])
+        self.assertEqual(plan[3].tolist(), list(range(15)) + [15] * 24)
+        self.assertEqual(plan[4].tolist(), [1] * 15 + [0] * 23 + [1])
+        offsets = plan[1].tolist()
+        self.assertEqual(offsets[:16], list(range(16)))
+        self.assertEqual(offsets[-1], raw[-1])
+        self.assertTrue(all(end > start for start, end in zip(offsets, offsets[1:])))
+        # Every internal split stays aligned relative to the original sequence.
+        self.assertTrue(all((offset - raw[15]) % 32 == 0
+                            for offset in offsets[16:-1]))
+
+    def test_tc02_h8_mixed_prefill_order_preserves_sequence_ownership(self):
+        for position in (0, 7, 15):
+            lengths = [1] * 16
+            lengths[position] = 31800
+            with self.subTest(position=position), mock.patch.object(
+                cp, "_device_execution_model", side_effect=self._tc02_device_model
+            ):
+                plan = cp.calc_cp_seqs(
+                    self._cu(*lengths), 32, 8, num_k_heads=2)
+                self.assertTrue(plan[0])
+                offsets, r2c, c2r, ht = [tensor.tolist() for tensor in plan[1:]]
+                raw = self._raw_cu(*lengths)
+                self.assertEqual(len(c2r), 39)
+                self.assertEqual(r2c[0], 0)
+                self.assertEqual(r2c[-1], len(c2r))
+                for seq, length in enumerate(lengths):
+                    start, end = r2c[seq:seq + 2]
+                    self.assertEqual(offsets[start], raw[seq])
+                    self.assertEqual(offsets[end], raw[seq + 1])
+                    self.assertEqual(c2r[start:end], [seq] * (end - start))
+                    self.assertEqual(ht[start:end], [0] * (end - start - 1) + [1])
+                    self.assertEqual(end - start, 24 if length > 1 else 1)
+
+    def test_tc02_mixed_decode_prefill_admission_boundaries(self):
+        for batch in (6, 8, 16, 32, 64):
+            for long_length in (8192, 16384, 31799, 31800, 31801, 32768):
+                lengths = (1,) * (batch - 1) + (long_length,)
+                with self.subTest(batch=batch, long_length=long_length):
+                    self.assertTrue(cp._tc02_real_gate_cp_allowed(
+                        self._raw_cu(*lengths), 32, 8, batch + 32,
+                        num_k_heads=2))
+                    with mock.patch.object(
+                        cp, "_device_execution_model",
+                        side_effect=self._tc02_device_model,
+                    ):
+                        plan = cp.calc_cp_seqs(
+                            self._cu(*lengths), 32, 8, num_k_heads=2)
+                    self.assertTrue(plan[0])
+                    self.assertEqual(plan[1][-1], sum(lengths))
+                    self.assertEqual(plan[3].tolist().count(batch - 1),
+                                     plan[2][-1] - plan[2][-2])
+
+    def test_tc02_mixed_terminal_warmup_preserves_predecessors(self):
+        for batch, length in ((16, 28672), (16, 31800), (32, 8192), (64, 31800)):
+            with self.subTest(batch=batch, length=length), mock.patch.object(
+                cp, "_device_execution_model", side_effect=self._tc02_device_model
+            ):
+                plan = cp.calc_cp_seqs(
+                    self._cu(*([1] * (batch - 1) + [length])), 32, 8, num_k_heads=2)
+                self.assertTrue(plan[0])
+                offsets, _, _, terminal = [value.tolist() for value in plan[1:]]
+                warmup, fallback = [value.tolist() for value in plan.warmup_metadata]
+                self.assertEqual(sum(terminal), batch)
+                for i, (start, end) in enumerate(zip(offsets, offsets[1:])):
+                    expected = 0 if terminal[i] else (end - start + 31) // 32
+                    self.assertEqual(warmup[i], [expected] * 8)
+                    self.assertEqual(fallback[i], [1] * 8)
+
+    def test_tc02_mixed_long_geometry_keeps_measured_scope(self):
+        for batch, length in ((16, 28671), (16, 32769), (8, 31800), (32, 31800)):
+            with self.subTest(batch=batch, length=length), mock.patch.object(
+                cp, "_device_execution_model", side_effect=self._tc02_device_model
+            ):
+                plans = []
+                for target in (24, 20):
+                    cp._cp_plan_cache.clear()
+                    with mock.patch.object(cp, "H8_MIXED_LONG_CP_SEGMENTS", target):
+                        plan = cp.calc_cp_seqs(
+                            self._cu(*([1] * (batch - 1) + [length])),
+                            32, 8, num_k_heads=2)
+                    plans.append(tuple(x.tolist() if hasattr(x, "tolist") else x
+                                       for x in plan))
+                self.assertEqual(plans[0], plans[1])
+
+    def test_tc02_mixed_decode_prefill_rejects_unmeasured_neighbors(self):
+        cases = (
+            ((1,) * 15 + (8191,), 32, 8, 2),
+            ((1,) * 15 + (32769,), 32, 8, 2),
+            ((1,) * 64 + (31800,), 32, 8, 2),
+            ((1,) * 14 + (0, 31800), 32, 8, 2),
+            ((1,) * 14 + (2, 31800), 32, 8, 2),
+            ((1,) * 14 + (8192, 31800), 32, 8, 2),
+            ((1,) * 16, 32, 8, 2),
+            ((1,) * 15 + (31800,), 64, 8, 2),
+            ((1,) * 15 + (31800,), 32, 8, 4),
+            ((1,) * 15 + (31800,), 32, 8, None),
+            ((1,) * 15 + (31800,), 32, 16, 2),
+            ((1,) * 15 + (31800,), 32, 24, 2),
+            ((1,) * 15 + (31800,), 32, 32, 2),
+        )
+        for lengths, chunk_size, heads, key_heads in cases:
+            with self.subTest(lengths=lengths, chunk_size=chunk_size,
+                              heads=heads, key_heads=key_heads):
+                self.assertFalse(cp._tc02_real_gate_cp_allowed(
+                    self._raw_cu(*lengths), chunk_size, heads, 64,
+                    num_k_heads=key_heads))
+
+    def test_tc02_mixed_guard_retains_existing_batch_one_to_five_decisions(self):
+        cases = (
+            ((447,), False), ((448,), True),
+            ((1, 2079), False), ((1, 2080), True),
+            ((1, 1, 2271), False), ((1, 1, 2272), True),
+            ((1, 1, 1, 3679), False), ((1, 1, 1, 3680), True),
+            ((1, 1, 1, 1, 5023), False),
+            ((1, 1, 1, 1, 5024), True),
+        )
+        for lengths, expected in cases:
+            for key_heads in (None, 2, 4):
+                with self.subTest(lengths=lengths, key_heads=key_heads):
+                    self.assertEqual(cp._tc02_real_gate_cp_allowed(
+                        self._raw_cu(*lengths), 32, 8, 64,
+                        num_k_heads=key_heads), expected)
+
     def test_tc02_real_gate_aligned_suffix_boundaries(self):
         for heads, batches in cp._TC02_REAL_GATE_CP_MIN_TOKENS.items():
             for batch, threshold in batches.items():
@@ -934,6 +1196,7 @@ class FusedFwdContractTest(unittest.TestCase):
         ("fused_fwd_cp_cute_runtime_kernel", "FF_LAUNCH_RUNTIME_S"),
         ("fused_fwd_cp_cute_runtime_head_major_kernel",
          "FF_LAUNCH_RUNTIME_HEAD_MAJOR_S"),
+        ("fused_fwd_packed_tc01_kernel", "PACKED_LAUNCH"),
     )
 
     def setUp(self):
@@ -941,6 +1204,9 @@ class FusedFwdContractTest(unittest.TestCase):
         kernels = root / "src/prefill/flashqla/kernels"
         self.source = (kernels / "fused_fwd_cute.cu").read_text()
         self.body = (kernels / "fused_fwd_cute_body.inc").read_text()
+        self.binding = (kernels.parent / "host/torch_extension_cute.cc").read_text()
+        self.prepare = (kernels / "prepare_h_cute.cu").read_text()
+        self.packed_api = (kernels / "packed_coefficients_api.h").read_text()
 
     def _parameters(self, kernel):
         match = re.search(rf"\b{kernel}\((.*?)\)\s*\{{", self.source, re.S)
@@ -954,6 +1220,18 @@ class FusedFwdContractTest(unittest.TestCase):
         for kernel, _ in self.VARIANTS:
             with self.subTest(kernel=kernel):
                 parameters = self._parameters(kernel)
+                if kernel == "fused_fwd_packed_tc01_kernel":
+                    # This serial-only ABI supplies the shared body's unused
+                    # CP/snapshot arguments as explicit constants, not pointers
+                    # that a caller could accidentally leave unforwarded.
+                    local = self.source.split(kernel + "(", 1)[1].split(
+                        '#include "fused_fwd_cute_body.inc"', 1)[0]
+                    for name in ("cp_seq_map", "num_warmup_chunks",
+                                 "fallback_mask", "raw_state_input", "h0", "ht_out"):
+                        self.assertRegex(local, rf"\b{name}\s*=\s*nullptr;")
+                    self.assertIn("precomputed_pg", parameters)
+                    self.assertIn("#define FF_BODY_PACKED_TC01 1", local)
+                    continue
                 for name in ("num_warmup_chunks", "fallback_mask"):
                     self.assertIn(name, self.body)
                     self.assertIn(name, parameters)
@@ -968,11 +1246,38 @@ class FusedFwdContractTest(unittest.TestCase):
                     "} while (0)", 1)[0]
                 self.assertIn(kernel + "<", launch)
                 arguments = launch.split(">>>(", 1)[1].split(");", 1)[0]
-                arguments = re.sub(r"reinterpret_cast<[^>]+>\((\w+)\)",
+                arguments = re.sub(r"(?:reinterpret_cast|static_cast)<[^>]+>\((\w+)\)",
                                    r"\1", arguments)
                 arguments = [part.replace("\\", "").strip()
                              for part in arguments.split(",")]
-                self.assertEqual(arguments, self._parameters(kernel))
+                parameters = self._parameters(kernel)
+                if kernel == "fused_fwd_packed_tc01_kernel":
+                    aliases = dict(a="ag", beta="rev", g="ex", precomputed_pg="pg",
+                                   cu_seqlens="cu", num_tokens="tokens")
+                    parameters = [aliases.get(name, name) for name in parameters]
+                self.assertEqual(arguments, parameters)
+
+    def test_host_forward_declarations_match_native_launch_definitions(self):
+        # A flags pointer was once inserted into the adjacent prepare_h
+        # declaration instead of fused_fwd. Kernel-only forwarding tests cannot
+        # see that mismatch; check the actual host/native type sequences here.
+        def types(parameters):
+            parameters = re.sub(r"/\*.*?\*/|//[^\n]*", "", parameters, flags=re.S)
+            return [re.sub(r"\s+", "", re.sub(r"\b\w+\s*$", "", part))
+                    for part in parameters.split(",") if part.strip()]
+
+        for name, declaration, native in (
+                ("launch_prepare_h_cp_cute", self.binding, self.prepare),
+                ("launch_fused_fwd_cp_cute", self.binding, self.source),
+                ("launch_gdn_packed_fwd_tc01", self.packed_api, self.source)):
+            with self.subTest(launcher=name):
+                declared = re.search(rf"\bvoid\s+{name}\((.*?)\)\s*;",
+                                     declaration, re.S)
+                defined = re.search(rf"\bvoid\s+{name}\((.*?)\)\s*\{{",
+                                    native, re.S)
+                self.assertIsNotNone(declared, name)
+                self.assertIsNotNone(defined, name)
+                self.assertEqual(types(declared.group(1)), types(defined.group(1)))
 
 
 class FatBinaryKernelContractTest(unittest.TestCase):
