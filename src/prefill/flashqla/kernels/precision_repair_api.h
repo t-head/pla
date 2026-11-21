@@ -5,17 +5,17 @@
 
 namespace flashqla_precision {
 struct Arguments {
-    const void *q, *k, *v, *raw_a;
+    const void *q, *k, *v, *raw_a, *live_initial;
     const float *g, *beta, *a_log, *dt_bias, *snapshot;
     const int32_t *cu, *indices;
     const int32_t* flags;
     void *out, *final_state;
-    int tokens, heads, key_heads, sequences, final_slots;
+    int tokens, heads, key_heads, sequences, final_slots, initial_slots;
     int dv_per_warp;
     int staged_tokens;
     int64_t v_token_stride, a_token_stride;
     double scale;
-    bool indexed, state_bf16;
+    bool indexed, state_bf16, initial_bf16;
     bool fuse_suffix, load_indexed_state;
 };
 

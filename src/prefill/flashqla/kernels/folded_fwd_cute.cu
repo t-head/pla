@@ -1268,7 +1268,7 @@ __global__ void gdn_folded_correct_kernel(float *, const float *, const float *,
 namespace flashqla_folded {
 template <typename Element, int H_TPL, int Hg_TPL, int NGRP,
           int DVH_TPL = FF_DVH, bool AUX_P_TPL = false,
-          bool STATE_BF16 = false>
+          bool STATE_BF16 = false, bool SkipRepairHeads = false>
 __global__ void __launch_bounds__(FF_WG * (AUX_P_TPL ? 2 : NGRP), FF_MIN_BLOCKS)
 gdn_folded_forward_kernel(
     Element* __restrict__ o,
@@ -1289,13 +1289,19 @@ gdn_folded_forward_kernel(
     const int* __restrict__ num_warmup_chunks,
     const signed char* __restrict__ fallback_mask,
     int batch_size, int num_tokens, int raw_batch_size,
-    float scale, int64_t v_token_stride)
+    float scale, int64_t v_token_stride, const int* precision_flags)
 {
 #if defined(FLASHQLA_ARCH_150)
   constexpr bool FF_PREPARE_MODE = false;
   constexpr bool compute_mt = false;
   constexpr int prepare_task = 0;
   const int folded_sequence = blockIdx.x / 2;
+  if constexpr (SkipRepairHeads) {
+    const int raw_seq = cp_seq_map ? cp_seq_map[folded_sequence] : folded_sequence;
+    const int key_head = int(blockIdx.y) / (H_TPL / Hg_TPL);
+    if (raw_seq < 0 || raw_seq >= raw_batch_size ||
+        precision_flags[int64_t(raw_seq) * Hg_TPL + key_head] != 0) return;
+  }
 #define FF_BODY_FOLDED 1
 #define FF_BODY_INDEXED_TC01 1
 #include "folded_fwd_cute_body.inc"
@@ -1503,13 +1509,14 @@ void launch_folded_prepare_h_cute(const void *k, const void *v,
   throw std::invalid_argument("unsupported folded state head configuration");
 }
 
-template <int H, int Hg>
+template <int H, int Hg, bool SkipRepairHeads>
 void launch_folded_forward(void *output, const void *q, const void *k,
                            const void *v, const void *coefficients,
                            const int *cu, const int *mapping, const int *raw_cu,
                            const float *h0, float *pool, const int *indices,
                            int batch, int tokens, int raw_batch, int device,
-                           int64_t v_stride, float scale, hggcStream_t stream) {
+                           int64_t v_stride, float scale, const int* flags,
+                           hggcStream_t stream) {
   using E = __ppu_bfloat16;
   using namespace flashqla_folded;
   const E *a = static_cast<const E *>(coefficients);
@@ -1519,19 +1526,19 @@ void launch_folded_forward(void *output, const void *q, const void *k,
       reinterpret_cast<const float *>(a + (int64_t)tokens * H * 160);
   static std::once_flag configured[64];
   auto configure = [] {
-    hggcFuncSetAttribute(gdn_folded_forward_kernel<E, H, Hg, 1, 64, false, false>,
+    hggcFuncSetAttribute(gdn_folded_forward_kernel<E, H, Hg, 1, 64, false, false, SkipRepairHeads>,
                          hggcFuncAttributeMaxDynamicSharedMemorySize, 130 * 1024);
   };
   if (device >= 0 && device < 64)
     std::call_once(configured[device], configure);
   else
     configure();
-  gdn_folded_forward_kernel<E, H, Hg, 1, 64, false, false>
+  gdn_folded_forward_kernel<E, H, Hg, 1, 64, false, false, SkipRepairHeads>
       <<<dim3(batch * 2, H), dim3(128, 1), FoldedForwardSmemLayout::TOTAL,
          stream>>>(static_cast<E *>(output), static_cast<const E *>(q),
                    static_cast<const E *>(k), static_cast<const E *>(v), a, m,
                    g, h0, nullptr, pool, nullptr, indices, cu, mapping, raw_cu,
-                   nullptr, nullptr, batch, tokens, raw_batch, scale, v_stride);
+                   nullptr, nullptr, batch, tokens, raw_batch, scale, v_stride, flags);
 }
 
 void launch_folded_fwd_cute(void *output, const void *q, const void *k,
@@ -1540,13 +1547,14 @@ void launch_folded_fwd_cute(void *output, const void *q, const void *k,
                             const int *raw_cu, const float *h0, float *pool,
                             const int *indices, int batch, int tokens,
                             int raw_batch, int device, int H, int Hg,
-                            int64_t v_stride, float scale,
+                            int64_t v_stride, float scale, const int* flags,
                             hggcStream_t stream) {
 #define FORWARD_CASE(HV, HGV)                                                  \
   if (H == HV && Hg == HGV) {                                                  \
-    launch_folded_forward<HV, HGV>(                                            \
-        output, q, k, v, coefficients, cu, mapping, raw_cu, h0, pool, indices, \
-        batch, tokens, raw_batch, device, v_stride, scale, stream);            \
+    const auto launch = flags ? launch_folded_forward<HV, HGV, true>             \
+                              : launch_folded_forward<HV, HGV, false>;            \
+    launch(output, q, k, v, coefficients, cu, mapping, raw_cu, h0, pool, indices,  \
+           batch, tokens, raw_batch, device, v_stride, scale, flags, stream);       \
     return;                                                                    \
   }
   FOLDED_HEAD_CONFIGS(FORWARD_CASE)

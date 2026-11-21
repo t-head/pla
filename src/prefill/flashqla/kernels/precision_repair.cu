@@ -430,9 +430,25 @@ __global__ void zero_suffix_kernel(Arguments a) {
         static_cast<E*>(a.out)[i] = convert<E>(0.f);
 }
 
+__device__ __forceinline__ int repair_initial_slot(Arguments a, int seq, bool empty) {
+    if (empty) return -1;
+    const int slot = a.indexed ? a.indices[seq] : seq;
+    if (slot < 0 || slot >= a.initial_slots) __trap();
+    return slot;
+}
+
+__device__ __forceinline__ float live_initial_value(Arguments a, int slot, int head, int dv, int dk) {
+    if (slot < 0) return 0.f;
+    const int64_t offset = (int64_t(slot) * a.heads + head) * 128 * 128
+        + (a.indexed ? dv * 128 + dk : dk * 128 + dv);
+    return a.initial_bf16 ? load(static_cast<const __ppu_bfloat16*>(a.live_initial)[offset])
+                          : static_cast<const float*>(a.live_initial)[offset];
+}
+
 // Each warp owns Columns independent DV columns and shares Q/K loads between
 // them. Carry, reductions, and updates use the validated FP64 arithmetic.
-template <typename E, int Columns, bool FuseSuffix = false, bool LoadIndexedState = false>
+template <typename E, int Columns, bool FuseSuffix = false, bool LoadIndexedState = false,
+          bool LoadLiveInitial = false>
 __global__ __launch_bounds__(128) void repair_kernel(Arguments a) {
     using Accumulator = double;
     if constexpr (FuseSuffix) zero_suffix_inline<E>(a);
@@ -452,6 +468,8 @@ __global__ __launch_bounds__(128) void repair_kernel(Arguments a) {
             slot = a.indices[seq];
             if (slot < 0 || slot >= a.final_slots) __trap();
         }
+        int initial_slot = -1;
+        if constexpr (LoadLiveInitial) initial_slot = repair_initial_slot(a, seq, bos == eos);
         Accumulator state[Columns][4];
         #pragma unroll
         for (int c = 0; c < Columns; ++c) {
@@ -464,6 +482,8 @@ __global__ __launch_bounds__(128) void repair_kernel(Arguments a) {
                     state[c][j] = a.state_bf16
                         ? Accumulator(load(static_cast<const __ppu_bfloat16*>(a.final_state)[offset]))
                         : Accumulator(static_cast<const float*>(a.final_state)[offset]);
+                } else if constexpr (LoadLiveInitial) {
+                    state[c][j] = live_initial_value(a, initial_slot, head, dv_base+c, lane + 32*j);
                 } else {
                     state[c][j] = a.snapshot
                         ? Accumulator(a.snapshot[(int64_t(sh) * 128 + dv_base+c) * 128 + lane + 32*j]) : 0.;
@@ -536,7 +556,7 @@ __global__ __launch_bounds__(128) void repair_kernel(Arguments a) {
 // Offline staging variant. A CTA loads 32 tokens cooperatively, computes the
 // same sequential recurrence, and publishes output with coalesced CTA stores.
 // Each DV column retains the same dot-product and update order as repair_kernel.
-template <typename E, int Columns, bool FuseSuffix = false>
+template <typename E, int Columns, bool FuseSuffix = false, bool LoadLiveInitial = false>
 __global__ __launch_bounds__(128) void repair_staged_kernel(Arguments a) {
     using Accumulator = double;
     if constexpr (FuseSuffix) zero_suffix_inline<E>(a);
@@ -555,13 +575,20 @@ __global__ __launch_bounds__(128) void repair_staged_kernel(Arguments a) {
         const int bos = a.cu[seq], eos = a.cu[seq + 1];
         if (a.cu[0] != 0 || bos < 0 || eos < bos || eos > a.tokens) __trap();
         if (a.indexed && bos == eos) continue;
+        int initial_slot = -1;
+        if constexpr (LoadLiveInitial) initial_slot = repair_initial_slot(a, seq, bos == eos);
         Accumulator state[Columns][4];
         #pragma unroll
         for (int c = 0; c < Columns; ++c) {
             #pragma unroll
-            for (int j = 0; j < 4; ++j)
-                state[c][j] = a.snapshot
-                    ? Accumulator(a.snapshot[(int64_t(sh) * 128 + dv_base+c) * 128 + lane + 32*j]) : 0.;
+            for (int j = 0; j < 4; ++j) {
+                if constexpr (LoadLiveInitial) {
+                    state[c][j] = live_initial_value(a, initial_slot, head, dv_base+c, lane + 32*j);
+                } else {
+                    state[c][j] = a.snapshot
+                        ? Accumulator(a.snapshot[(int64_t(sh) * 128 + dv_base+c) * 128 + lane + 32*j]) : 0.;
+                }
+            }
         }
         for (int tile = bos; tile < eos; tile += Tile) {
             const int count = eos - tile < Tile ? eos - tile : Tile;
@@ -739,25 +766,30 @@ void launch_repair(Arguments a, int dtype_tag, hggcStream_t stream, int block_ca
         return;
     }
 
-#define LAUNCH_PRECISION_VARIANT(E, C) \
+#define LAUNCH_PRECISION_VARIANT(E, C, LIVE) \
     do { \
         if (a.staged_tokens == 32) { \
-            if (a.fuse_suffix) repair_staged_kernel<E, C, true><<<blocks, 128, 0, stream>>>(a); \
-            else repair_staged_kernel<E, C><<<blocks, 128, 0, stream>>>(a); \
+            if (a.fuse_suffix) repair_staged_kernel<E, C, true, LIVE><<<blocks, 128, 0, stream>>>(a); \
+            else repair_staged_kernel<E, C, false, LIVE><<<blocks, 128, 0, stream>>>(a); \
         } else { \
-            if (a.fuse_suffix) repair_kernel<E, C, true><<<blocks, 128, 0, stream>>>(a); \
-            else repair_kernel<E, C><<<blocks, 128, 0, stream>>>(a); \
+            if (a.fuse_suffix) repair_kernel<E, C, true, false, LIVE><<<blocks, 128, 0, stream>>>(a); \
+            else repair_kernel<E, C, false, false, LIVE><<<blocks, 128, 0, stream>>>(a); \
         } \
     } while (0)
-#define LAUNCH_PRECISION_REPAIR(E) \
+#define LAUNCH_PRECISION_REPAIR(E, LIVE) \
     do { \
         if (!a.fuse_suffix) zero_suffix_kernel<E><<<256, 256, 0, stream>>>(a); \
-        if (a.dv_per_warp == 4) LAUNCH_PRECISION_VARIANT(E, 4); \
-        else if (a.dv_per_warp == 2) LAUNCH_PRECISION_VARIANT(E, 2); \
-        else LAUNCH_PRECISION_VARIANT(E, 1); \
+        if (a.dv_per_warp == 4) LAUNCH_PRECISION_VARIANT(E, 4, LIVE); \
+        else if (a.dv_per_warp == 2) LAUNCH_PRECISION_VARIANT(E, 2, LIVE); \
+        else LAUNCH_PRECISION_VARIANT(E, 1, LIVE); \
     } while (0)
-    if (dtype_tag == 0) LAUNCH_PRECISION_REPAIR(__half);
-    else LAUNCH_PRECISION_REPAIR(__ppu_bfloat16);
+    if (a.live_initial) {
+        if (dtype_tag == 0) LAUNCH_PRECISION_REPAIR(__half, true);
+        else LAUNCH_PRECISION_REPAIR(__ppu_bfloat16, true);
+    } else {
+        if (dtype_tag == 0) LAUNCH_PRECISION_REPAIR(__half, false);
+        else LAUNCH_PRECISION_REPAIR(__ppu_bfloat16, false);
+    }
 #undef LAUNCH_PRECISION_REPAIR
 #undef LAUNCH_PRECISION_VARIANT
 }

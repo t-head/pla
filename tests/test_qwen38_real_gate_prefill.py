@@ -981,13 +981,13 @@ def folded_prefill_reference(q, k, v, g, beta, offsets, initial_state):
         ((1024,), 1024, False, True, True, 4, 2),
         ((8192,), 8192, True, True, False, 6, 2),
         ((8192,), 8192, True, True, False, 12, 4),
-        ((8191,), 8191, True, True, False, 24, 8),
+        ((8191,), 8191, True, True, True, 24, 8),
         ((605,), 605, True, True, True, 24, 8),
         ((605,), 640, True, True, False, 24, 8),
         ((605,), 605, True, False, False, 24, 8),
         ((121, 799), 920, True, True, True, 16, 4),
         ((799, 121), 920, True, True, False, 16, 4),
-        ((1987,), 1987, True, True, False, 8, 2),
+        ((1987,), 1987, True, True, True, 8, 2),
         ((8192,), 8192, True, True, True, 24, 8),
         ((32768,), 32768, True, True, True, 24, 8),
         ((32768,), 32768, True, True, True, 12, 4),
@@ -1325,3 +1325,73 @@ def test_folded_long_weak_decay(folded_precision, length, auto_cp, heads, qk_hea
     assert_folded_close(pool[indices], state.transpose(-1, -2))
     assert result[4] is None
     assert torch.equal(pool[[0, 2]], before[[0, 2]])
+
+
+@torch.inference_mode()
+def test_prefill_graph_retains_warmed_metadata(folded_precision):
+    from pla.prefill.flashqla import ops, prefill_graph_metadata
+
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        def metadata(raw, heads):
+            cu = torch.tensor(raw, dtype=torch.int32, device="cuda")
+            return cu, raw, heads
+
+        def capture_values(case):
+            cu, raw, heads = case
+            chunks = ops._prepare_chunk_indices(cu, 32, raw)
+            plan = ops.calc_cp_seqs(cu, 32, heads, raw, num_k_heads=2, folded_prefill=True)
+            assert plan[0]
+            return chunks.clone(), plan[1].clone(), plan.warmup_metadata[0].clone()
+
+        first = metadata((0, 8192), 8)
+        graph = torch.cuda.CUDAGraph()
+        with prefill_graph_metadata() as prepare:
+            expected = capture_values(first)
+            for i in range(1, 7):
+                capture_values(metadata((0, 8192 + 32 * i), 8))
+            # The same offsets with a different head configuration need their
+            # own CP metadata entry.
+            capture_values(metadata((0, 8192), 16))
+            prepare()
+            with torch.cuda.graph(graph, stream=stream):
+                captured = capture_values(first)
+        for i in range(7, 13):
+            capture_values(metadata((0, 8192 + 32 * i), 8))
+        graph.replay()
+        assert all(torch.equal(a, b) for a, b in zip(captured, expected))
+
+
+@pytest.mark.parametrize("indexed,state_dtype", [
+    (True, torch.float32), (True, torch.bfloat16), (False, torch.float32),
+])
+@torch.inference_mode()
+def test_large_repair_preserves_live_initial_state(folded_precision, monkeypatch, indexed, state_dtype):
+    from pla.prefill.flashqla import ops
+
+    torch.manual_seed(20261121)
+    heads, qk_heads, tokens = 8, 2, 96
+    q = torch.randn((1, tokens, qk_heads, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn((1, tokens, heads, 128), device="cuda", dtype=q.dtype) * 0.1
+    g = torch.full((1, tokens, heads), -0.2, device="cuda")
+    beta = torch.full_like(g, 0.5)
+    raw = (0, 3, tokens)
+    cu = torch.tensor(raw, dtype=torch.int32, device="cuda")
+    indices = torch.tensor([2, 0], dtype=torch.int32, device="cuda") if indexed else None
+    state = torch.randn((4, heads, 128, 128), device="cuda", dtype=state_dtype) * 0.01
+    def run(pool):
+        return chunk_gated_delta_rule_fwd(
+            q, k, v, g, beta, initial_state=pool, initial_state_indices=indices,
+            cu_seqlens=cu, raw_cu_seqlens=raw, normalize_qk=True)
+    expected_pool = state.clone()
+    expected = run(expected_pool)
+    monkeypatch.setattr(ops, "_MAX_REPAIR_SNAPSHOT_BYTES", 0)
+    def unexpected_snapshot(*args, **kwargs):
+        pytest.fail("live repair allocated a snapshot")
+    monkeypatch.setattr(ops.flashqla_cute, "_precision_snapshot", unexpected_snapshot)
+    actual_pool = state.clone()
+    actual = run(actual_pool)
+    assert torch.equal(actual[2], expected[2])
+    assert torch.equal(actual[4], expected[4])
+    assert torch.equal(actual_pool, expected_pool)

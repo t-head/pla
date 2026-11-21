@@ -44,6 +44,7 @@ from typing import Optional, Sequence, Tuple
 import torch
 
 from ... import _sanity
+from .metadata import capture_metadata, metadata_tensor, metadata_upload
 
 # ─── PPU1.5 fallback constants ────────────────────────────────────
 # M890P has 39 compute units (CUs); H20/SM90 reference used 78 SMs.
@@ -1074,9 +1075,16 @@ def calc_cp_seqs(
         execution_model,
         raw_cu,
     )
+    scope = capture_metadata.get()
+    if scope is not None and cache_key in scope.plans:
+        _, plan, event, streams = scope.plans[cache_key]
+        _record_plan_stream(plan, event, streams)
+        return plan
     for cache_idx, (cached_key, cached_plan, ready_event,
                     active_streams) in enumerate(_cp_plan_cache):
         if cached_key == cache_key:
+            if scope is not None and active_streams is None:
+                scope.plans[cache_key] = (cached_key, cached_plan, ready_event, active_streams)
             if cache_idx:
                 # Publish a fully built order with one GIL-protected slice
                 # assignment. Concurrent promotions can only lose recency;
@@ -1636,43 +1644,42 @@ def calc_cp_seqs(
         use_cp = has_split
 
     warmup_metadata = None
-    if use_cp:
-        # Positive cold decisions need device tables. Reject before any H2D
-        # allocation; negative CPU-only plans remain usable during capture.
-        if (execution_model.architecture == "tc02" and
-                execution_model.physical_cu_count == 39 and raw_cu_seqlens.is_cuda):
-            with torch.cuda.device(raw_cu_seqlens.device):
-                if torch.cuda.is_current_stream_capturing():
-                    raise RuntimeError("positive CP metadata cold miss must be warmed before capture")
-        segment_chunks = [
-            _cdiv(cp_cu_seqlens[i + 1] - cp_cu_seqlens[i], chunk_size)
-            for i in range(num_cp_segments)
-        ]
-        if mixed_decode_prefill and (raw_batch >= 32 or
-                (raw_batch == 16 and max_seqlen >= 28 * 1024)):
-            # Only predecessor transitions are consumed by correct_h0. A final
-            # or unsplit segment still runs fused_fwd, but needs no prepare_h.
-            segment_chunks = [0 if ht_mask[i] else chunks
-                              for i, chunks in enumerate(segment_chunks)]
-        warmup_metadata = (
-            torch.tensor(
-                [c for c in segment_chunks for _ in range(H)],
-                dtype=torch.int32, device=device,
-            ).view(num_cp_segments, H),
-            torch.ones((num_cp_segments, H), dtype=torch.int8, device=device),
-        )
-        cp_cu_seqlens = torch.tensor(cp_cu_seqlens, dtype=seqlen_dtype, device=device)
-        seq_map_c2r = torch.tensor(seq_map_c2r, dtype=seqlen_dtype, device=device)
-        seq_map_r2c = torch.tensor(seq_map_r2c, dtype=seqlen_dtype, device=device)
-        # The binding consumes signed-char 0/1 values; construct int8 directly
-        # instead of launching a bool-to-int8 conversion in the API hot path.
-        ht_mask = torch.tensor(ht_mask, dtype=torch.int8, device=device)
-    else:
-        cp_cu_seqlens = seq_map_r2c = seq_map_c2r = ht_mask = None
-
-    plan = _CpPlan((use_cp, cp_cu_seqlens, seq_map_r2c, seq_map_c2r, ht_mask))
-    plan.warmup_metadata = warmup_metadata
-    ready_event, active_streams = _plan_ready_event(plan)
+    native_owner = (use_cp and execution_model.architecture == "tc02" and
+                    execution_model.physical_cu_count == 39 and raw_cu_seqlens.is_cuda)
+    if native_owner:
+        with torch.cuda.device(raw_cu_seqlens.device):
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("positive CP metadata cold miss must be warmed before capture")
+    with metadata_upload(device, native_owner):
+        if use_cp:
+            segment_chunks = [
+                _cdiv(cp_cu_seqlens[i + 1] - cp_cu_seqlens[i], chunk_size)
+                for i in range(num_cp_segments)
+            ]
+            if mixed_decode_prefill and (raw_batch >= 32 or
+                    (raw_batch == 16 and max_seqlen >= 28 * 1024)):
+                # Final and unsplit segments do not produce a carry for another segment.
+                segment_chunks = [0 if ht_mask[i] else chunks
+                                  for i, chunks in enumerate(segment_chunks)]
+            warmup_metadata = (
+                metadata_tensor([c for c in segment_chunks for _ in range(H)],
+                                torch.int32, device, native_owner).view(num_cp_segments, H),
+                torch.ones((num_cp_segments, H), dtype=torch.int8, device=device),
+            )
+            cp_cu_seqlens = metadata_tensor(cp_cu_seqlens, seqlen_dtype, device, native_owner)
+            seq_map_c2r = metadata_tensor(seq_map_c2r, seqlen_dtype, device, native_owner)
+            seq_map_r2c = metadata_tensor(seq_map_r2c, seqlen_dtype, device, native_owner)
+            ht_mask = metadata_tensor(ht_mask, torch.int8, device, native_owner)
+        else:
+            cp_cu_seqlens = seq_map_r2c = seq_map_c2r = ht_mask = None
+        plan = _CpPlan((use_cp, cp_cu_seqlens, seq_map_r2c, seq_map_c2r, ht_mask))
+        plan.warmup_metadata = warmup_metadata
+        ready_event, active_streams = _plan_ready_event(plan)
+    if native_owner:
+        ready_event.activate()
+    entry = (cache_key, plan, ready_event, active_streams)
+    if scope is not None and active_streams is None:
+        scope.plans[cache_key] = entry
     # Cache negative decisions too: repeatedly proving that a common short or
     # high-occupancy shape is serial has the same Python planning cost.  LRU
     # eviction also releases device tensors held only by an old positive plan.
@@ -1681,9 +1688,7 @@ def calc_cp_seqs(
     # or return a plan for the wrong key.
     cache_order = [entry for entry in _cp_plan_cache
                    if entry[0] != cache_key]
-    _cp_plan_cache[:] = [
-        (cache_key, plan, ready_event, active_streams), *cache_order[:3]
-    ]
+    _cp_plan_cache[:] = [entry, *cache_order[:3]]
     return plan
 
 

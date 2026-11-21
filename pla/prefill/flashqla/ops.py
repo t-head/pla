@@ -50,17 +50,14 @@ import torch
 
 from .. import _sanity
 from . import _C as flashqla_cute
-from .private.tc02_folded_schedules import (
-    FOLDED_TC02_PACKED_RAW,
-    FOLDED_TC02_PREACTIVATED_SCHEDULES,
-    FOLDED_TC02_SCHEDULES,
-)
+from .private.tc02_folded_policy import folded_schedule
 from .private.cp_preprocess import (
     calc_cp_seqs,
     tc01_overlap_warmup_threshold,
     _cuda_device_properties,
     _cp_plan_cache,
 )
+from .private.metadata import capture_metadata, metadata_tensor, metadata_upload
 from .private.packed_coefficients import tc01_packed_coefficients_mode
 
 CHUNK_SIZE = 32          # Unified chunk size (cumsum, get_warmup, CP splitting, fused_fwd, etc.)
@@ -70,6 +67,7 @@ DV = 128
 # Recurrent-state pool dtypes. bf16 halves the resident pool; the recurrence
 # itself is fp32 either way.
 _STATE_DTYPES = (torch.float32, torch.bfloat16)
+_MAX_REPAIR_SNAPSHOT_BYTES = 128 << 20
 _chunk_indices_cache = []
 
 
@@ -133,7 +131,9 @@ def _resolve_raw_cu(
     # without a version counter synchronize again rather than trusting object
     # identity. Serving avoids this path by supplying CPU offsets directly.
     if tensor_version is not None:
-        for cached_cu, cached_version, cached_key, _, _, _ in _chunk_indices_cache:
+        scope = capture_metadata.get()
+        candidates = (*scope.chunks.values(), *_chunk_indices_cache) if scope else _chunk_indices_cache
+        for cached_cu, cached_version, cached_key, _, _, _ in candidates:
             if (cached_cu is cu_seqlens and cached_version == tensor_version and
                     cached_key[2] == chunk_size):
                 return cached_key[3], tensor_version
@@ -178,6 +178,11 @@ def _prepare_chunk_indices(
 
     cache_key = (cu_seqlens.device.type, cu_seqlens.device.index,
                  chunk_size, raw_cu)
+    scope = capture_metadata.get()
+    if scope is not None and cache_key in scope.chunks:
+        _, _, _, indices, event, streams = scope.chunks[cache_key]
+        _activate_chunk_indices(indices, event, streams)
+        return indices
     for cache_idx, (_, _, cached_key, cached_indices, ready_event,
                     active_streams) in enumerate(_chunk_indices_cache):
         if cached_key == cache_key:
@@ -185,6 +190,8 @@ def _prepare_chunk_indices(
                 cached_indices, ready_event, active_streams)
             entry = (cu_seqlens, tensor_version, cache_key, cached_indices,
                      ready_event, active_streams)
+            if scope is not None and active_streams is None:
+                scope.chunks[cache_key] = entry
             if cache_idx:
                 cache_order = list(_chunk_indices_cache)
                 cache_order.pop(cache_idx)
@@ -203,10 +210,12 @@ def _prepare_chunk_indices(
         for seq_idx in range(len(raw_cu) - 1)
         for chunk_idx in range(_cdiv(raw_cu[seq_idx + 1] - raw_cu[seq_idx], chunk_size))
     ]
-    chunk_indices = torch.tensor(
-        indices, dtype=torch.int32, device=cu_seqlens.device)
+    with metadata_upload(cu_seqlens.device, native_owner):
+        chunk_indices = metadata_tensor(indices, torch.int32, cu_seqlens.device, native_owner)
+        if native_owner:
+            ready_event = flashqla_cute._make_chunk_metadata_entry(chunk_indices)
     if native_owner:
-        ready_event = flashqla_cute._make_chunk_metadata_entry(chunk_indices)
+        ready_event.activate()
         active_streams = None
     else:
         stream = torch.cuda.current_stream(chunk_indices.device)
@@ -223,6 +232,8 @@ def _prepare_chunk_indices(
         if cached[2] != cache_key
     ]
     _chunk_indices_cache[:] = [entry, *cache_order[:3]]
+    if scope is not None and active_streams is None:
+        scope.chunks[cache_key] = entry
     return chunk_indices
 
 
@@ -502,57 +513,25 @@ def chunk_gated_delta_rule_fwd(
         initial_state_indices.record_stream(
             torch.cuda.current_stream(initial_state_indices.device))
     chunk_indices = _prepare_chunk_indices(cu32, CHUNK_SIZE, raw_cu)
-    # The folded path uses the same extension and public API. Its workspace is
-    # private to this call; unsupported shapes keep the established stages.
-    # Coefficient preparation amortizes at shorter lengths when three value
-    # heads share Q/K. Other configurations need more work per sequence, and
-    # batched MHA keeps the established fused kernel. Preserve the calibrated
-    # 8K CP kernels for small heads, where they remain faster.
-    folded_min_length = (512 if (H, Hg) == (24, 8)
-                         else 1024 if batch == 1 else 4096)
-    calibrated_cp = (auto_cp and raw_cu == (0, 8192)
-                     and (H, Hg) in ((12, 4), (6, 2)))
-    short_folded_range = (H, Hg, batch) == (32, 4, 1) and 768 <= valid_num_tokens < 1024
-    if H == 8 and Hg in (2, 4) and valid_num_tokens < folded_min_length * batch:
-        lengths = [b - a for a, b in zip(raw_cu, raw_cu[1:])]
-        longest = max(lengths)
-        short_folded_range |= (batch <= 4 and longest >= 768 and valid_num_tokens >= 512 * batch)
-        short_folded_range |= (Hg == 2 and batch <= 32 and longest >= 8192 and
-                               valid_num_tokens - longest <= 3 * (batch - 1))
-    schedule_key = (H, Hg, raw_cu)
-    folded_max_local_chunks = FOLDED_TC02_SCHEDULES.get(schedule_key)
-    if (auto_cp and not use_raw_gating and valid_num_tokens == num_tokens and
-            overlap_warmup_threshold is None and not force_tc01_cp_candidate):
-        measured = FOLDED_TC02_PREACTIVATED_SCHEDULES.get(schedule_key)
-        if (measured is not None and indexed_state and q.dtype == torch.bfloat16 and
-                initial_state.dtype == torch.float32 and normalize_qk and
-                _cuda_device_properties(q.device.index) == (8, 9, 39)):
-            folded_max_local_chunks = measured
+    direct_precision = os.environ.get("PLA_FLASHQLA_DIRECT_PRECISION") == "1"
+    force_precision = os.environ.get("PLA_FLASHQLA_FORCE_PRECISION_REPAIR") == "1"
+    folded_max_local_chunks = None
+    complete_layout = valid_num_tokens == num_tokens
+    if (os.environ.get("PLA_FLASHQLA_TC02_FOLDED", "1") != "0"
+            and not direct_precision and not force_precision
+            and q.dtype == torch.bfloat16 and indexed_state
+            and initial_state.dtype == torch.float32
+            and overlap_warmup_threshold is None and not force_tc01_cp_candidate
+            and (normalize_qk or (q.is_contiguous() and k.is_contiguous()))
+            and (not use_raw_gating or auto_cp and complete_layout)
+            and _cuda_device_properties(q.device.index) == (8, 9, 39)):
+        folded_max_local_chunks = folded_schedule(
+            H, Hg, raw_cu, use_raw_gating, auto_cp,
+            auto_cp and complete_layout and normalize_qk)
+    use_folded = folded_max_local_chunks is not None
     packed_short = (
-        indexed_state and ((H == 8 and Hg in (2, 4) and batch in (11, 22)) or
-                           (H == 48 and Hg == 16 and 11 <= batch <= 128)) and
-        all(0 < b - a <= 256 for a, b in zip(raw_cu, raw_cu[1:])))
-    small_folded = (batch == 1 and valid_num_tokens == 24 and H in (8, 16))
-    grouped_packed_folded = packed_short and H == 48 and Hg == 16 and batch <= 128
-    packed_raw_folded = (
-        auto_cp and valid_num_tokens == num_tokens
-        and schedule_key in FOLDED_TC02_PACKED_RAW
-    )
-    use_folded = (
-        os.environ.get("PLA_FLASHQLA_TC02_FOLDED", "1") != "0"
-        and folded_max_local_chunks != -2
-        and (not use_raw_gating or packed_raw_folded)
-        and os.environ.get("PLA_FLASHQLA_DIRECT_PRECISION") != "1"
-        and os.environ.get("PLA_FLASHQLA_FORCE_PRECISION_REPAIR") != "1"
-        and q.dtype == torch.bfloat16
-        and (valid_num_tokens >= folded_min_length * batch or short_folded_range
-             or folded_max_local_chunks is not None or small_folded or grouped_packed_folded)
-        and (H != Hg or batch == 1) and not calibrated_cp
-        and indexed_state and initial_state.dtype == torch.float32
-        and overlap_warmup_threshold is None and not force_tc01_cp_candidate
-        and (normalize_qk or (q.is_contiguous() and k.is_contiguous()))
-        and _cuda_device_properties(q.device.index) == (8, 9, 39)
-    )
+        indexed_state and H == 8 and Hg in (2, 4) and batch in (11, 22)
+        and all(0 < b - a <= 256 for a, b in zip(raw_cu, raw_cu[1:])))
     # BF16 can round each weak CP decay to one. Use the FP32 transition
     # path for long sequences and the 24K+ single-sequence 12/4 schedule.
     precise_transitions = use_folded and (
@@ -578,8 +557,7 @@ def chunk_gated_delta_rule_fwd(
 
     precision_inputs = None
     precision_flags = None
-    direct_precision = os.environ.get("PLA_FLASHQLA_DIRECT_PRECISION") == "1"
-    force_precision = os.environ.get("PLA_FLASHQLA_FORCE_PRECISION_REPAIR") == "1"
+    live_initial = None
     # The structural guard unconditionally selects every nonempty sequence
     # in this range. Returning directly avoids computing output twice.
     repair_all_short = (
@@ -651,7 +629,16 @@ def chunk_gated_delta_rule_fwd(
             and len(raw_cu) == 2 and cu32.numel() == 2
             and repair_values[1].is_contiguous() and repair_values[3].is_contiguous()
             and _cuda_device_properties(q.device.index) == (8, 9, 39))
-        if tiny_indexed:
+        if (initial_state is not None and not force_precision and not direct_precision
+                and batch * H * DK * DV * 4 > _MAX_REPAIR_SNAPSHOT_BYTES):
+            # Fast kernels skip selected heads. Their original state remains
+            # available to FP64 repair even if the other heads update in place.
+            live_initial = initial_state
+        if live_initial is not None:
+            precision_flags = flashqla_cute._precision_guard(
+                repair_values[1], cu32, not indexed_state, repair_values[3])
+            snapshot = torch.empty(0, device=q.device, dtype=torch.float32)
+        elif tiny_indexed:
             snapshot = torch.empty(0, device=q.device, dtype=torch.float32)
         elif medium_guard_snapshot or compact_guard_snapshot or wide_short_guard:
             precision_flags, snapshot = flashqla_cute._precision_guard_snapshot_medium(
@@ -682,7 +669,7 @@ def chunk_gated_delta_rule_fwd(
                 fuse_suffix=(quick_guard or compact_guard_snapshot or wide_short_guard or ((medium_guard_snapshot and cu32.numel() <= 3) or
                     (cu32.numel() == 2 and H == 16 and Hg in (2, 4, 8) and
                      768 <= num_tokens <= 1408))),
-                load_indexed_state=tiny_indexed)
+                load_indexed_state=tiny_indexed, live_initial=live_initial)
 
 
     # Step 2: KKT solve (WY factor). kkt_solve internally computes K@K^T at CS=32.
@@ -845,6 +832,9 @@ def chunk_gated_delta_rule_fwd(
             cp_seq_map_i32 = seq_map_c2r.to(torch.int32)
             raw_cu_i32 = cu32
 
+    # The folded fast path only needs the guard mask when repair reads live state.
+    skip_folded_heads = use_folded and live_initial is not None
+    forward_flags = precision_flags if not use_folded or skip_folded_heads else None
     # Step 4: fused forward — CP path (grid = cp_batch*H) or non-CP path.
     if cp_seq_map_i32 is not None:
         o, ht = flashqla_cute.fused_fwd(
@@ -854,7 +844,8 @@ def chunk_gated_delta_rule_fwd(
             initial_state_indices if indexed_state else None,
             output_final_state, state_dtype == torch.bfloat16,
             raw_state_input, num_warmup_flat, fallback_mask_flat,
-            precision_flags=precision_flags, coefficients=coefficients)
+            precision_flags=forward_flags, coefficients=coefficients,
+            skip_folded_repair_heads=skip_folded_heads)
     else:
         h0 = (initial_state if initial_state is not None and not indexed_state
               else torch.empty(0, device=q.device))
@@ -870,7 +861,8 @@ def chunk_gated_delta_rule_fwd(
             initial_state if indexed_state else None,
             initial_state_indices if indexed_state else None,
             output_final_state, state_dtype == torch.bfloat16,
-            None, None, None, *packed_argument, precision_flags=precision_flags, coefficients=coefficients)
+            None, None, None, *packed_argument, precision_flags=forward_flags, coefficients=coefficients,
+            skip_folded_repair_heads=skip_folded_heads)
 
     if precision_inputs is not None:
         apply_precision(o, initial_state if indexed_state else (ht if output_final_state else None))
