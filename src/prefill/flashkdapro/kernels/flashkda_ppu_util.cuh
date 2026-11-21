@@ -123,6 +123,24 @@ __forceinline__ __device__ float bf16_to_f32(BF16 x) {
 #endif
 }
 
+// tc02 round-to-nearest-even; every FP32 NaN maps to positive BF16 0x7fff.
+__forceinline__ __device__ uint16_t f32_to_bf16_exact_bits(float x) {
+#if defined(__HGGC_ARCH__) && defined(FLASHKDA_ARCH_150)
+  uint16_t bits;
+  asm("{\n"
+      " .reg .pred p;\n"
+      " .reg .b16 raw;\n"
+      " ppu.cvt.rtte.bf16.f32 raw, %1;\n"
+      " ppu.cmpp.nan.f32 p, %1, %1;\n"
+      " ppu.selp.b16 %0, 0x7fff, raw, p;\n"
+      "}\n"
+      : "=h"(bits) : "f"(x));
+  return bits;
+#else
+  return BF16(x).storage;
+#endif
+}
+
 }  // namespace flashkda
 
 namespace cute {
@@ -501,7 +519,7 @@ CUTE_DEVICE void bf16_acc_to_bfrag_movmatrix_batched_u32(
     for (int n = 0; n < cute::size<2>(rC); ++n)
       CUTE_UNROLL
       for (int v = 0; v < cute::size<0>(rC); ++v) {
-        c_half[pos] = BF16(rC(v, m, n)).storage;
+        c_half[pos] = f32_to_bf16_exact_bits(rC(v, m, n));
         ++pos;
       }
   uint32_t c_regs[4];

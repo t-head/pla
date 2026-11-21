@@ -69,6 +69,7 @@
 #include <cutlass/bfloat16.h>
 #include <type_traits>
 #include "prefill/flashkdapro/common/launch_api.h"
+#include "prefill/flashkdapro/common/runtime_arch.h"
 #include "flashkda_ppu_util.cuh"
 #include "flashkda_cute_traits.cuh"
 
@@ -94,6 +95,38 @@ __device__ __forceinline__ void cp_copy_g2s(void* dst, const void* src, int tid)
     uint4* d4 = reinterpret_cast<uint4*>(dst);
     CUTE_UNROLL
     for (int i = tid; i < NVEC; i += NThreads) d4[i] = s4[i];
+}
+
+// Exact tc02 linear AIU operands and single-leader completion contract from
+// the qualified K2 loader. Only M/B global-to-shared stage transfers use AIU.
+__forceinline__ __device__ void cp_stage_aiu_load_2d_b16(
+    void* smem_ptr, const void* gmem_ptr, int dim_c, int dim_w, int64_t stride_w_bytes) {
+#if defined(FLASHKDA_ARCH_150)
+    uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+    asm volatile(
+        "ppu.cp.async.aiu.bulk.tensor.shared.global.2d.tile.padz.linear.b16"
+        " [%0], [%1], {%2, %3, %4}, {%5, %6, %7}, {%8, %9}, {%10, %11, %12}, %13;\n"
+        :: "r"(smem_addr), "l"(gmem_ptr),
+           "r"(dim_c), "r"(dim_w), "r"(1),
+           "r"(dim_c), "r"(dim_w), "r"(1),
+           "l"(stride_w_bytes), "l"(int64_t(0)),
+           "r"(0), "r"(0), "r"(0),
+           "r"(0)
+        : "memory");
+#else
+    (void)smem_ptr; (void)gmem_ptr; (void)dim_c; (void)dim_w; (void)stride_w_bytes;
+#endif
+}
+__forceinline__ __device__ void cp_stage_aiu_commit() {
+#if defined(FLASHKDA_ARCH_150)
+    asm volatile("ppu.cp.async.commit_group;\n" ::: "memory");
+#endif
+}
+template <int N>
+__forceinline__ __device__ void cp_stage_aiu_wait_group() {
+#if defined(FLASHKDA_ARCH_150)
+    asm volatile("ppu.cp.async.wait_group %0;\n" :: "n"(N) : "memory");
+#endif
 }
 
 // C[m][n] += acc, accumulating the GEMM result in fp32 before one destination
@@ -186,9 +219,8 @@ struct MergeSmem {
 };
 
 // seq_seg: per sequence, 2 int32 = {first segment index, segment count}.
-template <typename ElemT>
-__global__ void __launch_bounds__(MERGE_THREADS, 1)
-flashkda_cp_merge_kernel(
+template <typename ElemT, bool AsyncStage>
+__device__ __forceinline__ void merge_serial(
     const ElemT* __restrict__ chain,       // [2, n_seg, H, DV, DK] from pre_scan
     const void* __restrict__ init_state,   // [slots,H,DV,DK], bf16/fp32 or nullptr
     const int32_t* __restrict__ init_state_indices,
@@ -245,15 +277,31 @@ flashkda_cp_merge_kernel(
         return smem + MergeSmem::O_STAGE + s * MergeSmem::STAGE;
     };
     auto issue_stage = [&](int i, int s) {
-        // B_i tile (the segment's zero-carry result) and the full Mst image.
-        cp_copy_g2s<MergeSmem::C_BYTES, MERGE_THREADS>(
-            stage_ptr(s) + MergeSmem::M_BYTES,
-            chain + (int64_t(first + i) * H * DV * DK) + head_off, tid);
-        cp_copy_g2s<MergeSmem::M_BYTES, MERGE_THREADS>(
-            stage_ptr(s),
-            chain + chain_stride
-                  + (int64_t(first + i) * H * DV * DK)
-                  + int64_t(head) * DV * DK, tid);
+        // One group owns both byte-identical linear M/B stage images.
+        if constexpr (AsyncStage) {
+            if (tid == 0) {
+                cp_stage_aiu_load_2d_b16(
+                    stage_ptr(s) + MergeSmem::M_BYTES,
+                    chain + int64_t(first + i) * H * DV * DK + head_off,
+                    DK, BVM, int64_t(DK) * sizeof(ElemT));
+                cp_stage_aiu_load_2d_b16(
+                    stage_ptr(s),
+                    chain + chain_stride + int64_t(first + i) * H * DV * DK
+                          + int64_t(head) * DV * DK,
+                    DK, DK, int64_t(DK) * sizeof(ElemT));
+                cp_stage_aiu_commit();
+            }
+        } else {
+            // B_i tile (the segment's zero-carry result) and the full Mst image.
+            cp_copy_g2s<MergeSmem::C_BYTES, MERGE_THREADS>(
+                stage_ptr(s) + MergeSmem::M_BYTES,
+                chain + (int64_t(first + i) * H * DV * DK) + head_off, tid);
+            cp_copy_g2s<MergeSmem::M_BYTES, MERGE_THREADS>(
+                stage_ptr(s),
+                chain + chain_stride
+                      + (int64_t(first + i) * H * DV * DK)
+                      + int64_t(head) * DV * DK, tid);
+        }
     };
 
     if (cnt > 1) issue_stage(0, 0);
@@ -261,6 +309,11 @@ flashkda_cp_merge_kernel(
         const int s = i & 1;
         ElemT* sMst = reinterpret_cast<ElemT*>(stage_ptr(s));
         ElemT* sD = reinterpret_cast<ElemT*>(stage_ptr(s) + MergeSmem::M_BYTES);
+        if constexpr (AsyncStage) {
+            if (tid == 0) cp_stage_aiu_wait_group<0>();
+        }
+        // Publish completed AIU writes to every GEMM warp. The previous
+        // iteration's end barriers protect the other stage before reuse.
         __syncthreads();
         // Prefetch step i+1 into the other stage: M/B never depend on the carry,
         // so only the GEMM chain below is truly serial.
@@ -276,17 +329,94 @@ flashkda_cp_merge_kernel(
     }
 }
 
+template <typename ElemT, bool AsyncStage = false>
+__global__ void __launch_bounds__(MERGE_THREADS, 1) flashkda_cp_merge_kernel(
+    const ElemT* chain, const void* initial, const int32_t* indices, bool state_fp32,
+    ElemT* carries, const int* mapping, int heads, int segments) {
+    merge_serial<ElemT, AsyncStage>(chain, initial, indices, state_fp32,
+                                    carries, mapping, heads, segments);
+}
+
+__device__ __forceinline__ unsigned pack_initial_pair(float a, float b) {
+    return unsigned(BF16(a).storage) | (unsigned(BF16(b).storage) << 16);
+}
+
+__device__ __forceinline__ uint4 initial_vector(
+    const void* initial, const int32_t* indices, bool state_fp32, int seq,
+    int64_t stride, int64_t lane_offset) {
+    if (!initial) return make_uint4(0, 0, 0, 0);
+    const int slot = indices ? indices[seq] : seq;
+    const int64_t offset = int64_t(slot) * stride + lane_offset;
+    if (!state_fp32)
+        return *reinterpret_cast<const uint4*>(static_cast<const BF16*>(initial) + offset);
+    const float4* src = reinterpret_cast<const float4*>(static_cast<const float*>(initial) + offset);
+    const float4 lo = src[0], hi = src[1];
+    return make_uint4(pack_initial_pair(lo.x, lo.y), pack_initial_pair(lo.z, lo.w),
+                      pack_initial_pair(hi.x, hi.y), pack_initial_pair(hi.z, hi.w));
+}
+
+__device__ __forceinline__ bool finite_pair(unsigned pair) {
+    return (pair & 0x7f80u) != 0x7f80u && (pair & 0x7f800000u) != 0x7f800000u;
+}
+
+// BF16(bias + 0.f) is bit-identical to bias for normal finite values and +0.
+// The serial GEMM handles signed zero, subnormals, infinity and NaN.
+__device__ __forceinline__ bool copyable_bias(unsigned short bits) {
+    const unsigned exponent = bits & 0x7f80u;
+    return bits == 0 || (exponent != 0 && exponent != 0x7f80u);
+}
+
+__device__ __forceinline__ bool copyable_pair(unsigned pair) {
+    return copyable_bias(static_cast<unsigned short>(pair)) && copyable_bias(pair >> 16);
+}
+
+__global__ void __launch_bounds__(MERGE_THREADS, 1) flashkda_cp_merge_proof_kernel(
+    const BF16* chain, const void* initial, const int32_t* indices, bool state_fp32,
+    BF16* carries, const int* mapping, const int32_t* zero_slices, int heads, int segments) {
+    const int tid = threadIdx.x, seq = blockIdx.y, head = blockIdx.z;
+    const int first = mapping[2 * seq], count = mapping[2 * seq + 1];
+    const int64_t stride = int64_t(heads) * DV * DK;
+    const int64_t lane_offset = int64_t(head) * DV * DK + int(blockIdx.x) * BVM * DK + tid * 8;
+    static_assert(MERGE_THREADS * sizeof(uint4) == MergeSmem::C_BYTES);
+    const uint4 init = initial_vector(initial, indices, state_fp32, seq, stride, lane_offset);
+    bool copy = finite_pair(init.x) && finite_pair(init.y) && finite_pair(init.z) && finite_pair(init.w);
+    for (int i = 0; i < count - 1; ++i) {
+        const int index = ((first + i) * heads + head) * 2;
+        const uint4 bias = *reinterpret_cast<const uint4*>(chain + int64_t(first + i) * stride + lane_offset);
+        copy &= zero_slices[index] && zero_slices[index + 1]
+             && copyable_pair(bias.x) && copyable_pair(bias.y)
+             && copyable_pair(bias.z) && copyable_pair(bias.w);
+    }
+    __shared__ int warp_copy[MERGE_THREADS / WARP];
+    const int agree = __all_sync(0xffffffff, copy);
+    if ((tid % WARP) == 0) warp_copy[tid / WARP] = agree;
+    __syncthreads();
+    bool all_copy = true;
+    CUTE_UNROLL
+    for (int w = 0; w < MERGE_THREADS / WARP; ++w) all_copy &= warp_copy[w];
+    if (!all_copy) {
+        merge_serial<BF16, true>(chain, initial, indices, state_fp32, carries, mapping, heads, segments);
+        return;
+    }
+    *reinterpret_cast<uint4*>(carries + int64_t(first) * stride + lane_offset) = init;
+    for (int i = 0; i < count - 1; ++i) {
+        const int64_t offset = int64_t(first + i) * stride + lane_offset;
+        *reinterpret_cast<uint4*>(carries + offset + stride) = *reinterpret_cast<const uint4*>(chain + offset);
+    }
+}
+
 }  // namespace flashkda_cute_cp
 
-void launch_flashkda_cp_merge(
+static void launch_flashkda_cp_merge_impl(
     const void* chain, const void* init_state, void* carries, bool fp16_state,
     const int32_t* init_state_indices, bool init_state_is_fp32,
-    const int* seq_seg, int H, int N, int n_seg, hggcStream_t stream) {
+    const int* seq_seg, int H, int N, int n_seg, hggcStream_t stream,
+    bool short_auto) {
     namespace cp = flashkda_cute_cp;
     dim3 grid(cp::DV / cp::BVM, N, H);
-    auto launch = [&](auto type_tag) {
+    auto launch = [&](auto type_tag, auto async_tag) {
         using ElemT = typename decltype(type_tag)::type;
-        auto kern = cp::flashkda_cp_merge_kernel<ElemT>;
+        auto kern = cp::flashkda_cp_merge_kernel<ElemT, decltype(async_tag)::value>;
         hggcFuncSetAttribute(kern, hggcFuncAttributeMaxDynamicSharedMemorySize,
                              cp::MergeSmem::BYTES);
         kern<<<grid, cp::MERGE_THREADS, cp::MergeSmem::BYTES, stream>>>(
@@ -295,6 +425,45 @@ void launch_flashkda_cp_merge(
             reinterpret_cast<ElemT*>(carries),
             seq_seg, H, n_seg);
     };
-    if (fp16_state) launch(flashkda::TypeTag<cp::FP16>{});
-    else            launch(flashkda::TypeTag<cp::BF16>{});
+    const char* async_env = getenv("PLA_FLASHKDA_TC02_CP_ASYNC_MERGE");
+    const bool async_stage = !flashkda::host_runtime::current_device_is_tc01()
+        && ((async_env && async_env[0])
+            ? async_env[0] == '1' && async_env[1] == '\0'
+            : short_auto);
+    auto select = [&](auto type_tag) {
+        if (async_stage) launch(type_tag, std::true_type{});
+        else             launch(type_tag, std::false_type{});
+    };
+    if (fp16_state) select(flashkda::TypeTag<cp::FP16>{});
+    else            select(flashkda::TypeTag<cp::BF16>{});
+}
+
+void launch_flashkda_cp_merge(
+    const void* chain, const void* init_state, void* carries, bool fp16_state,
+    const int32_t* init_state_indices, bool init_state_is_fp32,
+    const int* seq_seg, int H, int N, int n_seg, hggcStream_t stream) {
+    launch_flashkda_cp_merge_impl(chain, init_state, carries, fp16_state,
+        init_state_indices, init_state_is_fp32, seq_seg, H, N, n_seg, stream,
+        false);
+}
+
+void launch_flashkda_cp_merge_short_auto(
+    const void* chain, const void* init_state, void* carries, bool fp16_state,
+    const int32_t* init_state_indices, bool init_state_is_fp32,
+    const int* seq_seg, int H, int N, int n_seg, hggcStream_t stream) {
+    launch_flashkda_cp_merge_impl(chain, init_state, carries, fp16_state,
+        init_state_indices, init_state_is_fp32, seq_seg, H, N, n_seg, stream,
+        true);
+}
+
+void launch_flashkda_cp_merge_zero_flags(
+    const void* chain, const void* initial, void* carries, const int32_t* indices,
+    bool state_fp32, const int* mapping, const int32_t* zero_slices,
+    int heads, int sequences, int segments, hggcStream_t stream) {
+    namespace cp = flashkda_cute_cp;
+    auto kernel = cp::flashkda_cp_merge_proof_kernel;
+    hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, cp::MergeSmem::BYTES);
+    kernel<<<dim3(cp::DV / cp::BVM, sequences, heads), cp::MERGE_THREADS, cp::MergeSmem::BYTES, stream>>>(
+        static_cast<const cp::BF16*>(chain), initial, indices, state_fp32,
+        static_cast<cp::BF16*>(carries), mapping, zero_slices, heads, segments);
 }
