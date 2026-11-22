@@ -52,6 +52,7 @@ other layout is materialized once on the current stream
 before the first kernel, and a strided ``final_state``/``state_pool`` is
 written back after the last kernel. Results are bit-identical either way.
 """
+import atexit
 from typing import Optional, Tuple
 
 import torch
@@ -59,6 +60,8 @@ import torch
 from . import _C as flashkda_cute
 from .. import _sanity
 from ._dispatch import dispatch_tc01_impl, explicit_tc01_impl, select_backend
+
+atexit.register(flashkda_cute._cp_graph_owner_shutdown)
 
 CHUNK_SIZE = 16          # Unified chunk size (Kernel 1 tiling, Kernel 2 recurrence)
 DK = 128

@@ -34,6 +34,7 @@ Run: python3 tests/test_tc01_fla_dispatch.py
 Does not load the installed pla/torch, does not run GPU kernels, and does not replace full wheel/PPU validation.
 """
 import ast
+import atexit
 from contextlib import ExitStack, nullcontext, redirect_stderr, redirect_stdout
 import importlib
 import importlib.util
@@ -125,6 +126,8 @@ class DispatchTests(unittest.TestCase):
             sys.modules[name] = parent
         legacy = types.ModuleType(ALIAS + '._C')
         legacy.flashkda_fwd = Mock(return_value=None)
+        legacy._cp_graph_owner_shutdown = Mock(return_value=None)
+        self.addCleanup(atexit.unregister, legacy._cp_graph_owner_shutdown)
         sys.modules[legacy.__name__] = legacy
         self.legacy = legacy.flashkda_fwd
         extension = types.ModuleType(ALIAS + '._tc01_fla._C')
@@ -377,17 +380,19 @@ class BuildTests(unittest.TestCase):
         self.flags = json.loads((SOURCE / 'build_flags.json').read_text())
 
     def setup_extensions(self, environment=None, command='build_ext'):
-        """Only executes the real setup.py FlashKDA config block, without loading torch/SDK or running a build."""
+        """Executes the FlashKDA config and header discovery without loading torch or the SDK."""
         tree = ast.parse((ROOT / 'setup.py').read_text())
+        helpers = [node for node in tree.body if isinstance(node, ast.FunctionDef)
+                   and node.name == 'local_headers']
         blocks = [node for node in tree.body if isinstance(node, ast.If)
                   and any(isinstance(item, ast.Constant) and item.value == 'pla.prefill.flashkdapro'
                           for item in ast.walk(node.test))]
         self.assertEqual(len(blocks), 1)
-        namespace = dict(here=str(ROOT), os=os, sys=sys, importlib=importlib,
+        namespace = dict(here=str(ROOT), os=os, re=re, sys=sys, importlib=importlib,
                          NAMESPACES=['pla.prefill.flashkdapro'], ext_modules=[],
                          Extension=lambda **kwargs: types.SimpleNamespace(**kwargs),
                          actlize_includes=[], PREFILL_CXX_FLAGS=[], PREFILL_HGCC_FLAGS=[])
-        module = ast.Module(body=blocks, type_ignores=[])
+        module = ast.Module(body=[*helpers, *blocks], type_ignores=[])
         with patch.dict(os.environ, environment or {}, clear=True), patch.object(sys, 'argv', ['setup.py', command]):
             exec(compile(module, str(ROOT / 'setup.py'), 'exec'), namespace)
         return namespace['ext_modules']

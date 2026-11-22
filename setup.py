@@ -603,15 +603,17 @@ if "pla.prefill.flashkdapro" in NAMESPACES:
             "FlashKDApro source manifest contains missing files: "
             + ", ".join(missing_flashkda_sources))
 
+    flashkda_include_dirs = [
+        os.path.join(flashkda_dir, "kernels"),
+        os.path.join(here, "src"),
+    ]
+    flashkda_headers = local_headers(flashkda_sources, flashkda_include_dirs)
     ext_modules.append(
         Extension(
             name="pla.prefill.flashkdapro._C",
             sources=flashkda_sources,
-            include_dirs=[
-                # flashkda_cute_traits.cuh / _f16acc.cuh / _ppu_util.cuh
-                os.path.join(flashkda_dir, "kernels"),
-                os.path.join(here, "src"),
-            ] + actlize_includes,
+            depends=flashkda_headers,
+            include_dirs=flashkda_include_dirs + actlize_includes,
             extra_link_args=[],
             extra_compile_args={
                 "cxx": PREFILL_CXX_FLAGS,

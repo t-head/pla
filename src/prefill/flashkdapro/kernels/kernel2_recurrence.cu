@@ -510,7 +510,7 @@ void launch_flashkda_recurrence(
     bool init_state_is_fp32, bool final_state_is_fp32,
     int T_total, int H, int N, int total_tiles, const int32_t* cu_seqlens,
     bool is_varlen, bool has_state_in, bool has_state_out,
-    flashkda::KrWorkspaceLayout kr_layout, hggcStream_t stream) {
+    flashkda::KrWorkspaceLayout kr_layout, hggcStream_t stream, int preferred_dv) {
     // K2 variant selection: register-resident "nows" fast path vs the baseline
     // column-split (shared-memory state) recurrence.
     //   env PLA_FLASHKDA_K2_NOWS = "0"     -> force baseline
@@ -583,7 +583,7 @@ void launch_flashkda_recurrence(
         const bool affine_layout =
             kr_layout == flashkda::KrWorkspaceLayout::kNormalAffineP
             || kr_layout == flashkda::KrWorkspaceLayout::kContiguousAffineP;
-        if (use_nows || contiguous_layout || affine_layout) {
+        if (use_nows || contiguous_layout || affine_layout || (preferred_dv && !e)) {
             launch_flashkda_recurrence_nows(
                 o, v, v_stride, beta, ws,
                 init_state, final_state,
@@ -591,7 +591,7 @@ void launch_flashkda_recurrence(
                 init_state_is_fp32, final_state_is_fp32,
                 T_total, H, N, total_tiles, cu_seqlens,
                 is_varlen, has_state_in, has_state_out,
-                kr_layout, stream);
+                kr_layout, stream, preferred_dv);
             return;
         }
     }

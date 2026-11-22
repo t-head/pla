@@ -80,18 +80,17 @@ available in the [prefill guide](docs/prefill_readme.md).
 
 The standard `pla.prefill.flashqla` build includes folded prefill kernels for
 39-CU M890P devices with BF16 inputs, head dimension 128, and an indexed FP32
-state pool. The existing forward APIs select them when the mean valid length
-per sequence reaches 512 tokens for 8 Q/K and 24 value heads, 1K for other
-single-sequence inputs, or 4K for other batches. Batches with 32, 64, or 128
-value heads require at least 4K valid tokens per sequence. At 64 or 128 value
-heads, the longest sequence must also be no more than twice the shortest.
-Batched MHA and the single-sequence 8K CP kernels for 6 and
-12 value heads retain their established paths. Folded prefill supports lengths
-above 64K with FP32 coefficient preparation and CP transitions to control
-accumulated error. Shorter sequences use the precision selected for their head
-configuration and CP schedule. Full CP prefix history is preserved. Regression
-coverage includes packed tails, nonconsecutive state slots, all supported
-heads and long weak-decay recurrences.
+state pool. Pre-activated inputs use the tc02 length thresholds and measured
+layout overrides. Packed raw inputs use folded prefill for measured, unpadded
+layouts with auto-CP enabled. `FOLDED_TC02_PACKED_RAW` keys admission by value
+heads, Q/K heads, and the complete sequence offsets. It includes measured
+single-sequence and mixed-batch layouts from the GDN prefill case lists.
+
+Packed raw keeps the established FP32 sigmoid for the FP64 repair guard.
+Other packed layouts use the established dispatch, including the calibrated
+single-sequence 8K CP kernels for 6 and 12 value heads. Folded prefill uses
+FP32 coefficient preparation and CP transitions for long weak-decay
+recurrences. CP retains the full prefix history across segments.
 
 ### vLLM KDA ReplaySSM
 

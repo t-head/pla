@@ -40,14 +40,19 @@ Public surface:
     GDN-specialized entry point that aliases convolution output laid out as
     ``[T, Q|K|V]`` instead of materializing three split tensors.
 
+``prefill_graph_metadata``
+    Keep a working set of warmup layouts through Graph capture on 39-CU tc02.
+
 The individual kernels it composes (``fused_fwd``, ``chunk_local_cumsum``,
 ``get_warmup_chunks``, ``kkt_solve``, ``prepare_h``, ``correct_h0``) are
 building blocks and live in :mod:`pla.prefill.flashqla.private`.
 """
 
 from .ops import chunk_gated_delta_rule_fwd, gdn_prefill_packed_qkv_fwd
+from .private.metadata import prefill_graph_metadata
 
 __all__ = [
     'chunk_gated_delta_rule_fwd',
     'gdn_prefill_packed_qkv_fwd',
+    'prefill_graph_metadata',
 ]

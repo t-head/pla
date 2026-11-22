@@ -38,6 +38,11 @@
   constexpr bool FF_AUX_P = AUX_P_TPL;
   constexpr bool FF_AUX_U = FF_AUX_P && H_TPL == 12;
   constexpr int FF_NThreads = FF_WG * NGRP;
+#if defined(FF_BODY_PACKED_TC01)
+  constexpr bool FF_PACKED_TC01 = true;
+#else
+  constexpr bool FF_PACKED_TC01 = false;
+#endif
 #if defined(FLASHQLA_ARCH_100) && defined(FF_VD_INPLACE)
   constexpr bool FF_REUSE_VD = true;
 #elif defined(FLASHQLA_ARCH_150) && defined(FF_VD_INPLACE)
@@ -47,18 +52,16 @@
 #endif
 #if FF_REG_CHAIN && defined(FLASHQLA_ARCH_150) && defined(FF_VD_INPLACE)
   constexpr bool FF_TC02_GVA_SPEC =
-      (H_TPL == 12 && Hg_TPL == 4) || (H_TPL == 6 && Hg_TPL == 2);
+      (H_TPL == 12 && Hg_TPL == 4) || (H_TPL == 6 && Hg_TPL == 2) ||
+      (H_TPL == 8 && (Hg_TPL == 2 || Hg_TPL == 4)) ||
+      (H_TPL == 16 && (Hg_TPL == 2 || Hg_TPL == 8)) ||
+        (H_TPL == 32 && (Hg_TPL == 4 || Hg_TPL == 8 || Hg_TPL == 16)) || (H_TPL == 24 && Hg_TPL == 8);
 #else
   constexpr bool FF_TC02_GVA_SPEC = false;
 #endif
-#ifdef FF_BODY_FOLDED
-  using Geometry = FoldedGeometry<H, NGRP, FF_PREPARE_MODE>;
-  using Smem = typename Geometry::Smem;
-  constexpr bool FF_PREFETCH_AFTER_DRAIN = Geometry::PrefetchAfterDrain;
-#else
+  // H=24 is the validated tc02 specialization: its register chain makes the
+  // h/W/Vd/gVd backing tiles redundant, while Ag/Pg/g-expansion are shared.
   using Smem = FfSmemLayout<NGRP, FF_DVH, H_TPL == 24>;
-  constexpr bool FF_PREFETCH_AFTER_DRAIN = FF_TC02_GVA_SPEC;
-#endif
 #if FF_REG_CHAIN
   using MmaO = FfMmaM4T<Element>;
   using MmaH = FfMmaM4T<Element>;
@@ -66,10 +69,7 @@
   using MmaO = fq::TiledMmaM32T<Element>;
   using MmaH = fq::TiledMmaM32T<Element>;
 #endif
-#ifdef FF_BODY_FOLDED
-  const int seq_idx = folded_sequence;
-  const int head_idx = blockIdx.y;
-#elif defined(FF_BODY_HEAD_MAJOR)
+#if defined(FF_BODY_HEAD_MAJOR)
   const int seq_idx  = blockIdx.y;
   const int head_idx = blockIdx.x;
 #elif defined(FLASHQLA_ARCH_150)
@@ -111,6 +111,15 @@
   }
 #endif
   const int kv_head_idx = head_idx / (H / Hg);
+  // A raw request/key-head selected for precise recurrence owns no fast-path
+  // state or output writes. Every thread in this CTA makes the same decision,
+  // including all CP segments and DV shards, before the first CTA barrier.
+  if (precision_flags != nullptr) {
+    const int raw_seq = cp_seq_map ? cp_seq_map[seq_idx] : seq_idx;
+    if (raw_seq < 0 || raw_seq >= raw_batch_size) return;
+    if (precision_flags[int64_t(raw_seq) * Hg + kv_head_idx] != 0) return;
+  }
+
   // 2D block: threadIdx.x = warp-group-local tid (0..FF_WG-1 = 0..127),
   //           threadIdx.y = warp-group ID (0 or 1).
 #if defined(FLASHQLA_ARCH_100)
@@ -132,11 +141,6 @@
   const int output_start = cu_seqlens[seq_idx];
   const int seq_end = cu_seqlens[seq_idx + 1];
   const int raw_batch_idx = cp_seq_map != nullptr ? cp_seq_map[seq_idx] : seq_idx;
-#ifdef FF_BODY_PREPARE
-  const int seq_start = folded_prepare_start(
-      output_start, seq_end, num_warmup_chunks[seq_idx * H + head_idx], compute_mt);
-  if (seq_start < 0) return;
-#else
   int seq_start = output_start;
   if (cp_seq_map != nullptr && num_warmup_chunks != nullptr &&
       fallback_mask != nullptr && raw_batch_idx >= 0 &&
@@ -160,11 +164,8 @@
       --predecessor;
     }
   }
-#endif
   const int seq_len = seq_end - seq_start;
-#ifndef FF_BODY_PREPARE
   if (seq_len == 0) return;
-#endif
   const int num_chunks = (seq_len + FF_CS - 1) / FF_CS;
   const int full_chunks = seq_len / FF_CS;  // chunks with actual==FF_CS (no partial)
 #if defined(FF_BODY_INDEXED_TC01)
@@ -190,6 +191,13 @@
   }
 
   extern __shared__ char smem[];
+#if defined(FF_BODY_PACKED_TC01)
+  static_assert(FF_REG_CHAIN && NGRP == 1 && !AUX_P_TPL);
+  static_assert(Smem::PG == Smem::AGSWZ + FF_AELEMS * 2);
+  // The independent coefficients already carry their final Element rounding
+  // and physical swizzle. The old Ag/Pg scratch holds two packed Pg slots.
+  Element* Pg_all = reinterpret_cast<Element*>(smem + Smem::AGSWZ);
+#endif
   // Input tiles are (double-)buffered: K_all/... are the slot-0 base pointers;
   // the per-chunk K_buf/... below index the active slot (p = c % FF_NBUF).
   Element* K_all    = reinterpret_cast<Element*>(smem + Smem::K);
@@ -221,31 +229,7 @@
   float*  g_rev     = reinterpret_cast<float*>(smem + Smem::GREV);
   float*  g_log     = reinterpret_cast<float*>(smem + Smem::GLOG);
 
-#ifdef FF_BODY_FOLDED
-  const int dv_base = Geometry::dv_base(prepare_task, gid);
-  const int FF_VBASE = Geometry::v_base(gid);
-  constexpr int FF_VPITCH = Geometry::VPitch;
-  constexpr int AElements = Geometry::AElements;
-  const int v_load_offset = dv_base - FF_VBASE;
-#else
   const int dv_base = (blockIdx.z * NGRP + gid) * FF_DVH;
-  const int FF_VBASE = dv_base;
-  constexpr int FF_VPITCH = FF_DV;
-  constexpr int AElements = FF_AELEMS;
-#endif
-
-  auto preload = [&](int count, int start, int slot, int warp, int lane) {
-#ifdef FF_BODY_FOLDED
-    folded_preload_chunks<Element, Hg, NGRP, FF_PREPARE_MODE>(
-        count, start, slot, seq_end, warp, lane, Q_all, K_all, V_all, A_all, g_all,
-        q, k, v, a, g, beta, kv_head_idx, head_idx, v_token_stride,
-        compute_mt, num_tokens, v_load_offset);
-#else
-    ff_preload_chunks_split_aiu<Element, H, Hg, NGRP>(
-        count, start, slot, seq_end, warp, lane, Q_all, K_all, V_all, A_all, g_all, b_all,
-        q, k, v, a, g, beta, kv_head_idx, head_idx, v_token_stride);
-#endif
-  };
 
   // per-group intermediate buffers
   Element* hstmT_g  = hstmT_a  + gid * FF_HELEMS;
@@ -295,11 +279,6 @@
   if (!is_aux) {
     int64_t hbase = (int64_t)seq_idx * H * FF_DK * FF_DV +
                     (int64_t)head_idx * FF_DK * FF_DV;
-#ifdef FF_BODY_PREPARE
-    if (seed_state != nullptr) {
-      folded_seed_state(rHreg, tc_dkdv, dv_base, seed_state);
-    } else
-#endif
     if constexpr (STATE_BF16) {
       // Two-phase the read: issue a whole innermost-vv batch into distinct
       // staging registers before converting any of it.  With a narrowed pool the
@@ -389,16 +368,24 @@
     }
   }
 
-#ifdef FF_BODY_PREPARE
-  if (compute_mt) folded_transition_state(rHreg, tc_dkdv, dv_base);
-#endif
   // ---- prologue: seed the input pipeline with multi-warp split AIU ----
   if (!is_aux) {
     const int warp = __shfl_sync(0xffffffff, tx >> 5, 0);
     const int lane = tx & 31;
     // The H12 specialization issues chunk c+1 after chunk c's drain barrier
     // (see below), so its prologue seeds only the first chunk.
-    preload(FF_PREFETCH_AFTER_DRAIN ? 1 : FF_NBUF, seq_start, 0, warp, lane);
+#if defined(FF_BODY_PACKED_TC01)
+    ff_preload_packed_chunks_tc01<Element, H, Hg, NGRP>(
+        1, seq_start, 0, seq_end, warp, lane,
+        Q_all, K_all, V_all, A_all, g_all, b_all,
+        q, k, v, a, g, beta, kv_head_idx, head_idx, v_token_stride,
+        Pg_all, precomputed_pg);
+#else
+    ff_preload_chunks_split_aiu<Element, H, Hg, NGRP>(
+        FF_TC02_GVA_SPEC ? 1 : FF_NBUF, seq_start, 0, seq_end, warp, lane,
+        Q_all, K_all, V_all, A_all, g_all, b_all,
+        q, k, v, a, g, beta, kv_head_idx, head_idx, v_token_stride);
+#endif
   }
   __syncthreads();  // both input slots are visible before the chunk loop
 
@@ -407,12 +394,11 @@
   for (int c = 0; c < num_chunks; ++c) {
     const int chunk_start = seq_start + c * FF_CS;
     const int actual = min(FF_CS, seq_end - chunk_start);
-#ifndef FF_BODY_FOLDED
     const Element* K_src = k + (int64_t)chunk_start * Hg * FF_DK + kv_head_idx * FF_DK;
     const Element* Q_src = q + (int64_t)chunk_start * Hg * FF_DK + kv_head_idx * FF_DK;
-    const Element* V_src = v + (int64_t)chunk_start * v_token_stride + head_idx * FF_DV;
-    const Element* A_src = a + (int64_t)chunk_start * H * FF_CS + head_idx * FF_CS;
-#endif
+    const Element* V_src =
+        v + (int64_t)chunk_start * v_token_stride + head_idx * FF_DV;
+    const Element* A_src = a + (int64_t)chunk_start * H  * FF_CS + head_idx    * FF_CS;
 
     // ---- active input slot for this chunk; other slot receives the prefetch ----
 #if defined(FLASHQLA_ARCH_100) && !FF_REG_CHAIN
@@ -421,9 +407,9 @@
     const int p = c % FF_NBUF;
 #endif
     Element* K_buf = K_all + p * FF_KELEMS;
-    Element* V_buf = V_all + p * FF_CS * FF_VPITCH;
+    Element* V_buf = V_all + p * FF_VELEMS;
     Element* Q_buf = Q_all + p * FF_KELEMS;
-    Element* A_buf = A_all + p * AElements;
+    Element* A_buf = A_all + p * FF_AELEMS;
     float*  g_buf = g_all + p * FF_CS;   // g/beta for chunk c: prefetched by the
     float*  b_buf = b_all + p * FF_CS;   // prior iteration (or prologue for c=0).
 
@@ -437,7 +423,7 @@
       // Drain chunk c while retaining the next full chunk in flight.  The
       // last full chunk flushes the FIFO before a possible partial tail.
       // The H12 specialization has only chunk c in flight here.
-      if (!FF_PREFETCH_AFTER_DRAIN && c < full_chunks - 1)
+      if (!FF_PACKED_TC01 && !FF_TC02_GVA_SPEC && c < full_chunks - 1)
         ff_aiu_wait_group<1>();
       else
         ff_aiu_wait_group<0>();
@@ -446,17 +432,22 @@
       // Tail (partial) chunk: no prefetch was issued; FIFO is empty. Inline-issue
       // the single flat group and drain immediately.
       if (tx == 0) {
-#ifdef FF_BODY_FOLDED
-        folded_load_tail<Element, FF_PREPARE_MODE, FF_VPITCH>(
-            K_buf, V_buf, Q_buf, A_buf, g_buf, q, k, v, a, g, beta, Hg, kv_head_idx,
-            head_idx, v_token_stride, num_tokens, v_load_offset, chunk_start, actual, compute_mt);
-#else
-        const float* g_srcp = g + (int64_t)chunk_start * H + head_idx;
+        const float* g_srcp = g    + (int64_t)chunk_start * H + head_idx;
         const float* b_srcp = beta + (int64_t)chunk_start * H + head_idx;
-        ff_issue_chunk_aiu<Element>(K_buf, V_buf, Q_buf, A_buf, K_src, V_src, Q_src, A_src,
-                                    H, Hg, v_token_stride, actual,
-                                    g_buf, b_buf, g_srcp, b_srcp);
+#if defined(FF_BODY_PACKED_TC01)
+        // Scalar coefficient copies do not pad their unused rows.
+        for (int i = actual; i < FF_CS; ++i) {
+          g_buf[i] = 0.0f;
+          b_buf[i] = 0.0f;
+        }
+        ff_load_a_tile_tc01<Element>(Pg_all + p * FF_AELEMS,
+            precomputed_pg + ((int64_t)chunk_start * H + head_idx) * FF_CS,
+            H * FF_CS, actual);
 #endif
+        ff_issue_chunk_aiu<Element>(K_buf, V_buf, Q_buf, A_buf,
+                           K_src, V_src, Q_src, A_src, H, Hg,
+                           v_token_stride, actual,
+                           g_buf, b_buf, g_srcp, b_srcp);
       }
       ff_aiu_wait_group<0>();
     }
@@ -465,7 +456,7 @@
 
     // ============ PHASE A-tail: g_exp / g_rev / stable g snapshot =========
     __syncthreads();  // publish AIU-drained chunk data (K/V/Q/A/g/b) to all
-    if constexpr (FF_PREFETCH_AFTER_DRAIN) {
+    if constexpr (FF_TC02_GVA_SPEC || FF_PACKED_TC01) {
       // Every thread has finished chunk c-1 at this barrier, and after the
       // drain barrier the register chain only reads shared memory.  Slot
       // (c+1)%2, last read by chunk c-1, and the shared Ag/Pg/g tiles are
@@ -474,12 +465,25 @@
       if (!is_aux && (c + 1) < num_chunks) {
         const int warp = tx >> 5;
         const int lane = tx & 31;
-        preload(1, chunk_start + FF_CS, (c + 1) % FF_NBUF, warp, lane);
+#if defined(FF_BODY_PACKED_TC01)
+        ff_preload_packed_chunks_tc01<Element, H, Hg, NGRP>(
+            1, chunk_start + FF_CS, (c + 1) % FF_NBUF, seq_end, warp, lane,
+            Q_all, K_all, V_all, A_all, g_all, b_all,
+            q, k, v, a, g, beta, kv_head_idx, head_idx, v_token_stride,
+            Pg_all, precomputed_pg);
+#else
+        ff_preload_chunks_split_aiu<Element, H, Hg, NGRP>(
+            1, chunk_start + FF_CS, (c + 1) % FF_NBUF, seq_end, warp, lane,
+            Q_all, K_all, V_all, A_all, g_all, b_all,
+            q, k, v, a, g, beta, kv_head_idx, head_idx, v_token_stride);
+#endif
       }
     }
-#ifdef FF_BODY_FOLDED
-    folded_pad_gates(g_buf, actual, tx);
+#if defined(FF_BODY_PACKED_TC01)
+    Ag_swz = A_buf;
+    Pg_g = Pg_all + p * FF_AELEMS;
     g_exp = g_buf;
+    g_rev = b_buf;
     const float decay = g_buf[actual > 0 ? actual - 1 : 0];
 #else
     // NOTE (tc01): K^T is materialised into KT_buf (which aliases hstmT) AFTER
@@ -611,7 +615,6 @@
       }
     }
 
-#endif  // FF_BODY_FOLDED
 #if defined(FLASHQLA_ARCH_100)
     // The optional second warp-group overlaps the DV-independent QK^T/Pg work
     // with the main group's state snapshot and gated-WY preparation.  It writes
@@ -652,7 +655,7 @@
     }
 #endif
 
-#if FF_REG_CHAIN && !defined(FF_BODY_FOLDED)
+#if FF_REG_CHAIN
     // P and Pg are identical for the two DV halves.  In the two-group kernel,
     // gid0 already owns all g/Ag work above because those loops cover at most
     // 128 threads; gid1 would otherwise wait idle at the block barrier.  Let
@@ -733,7 +736,10 @@
     // drain barrier, so the H12 specialization issues them before the Ag/Pg
     // rendezvous.  Each group then overlaps the other group's asymmetric
     // Ag or Pg work with tensor-cell work instead of idling at the barrier.
-    constexpr bool ff_early_qk = H_TPL == 12 && Hg_TPL == 4;
+    constexpr bool ff_early_qk = (H_TPL == 12 && Hg_TPL == 4) ||
+        (H_TPL == 8 && (Hg_TPL == 2 || Hg_TPL == 4)) ||
+        (H_TPL == 16 && (Hg_TPL == 2 || Hg_TPL == 8)) ||
+        (H_TPL == 32 && (Hg_TPL == 4 || Hg_TPL == 8 || Hg_TPL == 16)) || (H_TPL == 24 && Hg_TPL == 8);
     auto o_acc = fq::make_acc<FF_DVH, FF_CS, MmaO, Element>(l);
     auto u_acc = fq::make_acc<FF_DVH, FF_CS, MmaO, Element>(l);
     if constexpr (ff_early_qk)
@@ -759,9 +765,8 @@
     // faster.  Giving each group its own Ag copy avoids the rendezvous but has
     // to build Ag twice and is slower; the shared Ag/Pg tiles therefore keep
     // this single block publication point.
-#ifndef FF_BODY_FOLDED
     __syncthreads();
-#endif
+#endif  // FF_BODY_PACKED_TC01
 
     if (!is_aux || FF_AUX_U) {
 #if FF_GEMM_REORDER
@@ -796,14 +801,9 @@
     }
 
     // ---- GEMM3^T/GEMM1^T: O_int^T = h^T@Q^T, U^T = h^T@K^T ----
-#ifdef FF_BODY_PREPARE
-    folded_hk_m4<Element>(h_a_regs, K_buf, l, u_acc);
-#else
     ff_gemm_regA_qkB_m4<Element>(
         h_a_regs, Q_buf, K_buf, l, o_acc, u_acc);
-#endif
     }
-#ifndef FF_BODY_PREPARE
     auto rO = cute::recast<float>(o_acc);
     CUTE_UNROLL
     for (int m = 0; m < cute::size<1>(tc_csdv); ++m) {
@@ -817,7 +817,6 @@
       }
     }
 
-#endif
     // U^T -> W^T = V^T - U^T*diag(g_exp), packed directly as the A
     // fragments consumed by W^T @ Ag^T.
     uint32_t w_a_regs[FF_CS / 16][1][4];
@@ -835,18 +834,12 @@
           auto crd1 = tc_csdv(2 * i + 1, 0, kt);
           int dv0 = cute::get<0>(crd0), cs0 = cute::get<1>(crd0);
           int dv1 = cute::get<0>(crd1), cs1 = cute::get<1>(crd1);
-#ifdef FF_BODY_FOLDED
-          const float w0 = folded_residual<Element, FF_PREPARE_MODE>(
-              V_buf, cs0 * FF_VPITCH + FF_VBASE + dv0, g_exp[cs0], rU(2 * i, 0, kt), compute_mt);
-          const float w1 = folded_residual<Element, FF_PREPARE_MODE>(
-              V_buf, cs1 * FF_VPITCH + FF_VBASE + dv1, g_exp[cs1], rU(2 * i + 1, 0, kt), compute_mt);
-#else
           float w0 = fq::element_to_float<Element>(
 #if defined(FLASHQLA_ARCH_100)
                          *reinterpret_cast<const Element*>(
                              &sV_ain(cs0, dv_base + dv0)))
 #else
-                         V_buf[cs0 * FF_VPITCH + FF_VBASE + dv0])
+                         V_buf[cs0 * FF_DV + dv_base + dv0])
 #endif
                      - g_exp[cs0] * rU(2 * i, 0, kt);
           float w1 = fq::element_to_float<Element>(
@@ -854,10 +847,9 @@
                          *reinterpret_cast<const Element*>(
                              &sV_ain(cs1, dv_base + dv1)))
 #else
-                         V_buf[cs1 * FF_VPITCH + FF_VBASE + dv1])
+                         V_buf[cs1 * FF_DV + dv_base + dv1])
 #endif
                      - g_exp[cs1] * rU(2 * i + 1, 0, kt);
-#endif
           uint32_t lo = fq::element_bits16<Element>(
               fq::float_to_element<Element>(w0));
           uint32_t hi = fq::element_bits16<Element>(
@@ -871,7 +863,6 @@
     // ---- GEMM2^T: Vd^T = W^T @ Ag^T ----
     // With TN MMA semantics Ag is a natural [N=CS,K=CS] B view; using a
     // physical transposed load here would compute W^T@Ag and is incorrect.
-#ifndef FF_BODY_FOLDED
     auto vd_acc = fq::make_acc<FF_DVH, FF_CS, MmaO, Element>(l);
     ff_gemm_regA_swzlB_m4<FF_CS, FF_CS, Element>(
         w_a_regs, Ag_swz, l, vd_acc);
@@ -932,6 +923,7 @@
         }
       }
     }
+
     if constexpr (FF_REUSE_VD) {
     // Consume the unscaled Vd fragment before reusing its A registers for gVd.
     ff_gemm_regA_swzlB_m4<FF_CS, FF_CS, Element>(
@@ -962,8 +954,6 @@
     }
     }
 
-#endif  // FF_BODY_FOLDED
-
     // ---- decay h^T; GEMM6^T h^T += gVd^T@K; GEMM5^T O^T += Vd^T@Pg^T ----
     CUTE_UNROLL
     for (int m = 0; m < cute::size<1>(tc_dkdv); ++m) {
@@ -974,9 +964,6 @@
           rHreg(vv, m, n) *= decay;
       }
     }
-#ifdef FF_BODY_FOLDED
-    folded_update<Element, FF_PREPARE_MODE>(w_a_regs, A_buf, l, gid, h_reg, o_acc);
-#else
     if constexpr (FF_REUSE_VD) {
       ff_gemm_regA_ktB_m4_acc<Element>(vd_a_regs, K_buf, l, h_reg);
     } else {
@@ -985,20 +972,16 @@
           vd_a_regs, Pg_g, l, o_acc, /*clear_acc=*/false);
     }
 
-#endif  // FF_BODY_FOLDED
-
     // The DV-major fragment owns a [DV16,CS32] O^T tile per warp.  Transpose it
     // once in registers and publish two aligned int4 vectors per lane.  This
     // removes the Wswz_g scatter, group barrier and TSM reload from the final
     // output path without reintroducing scalar/uncoalesced global stores.
-#ifndef FF_BODY_PREPARE
     if (chunk_start >= output_start) {
       Element* O_ptr = o + (int64_t)chunk_start * H * FF_DV
                        + head_idx * FF_DV;
       ff_store_ot_register_direct<Element>(
           o_acc, O_ptr, (int64_t)H * FF_DV, dv_base, l, actual);
     }
-#endif
 #else
     // ============ PHASE D (FF_GEMM_REORDER): GEMM4->3->1->2->6->5 =============
     auto sH  = fq::make_smem_tensor_h_ld<FF_DVH, FF_DK, FF_HLD>(hstmT_g);
@@ -1415,19 +1398,26 @@
     }
 
     // ---- chunk fence + deferred prefetch ----
-    if constexpr (FF_PREFETCH_AFTER_DRAIN) continue;
+    if constexpr (FF_TC02_GVA_SPEC || FF_PACKED_TC01) continue;
     __syncthreads();   // all input-buffer readers done for this chunk
 #if defined(FLASHQLA_ARCH_100) && !FF_REG_CHAIN
     if (!is_aux && (c + 1) < num_chunks) {
       const int warp = tx >> 5;
       const int lane = tx & 31;
-      preload(1, chunk_start + FF_CS, 0, warp, lane);
+      ff_preload_chunks_split_aiu<Element, H, Hg, NGRP>(
+          1, chunk_start + FF_CS, 0, seq_end, warp, lane,
+          Q_all, K_all, V_all, A_all, g_all, b_all,
+          q, k, v, a, g, beta, kv_head_idx, head_idx, v_token_stride);
     }
 #else
     if ((c + FF_NBUF) < num_chunks) {
       const int warp = tx >> 5;
       const int lane = tx & 31;
-      preload(1, chunk_start + FF_NBUF * FF_CS, (c + FF_NBUF) % FF_NBUF, warp, lane);
+      ff_preload_chunks_split_aiu<Element, H, Hg, NGRP>(
+          1, chunk_start + FF_NBUF * FF_CS, (c + FF_NBUF) % FF_NBUF,
+          seq_end, warp, lane,
+          Q_all, K_all, V_all, A_all, g_all, b_all,
+          q, k, v, a, g, beta, kv_head_idx, head_idx, v_token_stride);
     }
 #endif
   }
@@ -1449,12 +1439,8 @@
 #else
           int dk = cute::get<0>(crd), dv = cute::get<1>(crd);
 #endif
-#ifdef FF_BODY_PREPARE
-          folded_store_prepared(ht_out, seed_result, hbase, dk * FF_DV + dv_base + dv,
-                                rHreg(vv, m, n));
-#else
-          fq::state_from_f32(ht_out[hbase + dk * FF_DV + dv_base + dv], rHreg(vv, m, n));
-#endif
+          fq::state_from_f32(ht_out[hbase + dk * FF_DV + dv_base + dv],
+                             rHreg(vv, m, n));
         }
       }
     }

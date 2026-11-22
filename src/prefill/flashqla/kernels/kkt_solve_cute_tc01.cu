@@ -37,3 +37,4 @@
 #define FLASHQLA_KKT_LAUNCHER launch_kkt_solve_cute_tc01
 #define FLASHQLA_KKT_HOST_ARCH_100 1
 #include "kkt_solve_cute_impl.cuh"
+#include "packed_coefficients_tc01.cuh"

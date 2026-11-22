@@ -57,7 +57,7 @@ void launch_flashkda_prepare(
     int tile_offset, int tile_count, int head_offset, int head_count,
     int* ready, void* ws, bool force_plain, bool cp_fma_front,
     bool fp16_kd_qd, flashkda::KrWorkspaceLayout kr_layout,
-    hggcStream_t stream);
+    hggcStream_t stream, const void* value_input = nullptr, bool short_k1_lb8 = false);
 
 void launch_flashkda_zero_padded_output_tail(
     void* out, int T_total, int H, int N,
@@ -72,7 +72,7 @@ void launch_flashkda_recurrence(
     bool init_state_is_fp32, bool final_state_is_fp32,
     int T_total, int H, int N, int total_tiles, const int32_t* cu_seqlens,
     bool is_varlen, bool has_state_in, bool has_state_out,
-    flashkda::KrWorkspaceLayout kr_layout, hggcStream_t stream);
+    flashkda::KrWorkspaceLayout kr_layout, hggcStream_t stream, int preferred_dv = 0);
 
 // Faithful register-resident recurrence implementation called by the public K2
 // dispatcher.  It remains in the shared interface so its definition and the
@@ -85,7 +85,7 @@ void launch_flashkda_recurrence_nows(
     bool init_state_is_fp32, bool final_state_is_fp32,
     int T_total, int H, int N, int total_tiles, const int32_t* cu_seqlens,
     bool is_varlen, bool has_state_in, bool has_state_out,
-    flashkda::KrWorkspaceLayout kr_layout, hggcStream_t stream);
+    flashkda::KrWorkspaceLayout kr_layout, hggcStream_t stream, int preferred_dv = 0);
 
 // tc01-only four-stage BT64 path. The public operator ABI is unchanged; these
 // buffers are private, same-stream intermediates owned by the host call.
@@ -130,22 +130,36 @@ void launch_flashkda_bt64_cp_back_tc01(
 // The debug prepare confirms the KR layout via a device probe and caches it per device; a cold capture must be warmed up eagerly first.
 bool flashkda_kr_is_preswizzled(hggcStream_t stream);
 
+// Short tc02 CP publishes one exact-zero flag per 64-row transition slice.
+void launch_flashkda_cp_prescan_zero_flags(
+    const void* v, const void* beta, const void* ws, void* chain, int32_t* zero_slices,
+    int tokens, int heads, int segments, int tiles, const int* table, hggcStream_t stream);
+void launch_flashkda_cp_merge_zero_flags(
+    const void* chain, const void* initial, void* carries, const int32_t* indices,
+    bool state_fp32, const int* mapping, const int32_t* zero_slices,
+    int heads, int sequences, int segments, hggcStream_t stream);
+
 // CP pass 1/3 (template modes of the register-resident recurrence kernel).
 void launch_flashkda_cp_prescan(
     const void* v, int64_t v_stride, const void* beta, const void* ws,
     void* chain_state, bool fp16_state,
     int T_total, int H, int n_seg, int total_tiles,
-    const int* seg_tbl, int bv, hggcStream_t stream);
+    const int* seg_tbl, int bv, hggcStream_t stream, bool automatic_nt256 = false);
 
 void launch_flashkda_cp_segment(
     void* o, const void* v, int64_t v_stride, const void* beta, const void* ws,
     const void* carries, bool fp16_state, void* final_state,
     const int32_t* final_state_indices, bool final_state_is_fp32,
     int T_total, int H, int n_seg, int total_tiles,
-    const int* seg_tbl, int bv, hggcStream_t stream);
+    const int* seg_tbl, int bv, hggcStream_t stream, bool automatic_nt256 = false);
 
 // CP pass 2 (the only serial stage; serial over segments, not chunks).
 void launch_flashkda_cp_merge(
+    const void* chain, const void* init_state, void* carries, bool fp16_state,
+    const int32_t* init_state_indices, bool init_state_is_fp32,
+    const int* seq_seg, int H, int N, int n_seg, hggcStream_t stream);
+
+void launch_flashkda_cp_merge_short_auto(
     const void* chain, const void* init_state, void* carries, bool fp16_state,
     const int32_t* init_state_indices, bool init_state_is_fp32,
     const int* seq_seg, int H, int N, int n_seg, hggcStream_t stream);

@@ -15,11 +15,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from pla.prefill.flashqla import chunk_gated_delta_rule_fwd, gdn_prefill_packed_qkv_fwd
 from pla.prefill.flashqla.ops import SUPPORTED_HEAD_CONFIGS
+from pla.prefill.flashqla.private.cp_preprocess import CHUNK_SIZE, calc_cp_seqs
 from prefill_utils import ref_gdr, tensor_metrics
 
-from pla.prefill.flashqla import chunk_gated_delta_rule_fwd, gdn_prefill_packed_qkv_fwd
-from pla.prefill.flashqla.private.cp_preprocess import CHUNK_SIZE, calc_cp_seqs
 
 D = 128
 H = 8
@@ -45,14 +45,14 @@ def _metrics(actual, expected):
     return cosine, relative
 
 
-def _run(q, k, v, cu, state_pool, state_indices, *, gate, raw):
+def _run(q, k, v, cu, state_pool, state_indices, *, gate, raw, auto_cp=False):
     common = {
         "scale": D ** -0.5,
         "initial_state": state_pool,
         "initial_state_indices": state_indices,
         "cu_seqlens": cu,
         "output_final_state": False,
-        "auto_cp": raw,
+        "auto_cp": auto_cp,
         "normalize_qk": True,
         "raw_cu_seqlens": RAW_CU,
     }
@@ -81,7 +81,8 @@ def _run(q, k, v, cu, state_pool, state_indices, *, gate, raw):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a PPU device")
-def test_qwen38_real_gate_raw_indexed_state_prefill():
+@pytest.mark.parametrize("auto_cp", [False, True])
+def test_qwen38_real_gate_raw_indexed_state_prefill(auto_cp):
     assert hashlib.sha256(FIXTURE.read_bytes()).hexdigest() == FIXTURE_SHA256
     gate_cpu = torch.load(FIXTURE, map_location="cpu", weights_only=True)
     assert set(gate_cpu) == {"raw_gate_a", "raw_beta_b", "A_log", "dt_bias"}
@@ -106,13 +107,8 @@ def test_qwen38_real_gate_raw_indexed_state_prefill():
     raw_pool = base_pool.clone()
     activated_pool = base_pool.clone()
 
-    use_cp, _, _, _, _ = calc_cp_seqs(
-        cu, CHUNK_SIZE, H, RAW_CU, num_k_heads=HG
-    )
-    assert not use_cp
-
     raw_result = _run(
-        q, k, v, cu, raw_pool, state_indices, gate=gate, raw=True
+        q, k, v, cu, raw_pool, state_indices, gate=gate, raw=True, auto_cp=auto_cp,
     )
     activated_result = _run(
         q, k, v, cu, activated_pool, state_indices, gate=gate, raw=False
@@ -477,7 +473,8 @@ def test_auto_cp_initial_state_carry(dtype):
                 initial_state=pool, initial_state_indices=indices,
                 cu_seqlens=cu, normalize_qk=True,
                 output_final_state=False, auto_cp=auto_cp)
-            assert (fused.call_args.args[7] is not None) == auto_cp
+            expected_cp = auto_cp and torch.cuda.get_device_capability() != (8, 0)
+            assert (fused.call_args.args[7] is not None) == expected_cp
         relative = (pool[1] - expected).norm() / expected.expand_as(pool[1]).norm()
         assert float(relative) < 0.05, "auto CP lost initial-state carry"
         torch.testing.assert_close(
@@ -517,10 +514,9 @@ def test_auto_cp_fresh_prefix(dtype):
                     q, k, v, gate, beta, initial_state=initial,
                     cu_seqlens=cu, normalize_qk=True,
                     output_final_state=True, auto_cp=auto_cp)
-                # The None path must really use production CP, not pass by
-                # silently disabling the optimization for this input.
                 if not zero_state:
-                    assert (fused.call_args.args[7] is not None) == auto_cp
+                    expected_cp = auto_cp and torch.cuda.get_device_capability() != (8, 0)
+                    assert (fused.call_args.args[7] is not None) == expected_cp
             torch.testing.assert_close(
                 result[4][0, :, 0].float(), expected_state[:, None].expand(heads, D),
                 rtol=0.05, atol=0.0)
@@ -528,6 +524,99 @@ def test_auto_cp_fresh_prefix(dtype):
             torch.testing.assert_close(
                 result[2][0, -1].float(), expected_output[:, None].expand(heads, D),
                 rtol=0.05, atol=0.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a PPU device")
+@pytest.mark.parametrize("heads,qk_heads,lengths", [
+    (16, 2, (8192,)), (32, 4, (6397, 1795)),
+    *((8, hg, lengths) for hg in (1, 2, 4) for lengths in (
+        (10000,), (32768,), (8000, 24000), (4000, 4000, 24000))),
+])
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("form", ["none", "legacy", "indexed"])
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("output_final_state", [False, True])
+@pytest.mark.parametrize("capture", [False, True])
+def test_tc01_automatic_overlap_stays_serial(
+    heads, qk_heads, lengths, packed, form, state_dtype, output_final_state, capture,
+):
+    import itertools
+    from pla.prefill.flashqla import gdn_prefill_packed_qkv_fwd, ops
+
+    if torch.cuda.get_device_capability() != (8, 0):
+        pytest.skip("tc01 automatic CP admission coverage")
+    torch.manual_seed(20261112)
+    total, batch = sum(lengths), len(lengths)
+    offsets = tuple(itertools.accumulate((0, *lengths)))
+    cu = torch.tensor(offsets, device="cuda", dtype=torch.int32)
+    qkv = torch.randn(total, (2 * qk_heads + heads) * D,
+                      device="cuda", dtype=torch.bfloat16) * 0.1
+    q, k, v = (part.reshape(1, total, h, D).contiguous()
+               for part, h in zip(qkv.split([qk_heads * D, qk_heads * D, heads * D], -1),
+                                  (qk_heads, qk_heads, heads)))
+    raw_a = torch.randn(total, heads, device="cuda", dtype=torch.bfloat16)
+    raw_b = torch.randn_like(raw_a)
+    a_log = torch.full((heads,), -5.0, device="cuda")
+    bias = torch.zeros_like(a_log)
+    g = -a_log.exp()[None, None] * F.softplus(raw_a.float()[None])
+    beta = raw_b.float().sigmoid()[None]
+    state = indices = None
+    if form == "indexed":
+        state = torch.randn(batch + 2, heads, D, D, device="cuda", dtype=state_dtype) * 0.01
+        indices = torch.arange(batch, 0, -1, device="cuda", dtype=torch.int32)
+    elif form == "legacy":
+        state = torch.randn(batch, heads, D, D, device="cuda", dtype=state_dtype) * 0.01
+    base = None if state is None else state.clone()
+
+    def run(auto_cp):
+        if state is not None:
+            state.copy_(base)
+        common = dict(initial_state=state, initial_state_indices=indices,
+                      output_final_state=output_final_state, final_state_dtype=state_dtype,
+                      auto_cp=auto_cp, raw_cu_seqlens=offsets)
+        if packed:
+            return gdn_prefill_packed_qkv_fwd(
+                qkv, raw_a, raw_b, a_log, bias, cu,
+                num_qk_heads=qk_heads, num_v_heads=heads, **common)
+        return chunk_gated_delta_rule_fwd(q, k, v, g, beta,
+                                         cu_seqlens=cu, normalize_qk=True, **common)
+
+    ref = run(False)
+    expected_output = ref[2].cpu()
+    expected_final = None if ref[4] is None else ref[4].cpu()
+    expected_pool = None if state is None else state.cpu()
+    del ref
+    with patch.object(ops.flashqla_cute, "fused_fwd", wraps=ops.flashqla_cute.fused_fwd) as fused, \
+            patch.object(ops.flashqla_cute, "prepare_h") as prepare, \
+            patch.object(ops.flashqla_cute, "correct_h0") as correct:
+        result = run(True)
+        assert fused.call_args.args[7] is None
+        prepare.assert_not_called()
+        correct.assert_not_called()
+    if capture:
+        del result
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            run(True)
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            result = run(True)
+        torch.cuda.current_stream().wait_stream(stream)
+        for _ in range(3):
+            graph.replay()
+        torch.cuda.synchronize()
+    assert torch.equal(result[2].cpu(), expected_output)
+    if expected_final is None:
+        assert result[4] is None
+    else:
+        assert torch.equal(result[4].cpu(), expected_final)
+    if state is not None:
+        assert torch.equal(state.cpu(), expected_pool)
+        if form == "indexed":
+            assert torch.equal(state[0], base[0])
+            assert torch.equal(state[-1], base[-1])
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a PPU device")
@@ -584,8 +673,7 @@ def test_cp_fresh_prefix_history(dtype, state_dtype, threshold, output_final_sta
             assert fused.call_args.args[7] is not None
             warmup.assert_not_called()
             if threshold is not None and form != "legacy":
-                _, _, fallback_mask = fused.call_args.args[18:21]
-                assert torch.all(fallback_mask == 1)
+                assert torch.all(fused.call_args.args[-1] == 1)
             else:
                 assert fused.call_args.args[13].numel() > 0
         torch.testing.assert_close(
@@ -624,15 +712,14 @@ def test_overlap_without_initial_state_preserves_full_warmup():
             overlap_warmup_threshold=-4.0, force_tc01_cp_candidate=True)
         warmup.assert_not_called()
         assert fused.call_args.args[7] is not None
-        raw_state_input, num_warmup, fallback_mask = fused.call_args.args[18:21]
-        assert raw_state_input is None
-        assert torch.all(fallback_mask == 1)
+        assert fused.call_args.args[-3] is None
+        assert torch.all(fused.call_args.args[-1] == 1)
         cp_cu = fused.call_args.args[6]
         full_chunks = torch.div(
             cp_cu[1:] - cp_cu[:-1] + CHUNK_SIZE - 1,
             CHUNK_SIZE, rounding_mode="floor")
         assert torch.equal(
-            num_warmup.view(-1, heads),
+            fused.call_args.args[-2].view(-1, heads),
             full_chunks[:, None].expand(-1, heads))
     assert result[4] is None
     assert not torch.count_nonzero(result[2])
@@ -645,7 +732,6 @@ def test_overlap_without_initial_state_preserves_full_warmup():
 @pytest.mark.parametrize("output_final_state", [False, True])
 def test_tc01_lpt_sequence_mapping(dtype, state_dtype, form, output_final_state):
     import itertools
-
     from pla.prefill.flashqla import gdn_prefill_packed_qkv_fwd, ops
 
     if torch.cuda.get_device_capability() != (8, 0):
@@ -810,11 +896,10 @@ def test_prepare_h_partial_tail_chunk_reads_inside_segment(dtype):
 # Folded long-prefill regression: full history, packed tails and resident state.
 @pytest.fixture(scope="module")
 def folded_precision():
-    if not torch.cuda.is_available() or not torch.cuda.get_device_name().startswith(
-        "ZW-M890"
-    ):
+    if not torch.cuda.is_available():
         pytest.skip("requires a PPU M890P")
-    if torch.cuda.get_device_properties("cuda").multi_processor_count != 39:
+    props = torch.cuda.get_device_properties("cuda")
+    if (props.major, props.minor, props.multi_processor_count) != (8, 9, 39):
         pytest.skip("requires the 39-CU folded prefill schedule")
     precision = torch.get_float32_matmul_precision()
     tf32 = torch.backends.cuda.matmul.allow_tf32
@@ -863,38 +948,52 @@ def folded_prefill_reference(q, k, v, g, beta, offsets, initial_state):
         for case in [
             ((32768,), 32768, False, True, True),
             ((32768,), 32768, False, False, True),
-            ((8193, 8191), 16416, True, True, True),
-            ((32749,), 32768, True, True, True),
+            ((8193, 8191), 16416, False, True, True),
+            ((32749,), 32768, True, True, False),
             ((65536,), 65536, False, True, True),
-            ((65537,), 65600, True, True, True),
+            ((65537,), 65600, False, True, True),
             ((98304,), 98304, False, True, True),
             ((131072,), 131072, False, True, True),
-            ((32768, 32768, 32768, 32768), 131072, True, True, True),
+            ((32768, 32768, 32768, 32768), 131072, False, True, True),
             ((511,), 512, True, True, False),
-            ((512,), 512, True, True, True),
-            ((512, 512), 1024, True, True, True),
+            ((512,), 512, False, True, True),
+            ((512, 512), 1024, False, True, True),
         ]
     ]
     + [
-        ((4097,), 4160, True, True, True, h, hg)
+        ((4097,), 4160, False, True, True, h, hg)
         for h, hg in sorted(SUPPORTED_HEAD_CONFIGS)
     ]
     + [
-        ((4096, 4096), 8192, True, True, h != hg, h, hg)
+        ((4096, 4096), 8192, False, True, h != hg, h, hg)
         for h, hg in sorted(SUPPORTED_HEAD_CONFIGS)
     ]
     + [
-        ((32749,), 32768, True, True, True, 12, 4),
+        ((32749,), 32768, True, True, False, 12, 4),
+        ((32749,), 32768, False, True, True, 12, 4),
         ((4095, 8192), 12288, True, True, False, 32, 8),
         ((128, 16256), 16384, True, True, False, 64, 8),
-        ((4096, 8192), 12288, True, True, True, 64, 16),
+        ((4096, 8192), 12288, False, True, True, 64, 16),
         ((4096, 8193), 12352, True, True, False, 64, 16),
         ((4096, 32768), 36864, True, True, False, 128, 16),
-        ((1, 32767), 32768, True, True, True, 24, 8),
+        ((1, 32767), 32768, False, True, True, 24, 8),
         ((1023,), 1024, True, True, False, 4, 2),
-        ((1024,), 1024, True, True, True, 4, 2),
+        ((1024,), 1024, False, True, True, 4, 2),
         ((8192,), 8192, True, True, False, 6, 2),
         ((8192,), 8192, True, True, False, 12, 4),
+        ((8191,), 8191, True, True, True, 24, 8),
+        ((605,), 605, True, True, True, 24, 8),
+        ((605,), 640, True, True, False, 24, 8),
+        ((605,), 605, True, False, False, 24, 8),
+        ((121, 799), 920, True, True, True, 16, 4),
+        ((799, 121), 920, True, True, False, 16, 4),
+        ((1987,), 1987, True, True, True, 8, 2),
+        ((8192,), 8192, True, True, True, 24, 8),
+        ((32768,), 32768, True, True, True, 24, 8),
+        ((32768,), 32768, True, True, True, 12, 4),
+        ((4096, 8192), 12288, True, True, True, 64, 8),
+        ((1,) * 7 + (32761,), 32768, True, True, True, 8, 2),
+        ((32768,) + (1,) * 7, 32775, True, True, True, 8, 2),
     ],
 )
 @torch.inference_mode()
@@ -928,13 +1027,12 @@ def test_folded_prefill(
     alog = torch.linspace(-2, -1, heads, device="cuda")
     bias = torch.zeros(heads, device="cuda")
     g = (-alog.exp() * F.softplus(raw_a.float() + bias))[None].contiguous()
-    beta = raw_b.float().sigmoid().bfloat16().float()[None].contiguous()
+    beta = raw_b.float().sigmoid()[None].contiguous()
     offsets = (0, *torch.tensor(lengths).cumsum(0).tolist())
     cu = torch.tensor(offsets, device="cuda", dtype=torch.int32)
-    indices = torch.tensor(
-        [3, 1, 5, 0][: len(lengths)], device="cuda", dtype=torch.int32
-    )
-    initial = torch.randn(6, heads, 128, 128, device="cuda") * 0.01
+    slots = 2 * len(lengths) + 2
+    indices = torch.arange(slots - 1, 1, -2, device="cuda", dtype=torch.int32)
+    initial = torch.randn(slots, heads, 128, 128, device="cuda") * 0.01
     pool = initial.clone()
     valid = sum(lengths)
     kkt = ref_gdr.torch_kkt_fwd
@@ -1000,7 +1098,7 @@ def test_folded_prefill(
     assert_folded_close(pool[indices], expected_state.transpose(-1, -2))
     assert torch.equal(result[4], pool[indices])
     assert torch.count_nonzero(result[2][:, valid:]) == 0
-    unused = [i for i in range(6) if i not in indices.tolist()]
+    unused = [i for i in range(slots) if i not in indices.tolist()]
     assert torch.equal(pool[unused], initial[unused])
     for value, before in zip(inputs, saved):
         assert torch.equal(value, before)
@@ -1137,6 +1235,56 @@ def test_folded_packed_weak_gate_decay(folded_precision, heads, qk_heads):
     assert torch.all(pool[[0, 2]] == 1)
 
 
+@torch.inference_mode()
+def test_folded_packed_fp64_guard_uses_fp32_beta(folded_precision, monkeypatch):
+    from pla.prefill.flashqla import ops
+
+    tokens, heads, qk_heads = 8192, 24, 8
+    width = qk_heads * D
+    qkv = torch.zeros((tokens, 2 * width + heads * D), device="cuda", dtype=torch.bfloat16)
+    qkv[:, 0] = qkv[:, width] = 1
+    qkv[:, D + 1] = qkv[:, width + D + 1] = 1
+    qkv[:, 2 * width] = 0.125
+    raw_a = torch.full((tokens, heads), -18, device="cuda", dtype=qkv.dtype)
+    raw_b = torch.zeros_like(raw_a)
+    raw_b[:, 0] = 32
+    raw_b[:, 3] = 7
+    alog = torch.full((heads,), 8.0, device="cuda")
+    bias = torch.zeros_like(alog)
+    cu = torch.tensor([0, tokens], device="cuda", dtype=torch.int32)
+    slots = torch.tensor([1], device="cuda", dtype=torch.int32)
+    pool = torch.ones((3, heads, D, D), device="cuda")
+
+    def forward():
+        return gdn_prefill_packed_qkv_fwd(
+            qkv, raw_a, raw_b, alog, bias, cu,
+            num_qk_heads=qk_heads, num_v_heads=heads,
+            initial_state=pool, initial_state_indices=slots,
+            raw_cu_seqlens=(0, tokens),
+        )
+
+    with patch.object(ops.flashqla_cute, "folded_coefficients",
+                      wraps=ops.flashqla_cute.folded_coefficients) as folded, \
+         patch.object(ops.flashqla_cute, "_precision_repair",
+                      wraps=ops.flashqla_cute._precision_repair) as repair:
+        _, _, output, _, state = forward()
+        assert folded.call_count == repair.call_count == 1
+        repair_beta = repair.call_args.args[3]
+        assert repair_beta.dtype == torch.float32
+        assert repair_beta[0, 0, 0] == 1
+        assert repair_beta[0, 0, 3] < 1
+        assert repair_beta[0, 0, 3].bfloat16() == 1
+        assert repair.call_args.kwargs["flags"][0, 0]
+    folded_pool = pool.clone()
+    pool.fill_(1)
+    monkeypatch.setenv("PLA_FLASHQLA_TC02_FOLDED", "0")
+    _, _, original_output, _, original_state = forward()
+    assert torch.equal(output[:, :, :3], original_output[:, :, :3])
+    assert torch.equal(state[:, :3], original_state[:, :3])
+    assert torch.all(folded_pool[[0, 2]] == 1)
+    assert torch.all(pool[[0, 2]] == 1)
+
+
 @pytest.mark.parametrize(
     "length,auto_cp", [(98304, True), (131072, True), (262144, True), (131072, False)]
 )
@@ -1177,3 +1325,73 @@ def test_folded_long_weak_decay(folded_precision, length, auto_cp, heads, qk_hea
     assert_folded_close(pool[indices], state.transpose(-1, -2))
     assert result[4] is None
     assert torch.equal(pool[[0, 2]], before[[0, 2]])
+
+
+@torch.inference_mode()
+def test_prefill_graph_retains_warmed_metadata(folded_precision):
+    from pla.prefill.flashqla import ops, prefill_graph_metadata
+
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        def metadata(raw, heads):
+            cu = torch.tensor(raw, dtype=torch.int32, device="cuda")
+            return cu, raw, heads
+
+        def capture_values(case):
+            cu, raw, heads = case
+            chunks = ops._prepare_chunk_indices(cu, 32, raw)
+            plan = ops.calc_cp_seqs(cu, 32, heads, raw, num_k_heads=2, folded_prefill=True)
+            assert plan[0]
+            return chunks.clone(), plan[1].clone(), plan.warmup_metadata[0].clone()
+
+        first = metadata((0, 8192), 8)
+        graph = torch.cuda.CUDAGraph()
+        with prefill_graph_metadata() as prepare:
+            expected = capture_values(first)
+            for i in range(1, 7):
+                capture_values(metadata((0, 8192 + 32 * i), 8))
+            # The same offsets with a different head configuration need their
+            # own CP metadata entry.
+            capture_values(metadata((0, 8192), 16))
+            prepare()
+            with torch.cuda.graph(graph, stream=stream):
+                captured = capture_values(first)
+        for i in range(7, 13):
+            capture_values(metadata((0, 8192 + 32 * i), 8))
+        graph.replay()
+        assert all(torch.equal(a, b) for a, b in zip(captured, expected))
+
+
+@pytest.mark.parametrize("indexed,state_dtype", [
+    (True, torch.float32), (True, torch.bfloat16), (False, torch.float32),
+])
+@torch.inference_mode()
+def test_large_repair_preserves_live_initial_state(folded_precision, monkeypatch, indexed, state_dtype):
+    from pla.prefill.flashqla import ops
+
+    torch.manual_seed(20261121)
+    heads, qk_heads, tokens = 8, 2, 96
+    q = torch.randn((1, tokens, qk_heads, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn((1, tokens, heads, 128), device="cuda", dtype=q.dtype) * 0.1
+    g = torch.full((1, tokens, heads), -0.2, device="cuda")
+    beta = torch.full_like(g, 0.5)
+    raw = (0, 3, tokens)
+    cu = torch.tensor(raw, dtype=torch.int32, device="cuda")
+    indices = torch.tensor([2, 0], dtype=torch.int32, device="cuda") if indexed else None
+    state = torch.randn((4, heads, 128, 128), device="cuda", dtype=state_dtype) * 0.01
+    def run(pool):
+        return chunk_gated_delta_rule_fwd(
+            q, k, v, g, beta, initial_state=pool, initial_state_indices=indices,
+            cu_seqlens=cu, raw_cu_seqlens=raw, normalize_qk=True)
+    expected_pool = state.clone()
+    expected = run(expected_pool)
+    monkeypatch.setattr(ops, "_MAX_REPAIR_SNAPSHOT_BYTES", 0)
+    def unexpected_snapshot(*args, **kwargs):
+        pytest.fail("live repair allocated a snapshot")
+    monkeypatch.setattr(ops.flashqla_cute, "_precision_snapshot", unexpected_snapshot)
+    actual_pool = state.clone()
+    actual = run(actual_pool)
+    assert torch.equal(actual[2], expected[2])
+    assert torch.equal(actual[4], expected[4])
+    assert torch.equal(actual_pool, expected_pool)

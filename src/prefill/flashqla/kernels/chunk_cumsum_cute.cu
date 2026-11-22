@@ -110,6 +110,17 @@ struct QkPairOps<__ppu_bfloat16> {
     }
 };
 
+// Contiguous b16 tensors may start at an odd element storage offset. Keep
+// aligned pair loads, and use scalar loads when the pair address is unaligned.
+template <typename Element>
+__device__ __forceinline__ float2 qk_load_pair(const Element* pointer) {
+    using PairOps = QkPairOps<Element>;
+    using Pair = typename PairOps::Pair;
+    if ((reinterpret_cast<uintptr_t>(pointer) & (alignof(Pair) - 1)) == 0)
+        return PairOps::to_float2(*reinterpret_cast<const Pair*>(pointer));
+    return make_float2(qk_to_float(pointer[0]), qk_to_float(pointer[1]));
+}
+
 __device__ __forceinline__ float qk_warp_sum(float value) {
     for (int offset = 16; offset > 0; offset >>= 1)
         value += __shfl_down_sync(0xffffffff, value, offset);
@@ -144,7 +155,7 @@ __global__ void chunk_local_cumsum_cute_kernel(
     }
 }
 
-template <int CS, typename Element>
+template <int CS, typename Element, bool StageG = false, bool ParallelPrefix = false>
 __global__ void chunk_local_cumsum_qk_norm_cute_kernel(
     const float* __restrict__ g,
     const int* __restrict__ cu_seqlens,
@@ -174,8 +185,6 @@ __global__ void chunk_local_cumsum_qk_norm_cute_kernel(
             const int64_t base = (int64_t)qk_idx * D;
             using PairOps = QkPairOps<Element>;
             using Pair = typename PairOps::Pair;
-            const Pair* q_pairs = reinterpret_cast<const Pair*>(q + base);
-            const Pair* k_pairs = reinterpret_cast<const Pair*>(k + base);
             Pair* q_norm_pairs = reinterpret_cast<Pair*>(q_norm + base);
             Pair* k_norm_pairs = reinterpret_cast<Pair*>(k_norm + base);
             float q_sq = 0.0f;
@@ -184,8 +193,8 @@ __global__ void chunk_local_cumsum_qk_norm_cute_kernel(
             float k_values[D / 32];
 #pragma unroll
             for (int d_pair = lane; d_pair < D / 2; d_pair += 32) {
-                const float2 qv = PairOps::to_float2(q_pairs[d_pair]);
-                const float2 kv = PairOps::to_float2(k_pairs[d_pair]);
+                const float2 qv = qk_load_pair(q + base + d_pair * 2);
+                const float2 kv = qk_load_pair(k + base + d_pair * 2);
                 const int value_idx = (d_pair / 32) * 2;
                 q_values[value_idx] = qv.x;
                 q_values[value_idx + 1] = qv.y;
@@ -209,6 +218,34 @@ __global__ void chunk_local_cumsum_qk_norm_cute_kernel(
         }
     }
 
+    // Four output rows per CTA let separate token/head owners compute short
+    // prefixes concurrently. Each owner adds g in the original token order.
+    if constexpr (ParallelPrefix) {
+        constexpr int rows_per_cta = 4;
+        constexpr int ctas_per_chunk = CS / rows_per_cta;
+        const int chunk_id = blockIdx.x / ctas_per_chunk;
+        if (chunk_id >= num_chunks) return;
+        const int b = chunk_indices[chunk_id * 2];
+        const int chunk = chunk_indices[chunk_id * 2 + 1];
+        const int start = cu_seqlens[b] + chunk * CS;
+        const int count = min(CS, cu_seqlens[b + 1] - start);
+        const int first_row = (blockIdx.x % ctas_per_chunk) * rows_per_cta;
+        if (first_row >= count) return;
+        const int end_row = min(count, first_row + rows_per_cta);
+        extern __shared__ float prefix_g[];
+        for (int i = threadIdx.x; i < end_row * H; i += blockDim.x)
+            prefix_g[i] = g[(int64_t)start * H + i];
+        __syncthreads();
+        for (int i = threadIdx.x; i < (end_row - first_row) * H; i += blockDim.x) {
+            const int row = first_row + i / H;
+            const int head = i % H;
+            float sum = 0.0f;
+            for (int token = 0; token <= row; ++token)
+                sum += prefix_g[token * H + head];
+            g_cum[(int64_t)(start + row) * H + head] = sum;
+        }
+        return;
+    }
     // Cumsum is independent of Q/K normalization. The following KKT launch on
     // the same stream is the global publication boundary for all three outputs.
     if ((int)blockIdx.x < num_chunks) {
@@ -218,12 +255,31 @@ __global__ void chunk_local_cumsum_qk_norm_cute_kernel(
         const int seq_end = cu_seqlens[b + 1];
         const int c_start = seq_start + chunk * CS;
         const int c_end = min(c_start + CS, seq_end);
+        if constexpr (StageG) {
+            // This specialization is host-gated to H=16. Every CTA cooperatively
+            // loads the complete valid chunk; head owners retain the exact
+            // original token-ordered FP32 additions and stores.
+            __shared__ float staged_g[CS * 16];
+            const int count = c_end - c_start;
+            for (int i = threadIdx.x; i < count * 16; i += blockDim.x)
+                staged_g[i] = g[(int64_t)c_start * 16 + i];
+            __syncthreads();
+            if (threadIdx.x < 16) {
+                const int h = threadIdx.x;
+                float acc = 0.0f;
+                for (int t = c_start; t < c_end; ++t) {
+                    acc += staged_g[(t - c_start) * 16 + h];
+                    g_cum[(int64_t)t * 16 + h] = acc;
+                }
+            }
+        } else {
         for (int h = threadIdx.x; h < H; h += blockDim.x) {
             float acc = 0.0f;
             for (int t = c_start; t < c_end; ++t) {
                 acc += g[(int64_t)t * H + h];
                 g_cum[(int64_t)t * H + h] = acc;
             }
+        }
         }
     }
 }
@@ -365,7 +421,8 @@ void launch_chunk_local_cumsum_qk_norm_cute(
     int H,
     int Hg,
     int dtype_tag,
-    hggcStream_t stream
+    hggcStream_t stream,
+    bool stage_g
 ) {
     constexpr int CS = 32;
     constexpr int QK_PER_BLOCK = 16;
@@ -374,6 +431,42 @@ void launch_chunk_local_cumsum_qk_norm_cute(
     if (grid_size < 1) return;
     dim3 grid(grid_size);
     dim3 block(256);
+    if (stage_g && (T <= 48 || (H == 8 && ((Hg == 4 && T == 920) || (Hg == 2 && T == 1041))) ||
+                    (H == 24 && Hg == 8 && T == 823) ||
+                    (H == 16 && Hg == 8 && T == 508))) {
+        constexpr int ctas_per_chunk = CS / 4;
+        const int prefix_grid = num_chunks * ctas_per_chunk;
+        const dim3 short_grid(grid_size > prefix_grid ? grid_size : prefix_grid);
+        const size_t shared_bytes = CS * H * sizeof(float);
+        if (dtype_tag == 0)
+            flashqla_cute::chunk_local_cumsum_qk_norm_cute_kernel<CS, __half, false, true>
+                <<<short_grid, block, shared_bytes, stream>>>(g, cu_seqlens, chunk_indices, g_cum,
+                    static_cast<const __half*>(q), static_cast<const __half*>(k),
+                    static_cast<__half*>(q_norm), static_cast<__half*>(k_norm),
+                    num_chunks, T, H, Hg, 1e-6f);
+        else
+            flashqla_cute::chunk_local_cumsum_qk_norm_cute_kernel<CS, __ppu_bfloat16, false, true>
+                <<<short_grid, block, shared_bytes, stream>>>(g, cu_seqlens, chunk_indices, g_cum,
+                    static_cast<const __ppu_bfloat16*>(q), static_cast<const __ppu_bfloat16*>(k),
+                    static_cast<__ppu_bfloat16*>(q_norm), static_cast<__ppu_bfloat16*>(k_norm),
+                    num_chunks, T, H, Hg, 1e-6f);
+        return;
+    }
+    if (stage_g) {
+        if (dtype_tag == 0)
+            flashqla_cute::chunk_local_cumsum_qk_norm_cute_kernel<CS, __half, true>
+                <<<grid, block, 0, stream>>>(g, cu_seqlens, chunk_indices, g_cum,
+                    static_cast<const __half*>(q), static_cast<const __half*>(k),
+                    static_cast<__half*>(q_norm), static_cast<__half*>(k_norm),
+                    num_chunks, T, H, Hg, 1e-6f);
+        else
+            flashqla_cute::chunk_local_cumsum_qk_norm_cute_kernel<CS, __ppu_bfloat16, true>
+                <<<grid, block, 0, stream>>>(g, cu_seqlens, chunk_indices, g_cum,
+                    static_cast<const __ppu_bfloat16*>(q), static_cast<const __ppu_bfloat16*>(k),
+                    static_cast<__ppu_bfloat16*>(q_norm), static_cast<__ppu_bfloat16*>(k_norm),
+                    num_chunks, T, H, Hg, 1e-6f);
+        return;
+    }
     if (dtype_tag == 0) {
         flashqla_cute::chunk_local_cumsum_qk_norm_cute_kernel<CS, __half>
             <<<grid, block, 0, stream>>>(
