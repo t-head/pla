@@ -68,7 +68,6 @@
 #include <memory>
 #include <mutex>
 #include <set>
-#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -78,6 +77,7 @@
 #include "prefill/flashkdapro/common/runtime_arch.h"
 #include "prefill/flashkdapro/common/strided_inputs.h"
 #include "prefill/flashkdapro/common/graph_payload_owner.h"
+#include "prefill/flashkdapro/common/tc02_prefill_cp_policy.h"
 #include "op_forge_case.h"
 #include "../../sanity_check.h"
 #include "../../../bypass_exec.h"
@@ -840,8 +840,8 @@ int cp_cu_count() {
     return cached[device];
 }
 
-// The original public calls supplied these sequence offsets on the host.
-// Match complete offsets and geometry before applying a measured CP plan.
+// Trusted host offsets allow tc02 to select a CP schedule before any
+// device-side metadata read.
 CpConfig tc02_measured_cp_config(CpConfig config, int T, int H, int N, bool varlen,
         flashkda::host_runtime::PpuArchitecture arch,
         const c10::optional<std::vector<int64_t>>& raw, double lower_bound) {
@@ -1039,31 +1039,29 @@ CpConfig tc02_measured_cp_config(CpConfig config, int T, int H, int N, bool varl
             return config;
         }
     }
-    // Each row records the best verified CP layout for a complete packed
-    // geometry. Search the smaller H/N/T key before comparing all offsets.
-    static constexpr Entry calibrated[] = {
-#include "prefill/flashkdapro/common/tc02_prefill_cp_schedules.inc"
-    };
-    if (H <= 32 && N <= 16 && T <= 65536) {
-        const auto key = std::make_tuple(H, N, T);
-        auto it = std::lower_bound(std::begin(calibrated), std::end(calibrated), key,
-            [](const Entry& e, const auto& lhs) { return std::tie(e.h, e.n, e.t) < lhs; });
-        for (; it != std::end(calibrated) && std::tie(it->h, it->n, it->t) == key; ++it) {
-            if (matches(*it)) {
-                apply(*it);
-                return config;
-            }
-        }
-    }
-    if (H > 32 || N > 16 || T < 4096 || T > 65536 ||
+    if (H > 32 || N <= 0 || N > 16 || T < 320 || T > 65536 ||
         raw->front() != 0 || raw->back() != T || config.bt64_cp)
         return config;
     int64_t longest = 0;
+    int shortest_tiles = T;
+    int total_tiles = 0;
     for (int i = 0; i < N; ++i) {
         const int64_t start = (*raw)[i], end = (*raw)[i + 1];
         if (start < 0 || end < start || end > T) return config;
         longest = std::max(longest, end - start);
+        const int tiles = int((end - start + KDA_CHUNK - 1) / KDA_CHUNK);
+        shortest_tiles = std::min(shortest_tiles, tiles);
+        total_tiles += tiles;
     }
+    if (shortest_tiles > 0) {
+        const auto policy = flashkda::host_runtime::tc02_prefill_cp_policy(
+            H, N, int((longest + KDA_CHUNK - 1) / KDA_CHUNK), shortest_tiles, total_tiles);
+        if (policy.mult) {
+            apply({H, N, T, policy.mult, {}, policy.min_segment_tiles, policy.short_k1_lb8, 64});
+            return config;
+        }
+    }
+    if (T < 4096) return config;
     // The full-DV pass wins on long chains. A finer DV split exposes more
     // independent work before that path amortizes its prescan.
     const bool long_chain = longest >= 8192;
