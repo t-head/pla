@@ -41,6 +41,7 @@
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDACachingAllocator.h>
 #include "launchers.h"
+#include "prefill_schedule.h"
 #include "workspace_layout.h"
 #include "../../common/strided_inputs.h"
 #include <array>
@@ -165,7 +166,8 @@ CpAlgorithm select_cp_algorithm(int segments, int heads, int64_t tokens) {
     if (automatic && tokens <= 65536 &&
         ((heads == 4 && segments == 1 && tokens > 0 && tokens <= 2048) ||
          (heads == 4 && segments == 5 && tokens >= 12288) ||
-         ((heads == 6 || heads == 8) && segments == 1 && tokens > 0)))
+         ((heads == 3 || heads == 6 || heads == 8) && segments == 1 && tokens > 0) ||
+         (heads == 16 && segments == 1 && tokens >= 8192 && tokens <= 32768)))
       return CpAlgorithm::State;
     return CpAlgorithm::Legacy;
   }
@@ -198,11 +200,13 @@ CpSelection select_cp(const Arguments& a, const Shape& s, const Launchers& table
         return {1, 1, -1};
       return {};
     }
-    split = select_fla_cp_auto_split(s.h, (*a.raw)[1] - (*a.raw)[0]);
-    // H4 AUTO buckets are qualified for state passing only. An explicit
-    // legacy algorithm retains the serial AUTO path for both H4 buckets.
+    const int64_t tokens = (*a.raw)[1] - (*a.raw)[0];
+    if ((s.h == 3 || s.h == 16) && tokens != s.t) return {};
+    split = select_fla_cp_auto_split(s.h, tokens);
+    // H3, H4 and H16 AUTO buckets use state passing. Keep explicit legacy
+    // selections on the serial AUTO path.
     const char* algorithm = std::getenv("PLA_FLASHKDA_TC01_FLA_CP_ALGO");
-    if (s.h == 4 && split && algorithm && algorithm[0] &&
+    if ((s.h == 3 || s.h == 4 || s.h == 16) && split && algorithm && algorithm[0] &&
         std::strcmp(algorithm, "state") != 0) return {};
     if (!split) return {};
   } else {
@@ -217,7 +221,7 @@ CpSelection select_cp(const Arguments& a, const Shape& s, const Launchers& table
     require(a.raw.has_value(), "forced FLA CP requires trusted raw_cu_seqlens");
     require(s.n == 1, "forced FLA CP currently supports exactly one sequence");
     require(table.cp_recurrence_output != nullptr,
-            "forced FLA CP supports only H4/H6/H8/H12 static kernels");
+            "forced FLA CP requires a built static CP kernel (H3/H4/H6/H8/H12/H16)");
   }
   const int64_t tokens = (*a.raw)[1] - (*a.raw)[0];
   if (tokens == 0) return {};
@@ -231,13 +235,14 @@ CpSelection select_cp(const Arguments& a, const Shape& s, const Launchers& table
 
 std::shared_mutex init_mutex;
 std::set<std::pair<int, int>> initialized;
-std::set<std::pair<int, int>> cp_initialized;
+std::set<std::pair<int, int>> cp_initialized, packed_initialized;
 std::set<int> devices;
-void initialize(int device, const Launchers& table, bool capture, bool require_cp) {
+void initialize(int device, const Launchers& table, bool capture, bool require_cp, bool require_packed = false) {
   const auto key = std::make_pair(device, table.heads);
   {
     std::shared_lock lock(init_mutex);
-    if (initialized.count(key) && (!require_cp || cp_initialized.count(key))) return;
+    if (initialized.count(key) && (!require_cp || cp_initialized.count(key)) &&
+        (!require_packed || packed_initialized.count(key))) return;
   }
   TORCH_CHECK(!capture, "the tc01 FLA monolithic extension and the selected CP path must be warmed up outside Graph capture");
   std::unique_lock lock(init_mutex);
@@ -258,6 +263,13 @@ void initialize(int device, const Launchers& table, bool capture, bool require_c
     TORCH_INTERNAL_ASSERT(table.configure_cp);
     cuda_check(table.configure_cp(), "CP recurrence/output configure");
     cp_initialized.insert(key);
+  }
+  if (require_packed && !packed_initialized.count(key)) {
+    TORCH_INTERNAL_ASSERT(table.configure_packed_fused);
+    cuda_check(table.configure_packed_fused(), "packed recurrence/output configure");
+    if (table.configure_packed_fused_bv16)
+      cuda_check(table.configure_packed_fused_bv16(), "BV16 packed recurrence/output configure");
+    packed_initialized.insert(key);
   }
 }
 
@@ -363,7 +375,18 @@ void forward(Arguments a) {
       ? (a.raw ? select_cp_algorithm(cp.count, s.h, a.raw->back() - a.raw->front())
                : CpAlgorithm::State)
       : CpAlgorithm::Legacy;
-  const WorkspaceLayout layout(s.t, s.h, s.n, s.chunks, !a.raw, cp.count);
+  const char* cp_mode = std::getenv("PLA_FLASHKDA_TC01_FLA_CP");
+  const bool automatic = !cp_mode || !cp_mode[0] || std::strcmp(cp_mode, "auto") == 0;
+  const bool complete = a.raw && a.raw->back() == s.t;
+  auto schedule = automatic && complete && table.heads == s.h
+      ? select_prefill_schedule(s.h, s.n, s.t) : PrefillSchedule{};
+  if (automatic && complete && s.n == 1 && s.t > 0 && s.t <= 32 &&
+      (table.heads == s.h || s.h == 3))
+    schedule.short_path = ShortPrefill::Direct;
+  const auto packed_launch = schedule.packed == PackedPrefill::Bv16 ? table.packed_fused_bv16
+      : schedule.packed == PackedPrefill::Bv32 ? table.packed_fused : nullptr;
+  const bool packed_fused = packed_launch && !cp.active() && s.chunks > 0;
+  const WorkspaceLayout layout(s.t, s.h, s.n, s.chunks, !a.raw, cp.count, packed_fused);
   // FLA dispatch also keeps the branch's value diagnostics; capture only checks metadata and never reads device values.
   const pla::sanity::Context sanity("flashkda_tc01_fla", a.q);
   if (sanity) {
@@ -388,7 +411,45 @@ void forward(Arguments a) {
   hggcStreamCaptureStatus status{};
   cuda_check(hggcStreamIsCapturing(reinterpret_cast<hggcStream_t>(stream.stream()), &status), "capture status query failed");
   const bool capture = status != hggcStreamCaptureStatusNone;
-  initialize(a.q.get_device(), table, capture, cp.active());
+  const bool use_short_direct = schedule.short_path != ShortPrefill::None &&
+      a.v.is_contiguous();
+  initialize(a.q.get_device(), table, capture, cp.active() && !use_short_direct, packed_fused);
+  if (use_short_direct) {
+    auto native_stream = reinterpret_cast<hggcStream_t>(stream.stream());
+    auto qn = at::empty(a.q.sizes(), a.q.options());
+    auto kn = at::empty(a.k.sizes(), a.k.options());
+    const auto q_stride = flashkda::layout::token_stride(a.q);
+    const auto k_stride = flashkda::layout::token_stride(a.k);
+    const bool half_warp = schedule.short_path == ShortPrefill::HalfWarp;
+    const bool prepared = schedule.short_path != ShortPrefill::Direct;
+    at::Tensor decay, beta;
+    if (prepared) {
+      decay = at::empty(a.q.sizes(), a.q.options().dtype(at::kFloat));
+      beta = at::empty(a.beta.sizes(), a.beta.options().dtype(at::kFloat));
+      cuda_check(launch_fla_short_prepare(
+          a.q.data_ptr(), qn.data_ptr(), a.k.data_ptr(), kn.data_ptr(), s.t * s.h,
+          s.h, q_stride, k_stride, a.g.data_ptr(), a.beta.data_ptr(),
+          a.a_log.data_ptr<float>(), a.dt_bias.data_ptr<float>(), a.beta.stride(0),
+          a.lower_bound, decay.data_ptr<float>(), beta.data_ptr<float>(), native_stream),
+          "short L2 + decay and beta");
+    } else {
+      cuda_check(launch_fla_l2norm2_bf16_d128_bt16(
+          a.q.data_ptr(), qn.data_ptr(), a.k.data_ptr(), kn.data_ptr(),
+          s.t * s.h, s.h, q_stride, k_stride, native_stream), "short L2 q+k");
+    }
+    const bool state_fp32 = a.initial.defined() ? a.initial.scalar_type() == at::kFloat
+        : a.final.defined() && a.final.scalar_type() == at::kFloat;
+    cuda_check(launch_fla_short_direct(
+        qn.data_ptr(), kn.data_ptr(), a.v.data_ptr(),
+        prepared ? decay.data_ptr() : a.g.data_ptr(), prepared ? beta.data_ptr() : a.beta.data_ptr(),
+        a.beta.stride(0), a.a_log.data_ptr<float>(), a.dt_bias.data_ptr<float>(),
+        a.out.data_ptr(), s.t, s.h, a.initial.defined() ? a.initial.data_ptr() : nullptr,
+        a.final.defined() ? a.final.data_ptr() : nullptr, state_fp32,
+        a.indices.defined() ? a.indices.data_ptr<int32_t>() : nullptr,
+        a.lower_bound, a.scale, prepared, half_warp, native_stream), "short recurrence and output");
+    staged.publish();
+    return;
+  }
   auto plan = a.raw ? trusted_plan(a, s, reinterpret_cast<hggcStream_t>(stream.stream()), capture) : nullptr;
   auto arena = at::empty({layout.bytes}, a.q.options().dtype(at::kByte));
   record_inputs(a, stream);
@@ -461,7 +522,8 @@ void forward(Arguments a) {
     // Prepared CP consumers need no workspace memset: the token stage writes
     // Aqk zeros before its diagonal tiles, the solve reads akkd's solved
     // diagonal only for live rows, and recompute zero-fills the upper inverse.
-    if (!(prepared_n1 && cp.active()))
+    const bool fuse_front = schedule.fused_front && !prepared_n1;
+    if (!fuse_front && !(prepared_n1 && cp.active()))
       zero(arena, layout.zeros, reinterpret_cast<hggcStream_t>(stream.stream()));
     // beta no longer does a host copy+sigmoid: the consumer kernels compute it from raw bf16 with the same inline implementation.
     const auto* beta_raw = static_cast<const uint16_t*>(a.beta.data_ptr());
@@ -474,12 +536,22 @@ void forward(Arguments a) {
     const int64_t q_stride = flashkda::layout::token_stride(a.q);
     const int64_t k_stride = flashkda::layout::token_stride(a.k);
     const int64_t v_stride = flashkda::layout::token_stride(a.v);
-    if (!prepared_n1)
-      cuda_check(launch_fla_l2norm2_bf16_d128_bt16(a.q.data_ptr(), qn, a.k.data_ptr(), kn,
+    if (fuse_front) {
+      cuda_check(launch_fla_front_prepare(
+          a.q.data_ptr(), qn, a.k.data_ptr(), kn, s.t * s.h, s.h,
+          q_stride, k_stride, pointer(arena, layout.zeros), layout.zeros.bytes,
+          a.g.data_ptr(), a.a_log.data_ptr<float>(), a.dt_bias.data_ptr<float>(),
+          gate, cu, chunks, s.n, s.chunks, s.t, a.lower_bound,
+          reinterpret_cast<hggcStream_t>(stream.stream())), "fused front preparation");
+    } else {
+      if (!prepared_n1)
+        cuda_check(launch_fla_l2norm2_bf16_d128_bt16(a.q.data_ptr(), qn, a.k.data_ptr(), kn,
                                                    s.t * s.h, s.h, q_stride, k_stride,
                                                    reinterpret_cast<hggcStream_t>(stream.stream())), "L2 q+k");
-    cuda_check(table.gate(a.g.data_ptr(), a.a_log.data_ptr<float>(), a.dt_bias.data_ptr<float>(), gate,
-                         s.t, cu, chunks, s.n, s.chunks, s.h, a.lower_bound, reinterpret_cast<hggcStream_t>(stream.stream())), "gate");
+      cuda_check(table.gate(a.g.data_ptr(), a.a_log.data_ptr<float>(), a.dt_bias.data_ptr<float>(), gate,
+                           s.t, cu, chunks, s.n, s.chunks, s.h, a.lower_bound,
+                           reinterpret_cast<hggcStream_t>(stream.stream())), "gate");
+    }
     if (prepared_n1) {
       TORCH_INTERNAL_ASSERT(layout.w.bytes == s.t * s.h * 128 * 2 &&
                             layout.u.bytes == layout.w.bytes &&
@@ -490,7 +562,8 @@ void forward(Arguments a) {
                           reinterpret_cast<hggcStream_t>(stream.stream())), "L2 + token + prepare");
     } else {
       cuda_check(table.token(qn, kn, gate, beta_raw, beta_stride, aqk, akkd, qg, a.scale, cu,
-                            s.n, s.t, s.h, reinterpret_cast<hggcStream_t>(stream.stream())), "token");
+                            s.n, s.t, s.h, schedule.packed_tokens ? chunks : nullptr,
+                            s.chunks, reinterpret_cast<hggcStream_t>(stream.stream())), "token");
     }
     if (prepared_n1) {
       cuda_check(table.inter_solve_prepared(qn, kn, gate, beta_raw, beta_stride, akkd, aqk, inverse,
@@ -498,12 +571,17 @@ void forward(Arguments a) {
                           reinterpret_cast<hggcStream_t>(stream.stream())), "inter prepared");
     } else {
       cuda_check(table.inter(qn, kn, gate, beta_raw, beta_stride, akkd, aqk, inverse, a.scale, cu, chunks,
-                            s.chunks, s.t, s.n, s.h, reinterpret_cast<hggcStream_t>(stream.stream())), "inter");
+                            s.chunks, s.t, s.n, s.h, schedule.wide_inter,
+                            reinterpret_cast<hggcStream_t>(stream.stream())), "inter");
     }
     cuda_check(table.recompute(kn, a.v.data_ptr(), v_stride, beta_raw, beta_stride, inverse, gate, w, u, kg,
-                              cu, chunks,
-                              s.chunks, s.t, s.n, s.h, reinterpret_cast<hggcStream_t>(stream.stream())), "recompute");
-    if (cp.active()) {
+                              cu, chunks, s.chunks, s.t, s.n, s.h,
+                              reinterpret_cast<hggcStream_t>(stream.stream())), "recompute");
+    if (packed_fused) {
+      cuda_check(packed_launch(qg, aqk, a.out.data_ptr(), kg, u, w, gate,
+          initial, final, state_fp32, indices, cu, offsets, s.t, s.n,
+          reinterpret_cast<hggcStream_t>(stream.stream())), "packed recurrence + output");
+    } else if (cp.active()) {
       auto bias = pointer<float>(arena, layout.cp_bias);
       auto transition_and_carries = pointer<float>(arena, layout.cp_state_passing);
       auto reserved = pointer<int>(arena, layout.cp_executed);

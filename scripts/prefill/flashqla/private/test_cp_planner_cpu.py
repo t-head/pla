@@ -1309,6 +1309,8 @@ class FatBinaryKernelContractTest(unittest.TestCase):
     # The callee closes the text before "<<<": a name plus optional template
     # arguments, which may span several lines.
     CALLEE = re.compile(r"\b([A-Za-z_]\w*)\s*(?:<[^;{}]*?>\s*)?$")
+    FLA_HEAD_SYMBOL = re.compile(
+        r"\bFLA_JOIN_HEAD\s*\(\s*([A-Za-z_]\w*)\s*,\s*(\w+)\s*\)")
     LAUNCH_BOUNDS = re.compile(r"__launch_bounds__\s*\([^()]*\)")
     WINDOW = 6
 
@@ -1367,13 +1369,17 @@ class FatBinaryKernelContractTest(unittest.TestCase):
                 frame["names"].setdefault(len(frame["conds"]) - 1, set()).add(name)
         return self._missing(closed)
 
+    def _expand_fla_head_symbols(self, text):
+        # Keep FLA_HEADS symbolic because the scanner runs before preprocessing.
+        return self.FLA_HEAD_SYMBOL.sub(r"\1__fla_h\2", text)
+
     def _one_image_only(self, lines):
         def defined(lines, index):
             if "__global__" not in lines[index]:
                 return None
             window = self.LAUNCH_BOUNDS.sub(
                 " ", "\n".join(lines[index:index + self.WINDOW]))
-            kernel = self.KERNEL.search(window)
+            kernel = self.KERNEL.search(self._expand_fla_head_symbols(window))
             return kernel.group(1) if kernel else None
 
         return self._walk(lines, defined)
@@ -1390,7 +1396,8 @@ class FatBinaryKernelContractTest(unittest.TestCase):
             return None
         start = max(0, index - self.WINDOW + 1)
         head = [text.rstrip().removesuffix("\\") for text in lines[start:index]]
-        found = self.CALLEE.search(" ".join(head + [line[:line.index("<<<")]]))
+        prefix = " ".join(head + [line[:line.index("<<<")]])
+        found = self.CALLEE.search(self._expand_fla_head_symbols(prefix))
         return found.group(1) if found else None
 
     def _launched_in_one_image_only(self, lines):
@@ -1531,6 +1538,25 @@ __global__ void k(float* x) {}
         self.assertEqual(
             self._launched_in_one_image_only(self._uncommented(template)),
             ["split_kernel under #if PH_XY_FACTOR"])
+
+    def test_scanner_checks_head_specialized_symbols_across_images(self):
+        guarded = """
+#if defined(FLASHQLA_ARCH_150)
+__global__ void FLA_JOIN_HEAD(chunk_kernel, 8)(float* x) {}
+  FLA_JOIN_HEAD(
+      chunk_kernel, 8)<<<grid, block>>>(x);
+#else
+__global__ void FLA_JOIN_HEAD(chunk_kernel, 16)(float* x) {}
+  FLA_JOIN_HEAD(chunk_kernel, 16)<<<grid, block>>>(x);
+#endif
+"""
+        lines = self._uncommented(guarded)
+        missing = [
+            "chunk_kernel__fla_h16 under #if defined(FLASHQLA_ARCH_150)",
+            "chunk_kernel__fla_h8 under #if defined(FLASHQLA_ARCH_150)",
+        ]
+        self.assertEqual(self._one_image_only(lines), missing)
+        self.assertEqual(self._launched_in_one_image_only(lines), missing)
 
 
 if __name__ == "__main__":

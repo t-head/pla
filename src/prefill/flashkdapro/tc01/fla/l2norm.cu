@@ -42,7 +42,7 @@
 
 #include <cstdint>
 
-#include "cute/tensor.hpp"
+#include "gate_scan.cuh"
 
 namespace fla_l2_cute {
 
@@ -122,14 +122,31 @@ __global__ void l2norm_bf16_d128_bt16_kernel(
 // (x0, y0) and the second half (x1, y1); the per-row math is identical to the single-pair kernel.
 // Rows are (token, head) pairs in token-major order. With Strided the inputs are [T, heads, 128] views
 // with a token stride (x0_stride / x1_stride elements) over packed head rows; the outputs stay dense.
-template <bool Strided>
-__global__ void l2norm2_bf16_d128_bt16_kernel(
+struct ShortGate {
+  const __ppu_bfloat16* raw_gate;
+  const __ppu_bfloat16* raw_beta;
+  const float* a_log;
+  const float* bias;
+  float* decay;
+  float* beta;
+  int64_t beta_stride;
+  float lower;
+};
+
+template <bool Strided, bool Clear, bool PrepareGate = false>
+__device__ __forceinline__ void normalize_pair(
     const __ppu_bfloat16* __restrict__ x0,
     __ppu_bfloat16* __restrict__ y0,
     const __ppu_bfloat16* __restrict__ x1,
     __ppu_bfloat16* __restrict__ y1,
-    int64_t rows_each, int heads, int64_t x0_stride, int64_t x1_stride) {
+    int64_t rows_each, int heads, int64_t x0_stride, int64_t x1_stride,
+    uint4* scratch, int64_t vectors, int blocks, ShortGate gate = {}) {
   using namespace cute;
+  if constexpr (Clear) {
+    const int64_t thread = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    for (int64_t i = thread; i < vectors; i += int64_t(blocks) * blockDim.x)
+      scratch[i] = make_uint4(0, 0, 0, 0);
+  }
 
   const int row_in_block = static_cast<int>(threadIdx.x) >> 4;
   const int lane_in_row = static_cast<int>(threadIdx.x) & 15;
@@ -184,7 +201,73 @@ __global__ void l2norm2_bf16_d128_bt16_kernel(
         values[pair_index * 2 + 1] / denominator));
   }
   *reinterpret_cast<uint4*>(&gY(local_row, first_d)) = packed_output.vector;
+  if constexpr (PrepareGate) {
+    if (!second) {
+      const int head = local_row % heads;
+      const int64_t offset = local_row * kD + first_d;
+      const int64_t token = local_row / heads;
+      Bf16x8 packed_gate;
+      packed_gate.vector = *reinterpret_cast<const uint4*>(gate.raw_gate + offset);
+      const float a = expf(gate.a_log[head]);
+      const float* bias = gate.bias + head * kD + first_d;
+      float decay[8];
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const float2 g = __bfloat1622float2(packed_gate.pairs[i]);
+        decay[i * 2] = expf(gate.lower / (1.0f + expf(-a * (g.x + bias[i * 2]))));
+        decay[i * 2 + 1] = expf(gate.lower / (1.0f + expf(-a * (g.y + bias[i * 2 + 1]))));
+      }
+      auto* output = reinterpret_cast<float4*>(gate.decay + offset);
+      output[0] = make_float4(decay[0], decay[1], decay[2], decay[3]);
+      output[1] = make_float4(decay[4], decay[5], decay[6], decay[7]);
+      if (lane_in_row == 0) {
+        const float beta = __bfloat162float(gate.raw_beta[token * gate.beta_stride + head]);
+        gate.beta[local_row] = 1.0f / (1.0f + expf(-beta));
+      }
+    }
+  }
 }
+
+template <bool Strided>
+__global__ void l2norm2_bf16_d128_bt16_kernel(
+    const __ppu_bfloat16* __restrict__ x0, __ppu_bfloat16* __restrict__ y0,
+    const __ppu_bfloat16* __restrict__ x1, __ppu_bfloat16* __restrict__ y1,
+    int64_t rows_each, int heads, int64_t x0_stride, int64_t x1_stride) {
+  normalize_pair<Strided, false>(
+      x0, y0, x1, y1, rows_each, heads, x0_stride, x1_stride, nullptr, 0, gridDim.x);
+}
+
+template <bool Strided>
+__global__ void prepare_short(
+    const __ppu_bfloat16* q, __ppu_bfloat16* qn,
+    const __ppu_bfloat16* k, __ppu_bfloat16* kn, int64_t rows_each,
+    int heads, int64_t q_stride, int64_t k_stride, ShortGate gate) {
+  normalize_pair<Strided, false, true>(
+      q, qn, k, kn, rows_each, heads, q_stride, k_stride, nullptr, 0, gridDim.x, gate);
+}
+
+template <bool Strided, bool DefaultBound>
+__global__ void prepare_front(
+    const __ppu_bfloat16* q, __ppu_bfloat16* qn,
+    const __ppu_bfloat16* k, __ppu_bfloat16* kn, int64_t rows_each,
+    int heads, int64_t q_stride, int64_t k_stride, uint4* scratch, int64_t vectors,
+    const __ppu_bfloat16* g, const float* a_log, const float* bias, float* gates,
+    const int32_t* cu, const int32_t* indices, int n, int chunks, int tokens,
+    float lower, int norm_blocks) {
+  if (blockIdx.x < norm_blocks) {
+    normalize_pair<Strided, true>(
+        q, qn, k, kn, rows_each, heads, q_stride, k_stride, scratch, vectors,
+        norm_blocks);
+  } else {
+    const int tile = blockIdx.x - norm_blocks;
+    const int chunk = (tile / 4) % chunks;
+    const int head = (tile / 4) / chunks;
+    __shared__ float carry[16 * 32];
+    fla_gate::scan<DefaultBound>(g, a_log, bias, gates, tokens, cu, indices, n, heads,
+                           lower, chunk, tile % 4, head, carry);
+  }
+}
+
 
 }  // namespace fla_l2_cute
 
@@ -217,5 +300,49 @@ hggcError_t launch_fla_l2norm2_bf16_d128_bt16(
       static_cast<__ppu_bfloat16*>(y0),
       static_cast<const __ppu_bfloat16*>(x1),
       static_cast<__ppu_bfloat16*>(y1), rows_each, heads, x0_stride, x1_stride);
+  return hggcGetLastError();
+}
+
+hggcError_t launch_fla_front_prepare(
+    const void* q, void* qn, const void* k, void* kn, int64_t rows_each,
+    int heads, int64_t q_stride, int64_t k_stride, void* scratch, int64_t bytes,
+    const void* g, const float* a_log, const float* bias, float* gates,
+    const int32_t* cu, const int32_t* indices, int n, int chunks, int tokens,
+    float lower, hggcStream_t stream) {
+  using namespace fla_l2_cute;
+  const int norm_blocks = (2 * rows_each + kBlockRows - 1) / kBlockRows;
+  const int packed = heads * kD;
+  const bool strided = q_stride != packed || k_stride != packed;
+  auto kernel = lower == -5.0f
+      ? (strided ? prepare_front<true, true> : prepare_front<false, true>)
+      : (strided ? prepare_front<true, false> : prepare_front<false, false>);
+  kernel<<<dim3(norm_blocks + 4 * heads * chunks), dim3(kThreads), 0, stream>>>(
+      static_cast<const __ppu_bfloat16*>(q), static_cast<__ppu_bfloat16*>(qn),
+      static_cast<const __ppu_bfloat16*>(k), static_cast<__ppu_bfloat16*>(kn),
+      rows_each, heads, q_stride, k_stride, static_cast<uint4*>(scratch),
+      bytes / sizeof(uint4), static_cast<const __ppu_bfloat16*>(g), a_log, bias,
+      gates, cu, indices, n, chunks, tokens, lower, norm_blocks);
+  return hggcGetLastError();
+}
+
+hggcError_t launch_fla_short_prepare(
+    const void* q, void* qn, const void* k, void* kn, int64_t rows_each,
+    int heads, int64_t q_stride, int64_t k_stride, const void* raw_gate,
+    const void* raw_beta, const float* a_log, const float* bias,
+    int64_t beta_stride, float lower, float* decay, float* beta,
+    hggcStream_t stream) {
+  using namespace fla_l2_cute;
+  const dim3 grid((2 * rows_each + kBlockRows - 1) / kBlockRows), block(kThreads);
+  const int64_t packed = int64_t(heads) * kD;
+  auto* kernel = q_stride == packed && k_stride == packed
+      ? prepare_short<false>
+      : prepare_short<true>;
+  const ShortGate gate{static_cast<const __ppu_bfloat16*>(raw_gate),
+      static_cast<const __ppu_bfloat16*>(raw_beta), a_log, bias, decay, beta,
+      beta_stride, lower};
+  kernel<<<grid, block, 0, stream>>>(
+      static_cast<const __ppu_bfloat16*>(q), static_cast<__ppu_bfloat16*>(qn),
+      static_cast<const __ppu_bfloat16*>(k), static_cast<__ppu_bfloat16*>(kn),
+      rows_each, heads, q_stride, k_stride, gate);
   return hggcGetLastError();
 }

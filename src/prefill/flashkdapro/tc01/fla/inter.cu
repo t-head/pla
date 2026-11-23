@@ -1954,14 +1954,14 @@ extern "C" hggcError_t launch_fla_inter_solve_bf16_d128_bt64_bc16_h8(
     int64_t beta_stride,
     const float* akkd, void* aqk, void* akk, float scale,
     const int32_t* cu, const int32_t* chunk_indices,
-    int chunks, int total_tokens, int n, int heads, hggcStream_t stream) {
+    int chunks, int total_tokens, int n, int heads, bool wide_inter, hggcStream_t stream) {
   if (chunks < 0 || total_tokens < 0) return hggcErrorInvalidValue;
   if (chunks == 0) return hggcSuccess;
   if (!q || !k || !g || !beta_raw || !akkd || !aqk || !akk || !cu || !chunk_indices)
     return hggcErrorInvalidValue;
   const int wide_max_chunks =
       heads <= 4 ? kWideMaxChunksH4 : (heads <= 8 ? kWideMaxChunksH8 : 0);
-  if (chunks <= wide_max_chunks) {
+  if (wide_inter || chunks <= wide_max_chunks) {
     fla_inter_solve_bf16_d128_bt64_bc16_h8_wide_kernel<<<
         dim3(chunks, heads, 1), dim3(192, 1, 1),
         fla_inter_solve_cute_wide::kSharedBytes, stream>>>(

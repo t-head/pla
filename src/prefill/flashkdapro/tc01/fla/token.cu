@@ -441,14 +441,12 @@ __device__ __forceinline__ void token_intra_chunk_body(
     float* __restrict__ akk,
     __ppu_bfloat16* __restrict__ qg,
     float scale,
-    const int32_t* __restrict__ cu_seqlens,
-    int total_tokens) {
-  const int bos = cu_seqlens[0];
-  const int eos = cu_seqlens[1];
-  if (bos < 0 || eos > total_tokens) return;
+    int bos, int eos, int local_chunk, int total_tokens) {
+  if (bos < 0 || eos > total_tokens || eos < bos || local_chunk < 0 ||
+      int64_t(local_chunk) * kBT >= eos - bos) return;
   const int warp = static_cast<int>(threadIdx.x) >> 5;
   ChunkTokenContext c{q, k, g, aqk, akk, qg, scale, bos,
-                      static_cast<int>(blockIdx.x) * kBT + (warp >> 1) * kBC,
+                      local_chunk * kBT + (warp >> 1) * kBC,
                       eos - bos, static_cast<int>(blockIdx.y), kH,
                       static_cast<int>(threadIdx.x) & 31, 0.0f};
   if (c.subchunk_start >= c.sequence_t) return;
@@ -502,7 +500,21 @@ void token_intra_chunk_bf16_d128_bt64_bc16_kernel(
     const int32_t* __restrict__ cu_seqlens,
     int total_tokens) {
   token_intra_chunk_body(q, k, g, beta_raw, beta_stride, aqk, akk, qg, scale,
-                         cu_seqlens, total_tokens);
+                         cu_seqlens[0], cu_seqlens[1], blockIdx.x, total_tokens);
+}
+
+__global__ __launch_bounds__(kChunkThreads, 4)
+__block_size__((kChunkThreads, 1, 1))
+void FLA_JOIN_HEAD(token_intra_packed_chunk, FLA_HEADS)(
+    const __ppu_bfloat16* q, const __ppu_bfloat16* k, const float* g,
+    const __ppu_bfloat16* beta_raw, int64_t beta_stride,
+    __ppu_bfloat16* aqk, float* akk, __ppu_bfloat16* qg, float scale,
+    const int32_t* cu, const int32_t* indices, int n, int total_tokens) {
+  const int seq = indices[2 * blockIdx.x];
+  if (seq < 0 || seq >= n) return;
+  const int local_chunk = indices[2 * blockIdx.x + 1];
+  token_intra_chunk_body(q, k, g, beta_raw, beta_stride, aqk, akk, qg, scale,
+                         cu[seq], cu[seq + 1], local_chunk, total_tokens);
 }
 
 // Fused L2 variant: before the token stage, the CTA normalizes the q and k
@@ -769,7 +781,7 @@ void token_intra_chunk_l2_bf16_d128_bt64_bc16_kernel(
   // reads them.
   __syncthreads();
   token_intra_chunk_body(qn, kn, g, beta_raw, beta_stride, aqk, akk, qg, scale,
-                         cu_seqlens, total_tokens);
+                         cu_seqlens[0], cu_seqlens[1], blockIdx.x, total_tokens);
   if (w) {
     // Publishes the chunk's akk rows to the diagonal solve.
     __syncthreads();
@@ -819,9 +831,20 @@ hggcError_t launch_fla_glm53_token_intra_bf16_d128_bt64_bc16_h8(
     float scale,
     const int32_t* cu_seqlens,
     int n,
-    int total_tokens, int heads,
+    int total_tokens, int heads, const int32_t* indices, int chunks,
     hggcStream_t stream) {
   if (total_tokens == 0) return hggcSuccess;
+  if (indices && chunks > 0) {
+    using namespace fla_glm53_token_intra_cute;
+    FLA_JOIN_HEAD(token_intra_packed_chunk, FLA_HEADS)<<<
+        dim3(chunks, heads), kChunkThreads, 0, stream>>>(
+        static_cast<const __ppu_bfloat16*>(q),
+        static_cast<const __ppu_bfloat16*>(k), g,
+        reinterpret_cast<const __ppu_bfloat16*>(beta_raw), beta_stride,
+        static_cast<__ppu_bfloat16*>(aqk), akk,
+        static_cast<__ppu_bfloat16*>(qg), scale, cu_seqlens, indices, n, total_tokens);
+    return hggcGetLastError();
+  }
   if (n == 1) {
     // Chunk-tiled N=1 path; the effective length is read on device, so the
     // grid covers the physical token extent.

@@ -58,7 +58,7 @@ CUTE_DEVICE void store_cp_public_state(
   else static_cast<uint16_t*>(final_state)[offset]=rounded;
 }
 
-template<int NtBucket,CpPass Pass>
+template<int NtBucket,CpPass Pass,bool SaveEnd=true>
 CUTE_DEVICE void fused_pretriangular_output_body_pipeline5(
     uint16_t const* qg,uint16_t const* a,uint16_t* output,
     uint16_t const* k,uint16_t const* v,uint16_t const* w,uint16_t* v_new,
@@ -385,7 +385,8 @@ CUTE_DEVICE void fused_pretriangular_output_body_pipeline5(
         int value=recurrence_state_v(tid,ordinal);
         int key=recurrence_state_k(tid,ordinal);
         float value_at_end=carried[panel][ordinal];
-        destination[state_offset(slot,head,value_base+value,64*panel+key)]=value_at_end;
+        if constexpr(SaveEnd)
+          destination[state_offset(slot,head,value_base+value,64*panel+key)]=value_at_end;
         if constexpr(Pass==CpPass::Zero)
           if(segment_count==1)
             store_cp_public_state(final_state,state_is_fp32,public_slot,head,
