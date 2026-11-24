@@ -106,7 +106,7 @@ struct WorkspaceLayout : Layout {
   Region v_new, history, cp_bias, cp_state_passing, cp_executed, zeros;
   MetadataLayout meta;
   WorkspaceLayout(int64_t t, int64_t h, int64_t n, int64_t chunks,
-                  bool device_metadata, int cp_segments = 0)
+                  bool device_metadata, int cp_segments = 0, bool fused_only = false)
       : meta(n, chunks) {
     dimensions(t, h, n, chunks);
     require(cp_segments >= 0 && cp_segments <= kCpMaxSegments,
@@ -130,7 +130,7 @@ struct WorkspaceLayout : Layout {
         // Reserved to preserve the existing arena size while the old repair
         // instrumentation is removed from downstream tooling.
         cp_executed = add(checked_mul(checked_mul(cp_segments, h), 8 * 4));
-      } else {
+      } else if (!fused_only) {
         v_new = add(activation);
         history = add(checked_mul(checked_mul(chunks, h), 128 * 128 * 2));
       }

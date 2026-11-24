@@ -35,8 +35,8 @@ import os
 from pathlib import Path
 import re
 
-HEADS = (0, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96)
-CP_HEADS = (4, 6, 8, 12)
+HEADS = (0, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96)
+CP_HEADS = (3, 4, 6, 8, 12, 16)
 RUNTIME_ABI = 'tc01_fla_monolithic_runtime_v2'
 KERNEL_ABI = 'tc01_fla_packed_v3_cpstate_v1'
 CP_ABI = 'tc01_fla_cp_state_passing_v2'
@@ -77,6 +77,17 @@ def object_groups(flags, heads=HEADS):
             groups.append(dict(stage=stage, heads=h, sources=sources,
                                flags={key: list(flags[stage][old]) + [f'-DFLA_HEADS={h}']
                                       for key, old in (('cxx', 'cflags'), ('hgcc', 'cuda_cflags'))}))
+    for h in (h for h in heads if h):
+        group = flags['cp_recurrence_output']
+        groups.append(dict(stage='packed_fused', heads=h, sources=['packed_recurrence_output.cu'],
+                           flags={'cxx': group['cflags'] + [f'-DFLA_HEADS={h}'],
+                                  'hgcc': group['cuda_cflags'] + [f'-DFLA_HEADS={h}']}))
+        if h <= 12:
+            groups.append(dict(stage='packed_fused_bv16', heads=h,
+                               sources=['packed_recurrence_output.cu'],
+                               flags={'cxx': group['cflags'] + [f'-DFLA_HEADS={h}'],
+                                      'hgcc': group['cuda_cflags'] +
+                                      [f'-DFLA_HEADS={h}', '-DFLA_PACKED_BV16=1']}))
     for h in heads:
         groups.append(dict(stage='adapter', heads=h, sources=['head_adapter.cc'],
                            flags={'cxx': HOST_FLAGS + [f'-DFLA_HEADS={h}'], 'hgcc': []}))
@@ -105,8 +116,12 @@ def compile_objects(command, ext):
                   '\n#define FLA_EACH_CP_HEAD(X) ' +
                   ' '.join(f'X({h})' for h in heads if h in CP_HEADS) + '\n')
     ext.include_dirs = list(ext.include_dirs) + [str(output)]
+    schedule_header = root / 'prefill_schedule.h'
+    launcher_header = root / 'launchers.h'
+    short_header = root / 'short_direct.cuh'
+    local_headers = {schedule_header, launcher_header, short_header}
     dependencies = ([str(p) for pattern in ('*.h', '*.cuh')
-                     for p in sorted(root.glob(pattern))]
+                     for p in sorted(root.glob(pattern)) if p not in local_headers]
                     + [str(root / 'recurrence.cu'), str(root / 'cp_recurrence_output.cu'),
                        str(root / 'build_flags.json')])
     records, objects = [], []
@@ -116,8 +131,13 @@ def compile_objects(command, ext):
         directory.mkdir(parents=True, exist_ok=True)
         args = {key: group['flags'][key] for key in ('cxx', 'hgcc')}
         sources = [str(root / name) for name in group['sources']]
+        group_dependencies = dependencies
+        if group['stage'] == 'adapter':
+            group_dependencies = dependencies + [str(launcher_header)]
+        elif group['stage'] == 'recurrence' and group['heads'] == 0:
+            group_dependencies = dependencies + [str(short_header)]
         built = command.compile_sources(
-            sources, directory, ext, extra_postargs=args, depends=dependencies)
+            sources, directory, ext, extra_postargs=args, depends=group_dependencies)
         if len(built) != len(sources) or any(not Path(p).is_file() for p in built):
             raise RuntimeError('FLA object group missing: ' + str(group))
         objects.extend(built)
@@ -131,7 +151,8 @@ def compile_objects(command, ext):
     if len(set(objects)) != len(objects):
         raise RuntimeError('different FLA object groups overwrote the same path')
     ext.extra_objects = list(ext.extra_objects or []) + objects
-    ext.depends = list(ext.depends or []) + dependencies + objects + [str(output / 'runtime_heads.h')]
+    ext.depends = (list(ext.depends or []) + dependencies + objects +
+                   [str(output / 'runtime_heads.h'), str(schedule_header), str(launcher_header)])
     manifest = dict(schema='tc01_fla_monolithic_build_v2', runtime_abi=RUNTIME_ABI,
                     kernel_abi=KERNEL_ABI, cp_abi=CP_ABI,
                     heads=list(heads), cp_heads=[h for h in heads if h in CP_HEADS],

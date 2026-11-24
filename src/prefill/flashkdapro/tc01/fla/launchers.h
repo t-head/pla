@@ -40,9 +40,11 @@ using Configure = hggcError_t (*)();
 using Gate = hggcError_t (*)(const void*, const float*, const float*, float*, int,
                             const int32_t*, const int32_t*, int, int, int, float, hggcStream_t);
 using Token = hggcError_t (*)(const void*, const void*, const float*, const uint16_t*, int64_t,
-                             void*, float*, void*, float, const int32_t*, int, int, int, hggcStream_t);
+                             void*, float*, void*, float, const int32_t*, int, int, int,
+                             const int32_t*, int, hggcStream_t);
 using Inter = hggcError_t (*)(const void*, const void*, const float*, const uint16_t*, int64_t, const float*,
-                             void*, void*, float, const int32_t*, const int32_t*, int, int, int, int, hggcStream_t);
+                             void*, void*, float, const int32_t*, const int32_t*, int, int, int, int, bool,
+                             hggcStream_t);
 using TokenL2 = hggcError_t (*)(const void*, const void*, int64_t, int64_t, void*, void*, const float*,
                                const uint16_t*, int64_t, void*, float*, void*, void*, void*, void*, float,
                                const int32_t*, int, int, hggcStream_t);
@@ -61,6 +63,9 @@ using CpRecurrenceOutput = hggcError_t (*)(
     const void*, const void*, void*, const void*, const void*, const void*, const float*,
     const void*, void*, int, const int32_t*, float*, float*, int*, const int32_t*,
     const int64_t*, int, int, hggcStream_t);
+using PackedFused = hggcError_t (*)(const void*, const void*, void*, const void*, const void*,
+    const void*, const float*, const void*, void*, int, const int32_t*, const int32_t*,
+    const int64_t*, int, int, hggcStream_t);
 struct Launchers {
   int heads;
   Configure configure_recompute, configure_recurrence, configure_output, configure_cp;
@@ -74,6 +79,10 @@ struct Launchers {
   // Optional fused stages are present only in the matching static head adapter.
   TokenL2 token_l2;
   InterPrepared inter_solve_prepared;
+  Configure configure_packed_fused;
+  PackedFused packed_fused;
+  Configure configure_packed_fused_bv16;
+  PackedFused packed_fused_bv16;
 };
 const Launchers& launchers_for(int heads);
 }  // namespace fla_runtime
@@ -90,5 +99,17 @@ extern "C" hggcError_t launch_fla_inter_prepared__fla_h8(
 hggcError_t launch_fla_l2norm_bf16_d128_bt16(const void*, void*, int64_t, hggcStream_t);
 hggcError_t launch_fla_l2norm2_bf16_d128_bt16(const void*, void*, const void*, void*, int64_t, int,
                                               int64_t, int64_t, hggcStream_t);
+hggcError_t launch_fla_front_prepare(
+    const void*, void*, const void*, void*, int64_t, int, int64_t, int64_t, void*,
+    int64_t, const void*, const float*, const float*, float*, const int32_t*,
+    const int32_t*, int, int, int, float, hggcStream_t);
+hggcError_t launch_fla_short_prepare(
+    const void*, void*, const void*, void*, int64_t, int, int64_t, int64_t,
+    const void*, const void*, const float*, const float*, int64_t, float, float*,
+    float*, hggcStream_t);
+extern "C" hggcError_t launch_fla_short_direct(
+    const void*, const void*, const void*, const void*, const void*, int,
+    const float*, const float*, void*, int, int, const void*, void*, int,
+    const int32_t*, float, float, bool, bool, hggcStream_t);
 hggcError_t launch_fla_metadata(const void*, bool, int32_t*, int64_t*, int32_t*, int32_t*,
                                 int, int, int, hggcStream_t);

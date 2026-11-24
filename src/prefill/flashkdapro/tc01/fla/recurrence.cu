@@ -2534,3 +2534,5 @@ extern "C" hggcError_t launch_fla_glm53_recurrence_h8_bf16_d128_bt64(
   return hggcGetLastError();
 }
 #endif  // FLA_RECURRENCE_BODY_ONLY
+
+#include "short_direct.cuh"

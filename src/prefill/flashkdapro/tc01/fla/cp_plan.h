@@ -96,11 +96,15 @@ inline int select_fla_cp_auto_split(int heads, int64_t tokens) {
     case 4:
       if (tokens <= 2048) return 1;
       return tokens >= 12288 && tokens <= 65536 ? 5 : 0;
+    case 3:
+      return tokens <= 32768 ? 1 : 0;
     case 6:
     case 8:
       return 1;
     case 12:
       return tokens >= 8192 ? 1 : 0;
+    case 16:
+      return tokens >= 8192 && tokens <= 32768 ? 1 : 0;
     default:
       return 0;
   }

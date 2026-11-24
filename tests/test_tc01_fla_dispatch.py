@@ -55,8 +55,8 @@ ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = ROOT / 'pla/prefill/flashkdapro'
 SOURCE = ROOT / 'src/prefill/flashkdapro/tc01/fla'
 ALIAS = '_tc01_dispatch_test_package.prefill.flashkdapro'
-HEADS = (0, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96)
-CP_HEADS = (4, 6, 8, 12)
+HEADS = (0, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96)
+CP_HEADS = (3, 4, 6, 8, 12, 16)
 STAGES = ('l2norm', 'metadata', 'gate', 'inter', 'recompute', 'recurrence',
           'cp_recurrence_output', 'token_output')
 
@@ -434,10 +434,14 @@ class BuildTests(unittest.TestCase):
         expected = [(stage, head) for stage in STAGES
                     for head in ((0,) if stage in ('l2norm', 'metadata') else
                                  (CP_HEADS if stage == 'cp_recurrence_output' else HEADS))]
+        for head in HEADS[1:]:
+            expected.append(('packed_fused', head))
+            if head <= 12:
+                expected.append(('packed_fused_bv16', head))
         expected += [('adapter', head) for head in HEADS]
         self.assertEqual([(g['stage'], g['heads']) for g in groups], expected)
-        self.assertEqual(len(groups), 72)
-        self.assertEqual(sum(len(g['sources']) for g in groups), 87)
+        self.assertEqual(len(groups), 96)
+        self.assertEqual(sum(len(g['sources']) for g in groups), 114)
         kernels = set()
         objects = set()
         for group in groups:
@@ -446,8 +450,10 @@ class BuildTests(unittest.TestCase):
             if stage == 'adapter':
                 self.assertEqual(group['flags'], dict(cxx=self.build.HOST_FLAGS + define, hgcc=[]))
             else:
+                flag_stage = 'cp_recurrence_output' if stage.startswith('packed_fused') else stage
                 for key, old in (('cxx', 'cflags'), ('hgcc', 'cuda_cflags')):
-                    self.assertEqual(group['flags'][key], self.flags[stage][old] + define)
+                    width = ['-DFLA_PACKED_BV16=1'] if stage == 'packed_fused_bv16' and key == 'hgcc' else []
+                    self.assertEqual(group['flags'][key], self.flags[flag_stage][old] + define + width)
             for name in group['sources']:
                 self.assertTrue((SOURCE / name).is_file(), name)
                 path = (stage, head, Path(name).stem)
@@ -468,6 +474,7 @@ class BuildTests(unittest.TestCase):
             'std::shared_mutex init_mutex;', 1)[0]
         source = r'''
 #include "cp_plan.h"
+#include "prefill_schedule.h"
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
@@ -488,6 +495,26 @@ struct CpSelection {
 int main() {
   unsetenv("PLA_FLASHKDA_TC01_FLA_CP");
   unsetenv("PLA_FLASHKDA_TC01_FLA_CP_ALGO");
+  assert(select_cp(Arguments{std::vector<int64_t>{0, 605}}, {1, 3, 605}, {true}).count == 1);
+  assert(!select_cp(Arguments{std::vector<int64_t>{0, 605}}, {1, 3, 606}, {true}).active());
+  assert(select_cp_algorithm(1, 3, 605) == CpAlgorithm::State);
+  assert(select_prefill_schedule(64, 1, 32).short_path == ShortPrefill::Direct);
+  assert(select_prefill_schedule(64, 1, 48).short_path == ShortPrefill::HalfWarp);
+  assert(select_prefill_schedule(64, 1, 65).packed == PackedPrefill::Bv32);
+  assert(select_prefill_schedule(96, 1, 80).short_path == ShortPrefill::Prepared);
+  assert(select_prefill_schedule(96, 1, 81).packed == PackedPrefill::Bv32);
+  assert(select_prefill_schedule(48, 1, 96).short_path == ShortPrefill::Prepared);
+  assert(select_prefill_schedule(48, 1, 121).short_path == ShortPrefill::HalfWarp);
+  assert(select_prefill_schedule(64, 1, 128).short_path == ShortPrefill::HalfWarp);
+  assert(select_prefill_schedule(64, 1, 129).packed == PackedPrefill::Bv32);
+  assert(select_prefill_schedule(3, 1, 1235).wide_inter);
+  assert(!select_prefill_schedule(3, 1, 1345).wide_inter);
+  assert(select_prefill_schedule(12, 1, 242).wide_inter);
+  assert(select_prefill_schedule(4, 1, 242).fused_front);
+  assert(select_prefill_schedule(8, 3, 1024).packed == PackedPrefill::Bv16);
+  assert(select_prefill_schedule(8, 3, 1025).packed == PackedPrefill::Bv32);
+  assert(select_prefill_schedule(96, 9, 4096).packed_tokens);
+  assert(!select_prefill_schedule(96, 8, 4096).packed_tokens);
   for (int h : {4, 6, 8}) {
     assert(select_fla_cp_auto_split(h, 0) == 0);
     assert(select_fla_cp_auto_split(h, -1) == 0);
@@ -526,6 +553,21 @@ int main() {
   }
   assert(select_fla_cp_auto_split(12, 8191) == 0);
   assert(select_fla_cp_auto_split(12, 8192) == 1);
+  for (int t : {8192, 32768}) {
+    Arguments a{std::vector<int64_t>{0, t}};
+    assert(select_cp(a, {1, 16, t}, {true}).split == 1);
+    assert(select_cp_algorithm(1, 16, t) == CpAlgorithm::State);
+    assert(!select_cp(a, {1, 16, t + 1}, {true}).active());
+    assert(!select_cp(Arguments{}, {1, 16, t}, {true}).active());
+    assert(!select_cp(a, {2, 16, t}, {true}).active());
+    setenv("PLA_FLASHKDA_TC01_FLA_CP_ALGO", "legacy", 1);
+    assert(!select_cp(a, {1, 16, t}, {true}).active());
+    unsetenv("PLA_FLASHKDA_TC01_FLA_CP_ALGO");
+  }
+  for (int t : {8191, 32769}) {
+    Arguments a{std::vector<int64_t>{0, t}};
+    assert(!select_cp(a, {1, 16, t}, {true}).active());
+  }
   for (int h : {1, 5, 16, 24, 96})
     assert(select_fla_cp_auto_split(h, 19) == 0);
   for (int h : {4, 6, 8, 12}) {

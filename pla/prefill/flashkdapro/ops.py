@@ -140,12 +140,15 @@ def flashkda_fwd(
     belongs to this call/Graph. The old BT64/CP environment variables only affect the legacy backend; the monolithic FLA
     tc01 FLA CP uses the separate ``PLA_FLASHKDA_TC01_FLA_CP``: unset, empty or
     ``auto`` enables CP only for qualified N1 shapes with a static CP kernel.
-    With trusted host offsets, H4 uses state CP1 for 1-2048 tokens and state CP5
-    for 12288-65536; other lengths remain serial. H6/H8 use state CP1 for
+    With trusted host offsets, H3 can use state CP1 through 32768 tokens and H16
+    uses state CP1 for 8192-32768 tokens. Both require a full N1 layout.
+    H4 uses state CP1 for 1-2048 tokens and state CP5 for 12288-65536 tokens.
+    H6/H8 use state CP1 for
     1-65536 and retain legacy CP1 for 65537-102400. H12 retains legacy CP1 for
     8192-102400. With only device offsets, H4 physical T=16384/32768 uses state
     CP5 and H8 physical T=4096/8192/16384/32768 uses state CP1; each replay uses
-    the current effective offsets. Other unqualified inputs remain serial.
+    the current effective offsets. On full trusted AUTO layouts, short direct
+    kernels and packed recurrence/output fusion are also selected by shape.
     ``off``/``0`` selects serial execution. Explicit splits accept only
     ``1/2/3/4/5/8`` and require N1, trusted offsets, a supported head count and
     effective length <=102400; invalid requests raise an error.

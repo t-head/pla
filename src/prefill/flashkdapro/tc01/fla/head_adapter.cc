@@ -36,10 +36,12 @@
 hggcError_t launch_fla_gate_cumsum_bf16_h8_aligned_m1(const void*, const float*, const float*,
     float*, int, const int32_t*, const int32_t*, int, int, int, float, hggcStream_t);
 hggcError_t launch_fla_glm53_token_intra_bf16_d128_bt64_bc16_h8(const void*, const void*,
-    const float*, const uint16_t*, int64_t, void*, float*, void*, float, const int32_t*, int, int, int, hggcStream_t);
+    const float*, const uint16_t*, int64_t, void*, float*, void*, float, const int32_t*, int, int, int,
+    const int32_t*, int, hggcStream_t);
 extern "C" {
 hggcError_t launch_fla_inter_solve_bf16_d128_bt64_bc16_h8(const void*, const void*, const float*,
-    const uint16_t*, int64_t, const float*, void*, void*, float, const int32_t*, const int32_t*, int, int, int, int, hggcStream_t);
+    const uint16_t*, int64_t, const float*, void*, void*, float, const int32_t*, const int32_t*, int, int, int, int,
+    bool, hggcStream_t);
 hggcError_t configure_fla_recompute_h8_bf16_d128_bt64();
 hggcError_t launch_fla_recompute_h8_bf16_d128_bt64(const void*, const void*, int64_t, const uint16_t*, int64_t,
     const void*, const float*, void*, void*, void*, const int32_t*, const int32_t*, int, int, int, int, hggcStream_t);
@@ -50,7 +52,7 @@ hggcError_t launch_fla_glm53_recurrence_h8_bf16_d128_bt64(const void*, const voi
 hggcError_t configure_fla_glm53_output_h8_bf16_d128_bt64();
 hggcError_t launch_fla_glm53_output_h8_bf16_d128_bt64(const void*, const void*, const float*,
     void*, const void*, void*, const void*, const int32_t*, const int32_t*, float, int, int, int, int, hggcStream_t);
-#if FLA_HEADS == 4 || FLA_HEADS == 6 || FLA_HEADS == 8 || FLA_HEADS == 12
+#if FLA_HEADS == 3 || FLA_HEADS == 4 || FLA_HEADS == 6 || FLA_HEADS == 8 || FLA_HEADS == 12 || FLA_HEADS == 16
 hggcError_t configure_fla_cp_pretriangular_output();
 hggcError_t launch_fla_cp_pretriangular_output(
     const void*, const void*, void*, const void*, const void*, const void*, const float*,
@@ -68,9 +70,22 @@ hggcError_t FLA_JOIN_HEAD(launch_fla_inter_solve_prepared, FLA_HEADS)(
 #endif
 }
 
+#define FLA_PACKED_DECLARATIONS(configure, launch) \
+  extern "C" hggcError_t FLA_JOIN_HEAD(configure, FLA_HEADS)(); \
+  extern "C" hggcError_t FLA_JOIN_HEAD(launch, FLA_HEADS)( \
+      const void*, const void*, void*, const void*, const void*, const void*, const float*, \
+      const void*, void*, int, const int32_t*, const int32_t*, const int64_t*, int, int, hggcStream_t);
+#if FLA_HEADS > 0
+FLA_PACKED_DECLARATIONS(configure_fla_packed_recurrence_output, launch_fla_packed_recurrence_output)
+#endif
+#if FLA_HEADS > 0 && FLA_HEADS <= 12
+FLA_PACKED_DECLARATIONS(configure_fla_packed_recurrence_output_bv16, launch_fla_packed_recurrence_output_bv16)
+#endif
+#undef FLA_PACKED_DECLARATIONS
+
 namespace fla_runtime {
 const Launchers& FLA_JOIN_HEAD(head_adapter, FLA_HEADS)() {
-#if FLA_HEADS == 4 || FLA_HEADS == 6 || FLA_HEADS == 8 || FLA_HEADS == 12
+#if FLA_HEADS == 3 || FLA_HEADS == 4 || FLA_HEADS == 6 || FLA_HEADS == 8 || FLA_HEADS == 12 || FLA_HEADS == 16
   constexpr Configure cp_configure = configure_fla_cp_pretriangular_output;
   constexpr CpRecurrenceOutput cp_launch = launch_fla_cp_pretriangular_output;
 #else
@@ -98,7 +113,22 @@ const Launchers& FLA_JOIN_HEAD(head_adapter, FLA_HEADS)() {
       launch_fla_glm53_output_h8_bf16_d128_bt64,
       cp_launch,
       token_l2,
-      inter_prepared};
+      inter_prepared,
+#if FLA_HEADS > 0
+      FLA_JOIN_HEAD(configure_fla_packed_recurrence_output, FLA_HEADS),
+      FLA_JOIN_HEAD(launch_fla_packed_recurrence_output, FLA_HEADS),
+#else
+      nullptr,
+      nullptr,
+#endif
+#if FLA_HEADS > 0 && FLA_HEADS <= 12
+      FLA_JOIN_HEAD(configure_fla_packed_recurrence_output_bv16, FLA_HEADS),
+      FLA_JOIN_HEAD(launch_fla_packed_recurrence_output_bv16, FLA_HEADS),
+#else
+      nullptr,
+      nullptr,
+#endif
+  };
   return value;
 }
 }  // namespace fla_runtime

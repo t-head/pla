@@ -30,7 +30,7 @@
 
 """ABI and static head list of the monolithic tc01 FLA extension; argument validation is owned by the C++ runtime."""
 
-HEADS = (4, 6, 8, 12, 16, 24, 32, 48, 64, 96)
-CP_HEADS = (4, 6, 8, 12)
+HEADS = (3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96)
+CP_HEADS = (3, 4, 6, 8, 12, 16)
 ABI = "tc01_fla_packed_v3_cpstate_v1"
 CP_ABI = "tc01_fla_cp_state_passing_v2"
