@@ -57,7 +57,8 @@ void launch_flashkda_prepare(
     int tile_offset, int tile_count, int head_offset, int head_count,
     int* ready, void* ws, bool force_plain, bool cp_fma_front,
     bool fp16_kd_qd, flashkda::KrWorkspaceLayout kr_layout,
-    hggcStream_t stream, const void* value_input = nullptr, bool short_k1_lb8 = false);
+    hggcStream_t stream, const void* value_input = nullptr, bool short_k1_lb8 = false,
+    bool collect_condition = false);
 
 void launch_flashkda_zero_padded_output_tail(
     void* out, int T_total, int H, int N,

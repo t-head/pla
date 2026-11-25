@@ -256,19 +256,23 @@ __global__ void flashkda_zero_padded_output_tail(
 }
 
 // ===================== Kernel 1: prepare =====================
+// Keep the kernel declaration visible in both device images.
+#if defined(__HGGC_ARCH__) && defined(FLASHKDA_ARCH_150)
+// Use the higher occupancy target for dense and strided raw-input fast paths.
+#define FLASHKDA_K1_LAUNCH_BOUNDS \
+    __launch_bounds__(NThreads, \
+        NThreads == 128 && !PrecomputeAffine && ChunksPerCTA == 1 && \
+        (DefaultInputs || Unconditioned) ? DefaultMinBlocks : 1)
+#else
+#define FLASHKDA_K1_LAUNCH_BOUNDS __launch_bounds__(NThreads)
+#endif
+
 template <int NThreads, bool IsVarlen, bool UseTilePrefix,
           bool PrecomputeAffine = false, int ChunksPerCTA = 1,
           bool FmaFront = false, bool Tc01KrContiguous = false,
           bool DefaultInputs = false, int DefaultMinBlocks = 11,
-          bool DirectNeumann = false>
-#if defined(__HGGC_ARCH__) && defined(FLASHKDA_ARCH_150)
-// The higher occupancy target applies only to the raw default-input path.
-__global__ void __launch_bounds__(NThreads,
-    NThreads == 128 && !PrecomputeAffine && ChunksPerCTA == 1 && DefaultInputs ? DefaultMinBlocks : 1)
-#else
-__global__ void __launch_bounds__(NThreads)
-#endif
-flashkda_prepare_kernel(
+          bool DirectNeumann = false, bool Unconditioned = false>
+__global__ void FLASHKDA_K1_LAUNCH_BOUNDS flashkda_prepare_kernel(
     const BF16* __restrict__ q,       // [T_total, H, D] (token stride q_stride, D, 1)
     const BF16* __restrict__ k,
     const BF16* __restrict__ g_in,
@@ -286,17 +290,19 @@ flashkda_prepare_kernel(
     // per (head,tile), indexed by ws_idx = head*total_tiles + gtile. The Kd and
     // Qd fields are FP16 when fp16_kd_qd is true; every offset and slot size
     // stays unchanged.
-    BF16* __restrict__ ws, const BF16* __restrict__ value_input)
+    BF16* __restrict__ ws, const BF16* __restrict__ value_input, bool collect_condition)
 {
     const int64_t q_stride = DefaultInputs ? int64_t(H) * D : q_token_stride;
     const int64_t k_stride = DefaultInputs ? int64_t(H) * D : k_token_stride;
     // This tc02 specialization requires null value/ready and raw BF16.
     // Structural/power risk classification and repair remain unchanged.
-    if constexpr (DefaultInputs) {
+    if constexpr (DefaultInputs || Unconditioned) {
         value_input = nullptr;
         fp16_kd_qd = false;
         ready = nullptr;
     }
+    if constexpr (Unconditioned)
+        collect_condition = false;
     static_assert(!PrecomputeAffine || NThreads == 128,
                   "fused affine prepare is specialized for four warps");
     static_assert(ChunksPerCTA >= 1, "ChunksPerCTA must be positive");
@@ -551,7 +557,7 @@ flashkda_prepare_kernel(
     // Read the actual normalized BF16 keys while phase-A storage is intact.
     // This structural class also catches low-beta value cancellation that an
     // operator-only L^2 test cannot detect. It is not a general error bound.
-    if (tid < 32) {
+    if (collect_condition && tid < 32) {
         const bool structural_class = flashkda::conditioned::exact_structural_pair(sk,actual_len,tid);
         const float row_beta = tid < actual_len ? s_beta[tid] : 0.f;
         const bool saturated_beta = __any_sync(0xffffffff,row_beta == 1.f);
@@ -723,9 +729,11 @@ flashkda_prepare_kernel(
             fk::store_acc16_f16acc_1warp(acc, reinterpret_cast<__half*>(sPow), 16, lane);
         }
         __syncwarp();
-        const bool risk = k1_conditioned_power_risk(sPow, lane);
-        if (lane == 0)
-            *reinterpret_cast<int32_t*>(slot + fk::WS_OFF_CONDITION_U) |= int(risk);
+        if (collect_condition) {
+            const bool risk = k1_conditioned_power_risk(sPow, lane);
+            if (lane == 0)
+                *reinterpret_cast<int32_t*>(slot + fk::WS_OFF_CONDITION_U) |= int(risk);
+        }
         #pragma unroll
         for (int it = 0; it < 3; ++it) {
             // tmp = INV @ pow ; INV += tmp
@@ -940,6 +948,8 @@ flashkda_prepare_kernel(
     }
 }
 
+#undef FLASHKDA_K1_LAUNCH_BOUNDS
+
 }  // namespace flashkda_cute
 
 namespace flashkda_cute {
@@ -1027,7 +1037,7 @@ void launch_flashkda_prepare(
     int tile_offset, int tile_count, int head_offset, int head_count,
     int* ready, void* ws, bool force_plain, bool cp_fma_front,
     bool fp16_kd_qd, flashkda::KrWorkspaceLayout kr_layout,
-    hggcStream_t stream, const void* value_input, bool short_k1_lb8) {
+    hggcStream_t stream, const void* value_input, bool short_k1_lb8, bool collect_condition) {
     using BF16 = cutlass::bfloat16_t;
     int smem = sizeof(flashkda_cute::K1Smem);
     const bool is_tc01 =
@@ -1208,7 +1218,8 @@ void launch_flashkda_prepare(
                 q_stride, k_stride,
                 N, total_tiles, tile_count, cu_seqlens,
                 tile_prefix, tile_offset, head_offset, ready, fp16_kd_qd,
-                reinterpret_cast<BF16*>(ws), reinterpret_cast<const BF16*>(value_input));
+                reinterpret_cast<BF16*>(ws), reinterpret_cast<const BF16*>(value_input),
+                collect_condition);
             auto tail = flashkda_cute::flashkda_neumann_tail_kernel<
                 decltype(varlen)::value, decltype(prefix)::value>;
             tail<<<grid, 32, 0, stream>>>(
@@ -1236,12 +1247,12 @@ void launch_flashkda_prepare(
                  auto kr_contiguous) {
         constexpr int NT = decltype(nt)::value;
         constexpr int CPC = decltype(cpc)::value;
-        auto launch_default_mode = [&](auto default_inputs, auto min_blocks, auto direct_neumann) {
+        auto launch = [&](auto default_inputs, auto min_blocks, auto direct_neumann, auto unconditioned) {
             auto kern = flashkda_cute::flashkda_prepare_kernel<
                 NT, decltype(varlen)::value, decltype(prefix)::value,
                 decltype(affine)::value, CPC, false,
                 decltype(kr_contiguous)::value, decltype(default_inputs)::value, decltype(min_blocks)::value,
-                decltype(direct_neumann)::value>;
+                decltype(direct_neumann)::value, decltype(unconditioned)::value>;
             hggcFuncSetAttribute(kern, hggcFuncAttributeMaxDynamicSharedMemorySize, smem);
             dim3 grid((tile_count + CPC - 1) / CPC, head_count);
             kern<<<grid, NT, smem, stream>>>(
@@ -1250,8 +1261,19 @@ void launch_flashkda_prepare(
                 A_log, dt_bias, scale, gate_scale, T_total, H, beta_stride, q_stride, k_stride,
                 N, total_tiles, tile_count, cu_seqlens,
                 tile_prefix, tile_offset, head_offset, ready, fp16_kd_qd,
-                reinterpret_cast<BF16*>(ws), reinterpret_cast<const BF16*>(value_input));
+                reinterpret_cast<BF16*>(ws), reinterpret_cast<const BF16*>(value_input),
+                collect_condition);
         };
+        // Keep strided Q/K, but let the compiler drop the repair, value-guard,
+        // and ready-flag paths from the tc02 packed prepare kernel.
+        if constexpr (NT == 128 && CPC == 1 && decltype(varlen)::value
+                      && !decltype(affine)::value && !decltype(kr_contiguous)::value) {
+            if (!is_tc01 && !collect_condition && value_input == nullptr && !fp16_kd_qd && ready == nullptr
+                && (q_stride != int64_t(H) * 128 || k_stride != int64_t(H) * 128)) {
+                launch(std::false_type{}, std::integral_constant<int, 11>{}, std::false_type{}, std::true_type{});
+                return;
+            }
+        }
         if (!is_tc01 && value_input == nullptr && !fp16_kd_qd && ready == nullptr &&
             q_stride == int64_t(H) * 128 && k_stride == int64_t(H) * 128) {
             if constexpr (NT == 128 && CPC == 1 && decltype(varlen)::value
@@ -1260,15 +1282,15 @@ void launch_flashkda_prepare(
                 if (short_k1_lb8) {
                     // The host has already matched tc02, the CU count and the exact offsets.
                     if ((N == 1 && H == 12 && T_total == 823) || (N == 2 && H == 8 && T_total == 920))
-                        launch_default_mode(std::true_type{}, std::integral_constant<int, 8>{}, std::true_type{});
+                        launch(std::true_type{}, std::integral_constant<int, 8>{}, std::true_type{}, std::false_type{});
                     else
-                        launch_default_mode(std::true_type{}, std::integral_constant<int, 8>{}, std::false_type{});
+                        launch(std::true_type{}, std::integral_constant<int, 8>{}, std::false_type{}, std::false_type{});
                     return;
                 }
             }
-            launch_default_mode(std::true_type{}, std::integral_constant<int, 11>{}, std::false_type{});
+            launch(std::true_type{}, std::integral_constant<int, 11>{}, std::false_type{}, std::false_type{});
         } else {
-            launch_default_mode(std::false_type{}, std::integral_constant<int, 11>{}, std::false_type{});
+            launch(std::false_type{}, std::integral_constant<int, 11>{}, std::false_type{}, std::false_type{});
         }
     };
     // affine is only ever enabled on the 128-thread shape; every other thread
