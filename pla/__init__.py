@@ -35,6 +35,9 @@ package. Import the namespace you need:
 
     pla.decode                    fused sigmoid gating delta rule (GDN) decode
     pla.decode.kda                Kimi Delta Attention decode
+    pla.decode.gdn_replayssm       Shared GDN ReplaySSM compute APIs and kernels
+    pla.decode.gdn_replayssm_sglang SGLang-compatible GDN ReplaySSM APIs
+    pla.decode.gdn_replayssm_hlm    TensorRT-LLM-compatible cached GDN ReplaySSM APIs
     pla.decode.kda_replayssm_sglang     SGLang KDA ReplaySSM verify + commit
     pla.decode.kda_mtp_sglang          Compatibility API for SGLang ReplaySSM
     pla.decode.kda_replayssm_vllm       Native paged KDA replay verify + commit

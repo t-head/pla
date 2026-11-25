@@ -1298,6 +1298,10 @@ class FatBinaryKernelContractTest(unittest.TestCase):
     a symbol even when the definition is unconditional. That is what broke
     every ``ph_precompute_x_*`` launch on ZW-M890P. Keeping the guard inside the
     kernel body and testing it with a run-time ``if`` keeps both images whole.
+
+    A translation unit registered as single-image in setup.py is compiled
+    for the host and its selected device architecture. Its matching
+    host-or-device guard is enabled in every compilation pass.
     """
 
     IMAGE_TOKENS = ("FLASHQLA_ARCH_150", "FLASHQLA_ARCH_100", "PH_XY_FACTOR",
@@ -1314,13 +1318,46 @@ class FatBinaryKernelContractTest(unittest.TestCase):
     LAUNCH_BOUNDS = re.compile(r"__launch_bounds__\s*\([^()]*\)")
     WINDOW = 6
 
+    @classmethod
+    def setUpClass(cls):
+        setup_path = Path(__file__).resolve().parents[4] / "setup.py"
+        setup = ast.parse(setup_path.read_text(), filename=str(setup_path))
+        replay = "pla.decode.gdn_replayssm"
+        extension_block = next((
+            node for node in setup.body if isinstance(node, ast.If)
+            and any(isinstance(child, ast.Constant) and child.value == replay + "._C"
+                    for child in ast.walk(node))
+        ), None)
+        cls.single_image_arch = {}
+        if extension_block is None:
+            return
+
+        # Evaluate only the registration block with a stub Extension, so the
+        # CPU contract uses the source lists that PPUBuildExtension receives.
+        namespace = dict(
+            NAMESPACES=(replay,), Path=Path, os=os, here=str(setup_path.parent),
+            HGCC_THREADS="1", ext_modules=[], Extension=types.SimpleNamespace,
+        )
+        exec(compile(ast.Module([extension_block], type_ignores=[]),
+                     str(setup_path), "exec"), namespace)
+        extension, = namespace["ext_modules"]
+        cls.single_image_arch = {
+            Path(source).resolve(): arch
+            for attr, arch in (("ppu10_sources", 100), ("ppu15_sources", 150))
+            for source in getattr(extension, attr, ())
+        }
+
     @staticmethod
-    def _uncommented(text):
-        """Drop comments, keeping line numbers aligned for the window scan."""
+    def _uncommented(text, arch=None):
+        """Drop comments and normalize the selected single-image guard."""
         text = re.sub(r"/\*.*?\*/",
                       lambda match: "\n" * match.group(0).count("\n"),
                       text, flags=re.S)
-        return [line.split("//", 1)[0] for line in text.splitlines()]
+        lines = [line.split("//", 1)[0] for line in text.splitlines()]
+        if arch is None:
+            return lines
+        guard = f"#if!defined(__HGGC_ARCH__)||__HGGC_ARCH__=={arch}"
+        return ["#if 1" if "".join(line.split()) == guard else line for line in lines]
 
     def _missing(self, closed):
         """Names some branch of an image conditional provides and another lacks.
@@ -1415,7 +1452,8 @@ class FatBinaryKernelContractTest(unittest.TestCase):
         for path in sources:
             with self.subTest(source=str(path.relative_to(root))):
                 self.assertEqual(
-                    self._one_image_only(self._uncommented(path.read_text())), [])
+                    self._one_image_only(self._uncommented(
+                        path.read_text(), self.single_image_arch.get(path))), [])
 
     def test_every_launch_is_visible_to_every_image(self):
         root, sources = self._sources()
@@ -1423,7 +1461,7 @@ class FatBinaryKernelContractTest(unittest.TestCase):
             with self.subTest(source=str(path.relative_to(root))):
                 self.assertEqual(
                     self._launched_in_one_image_only(
-                        self._uncommented(path.read_text())), [])
+                        self._uncommented(path.read_text(), self.single_image_arch.get(path))), [])
 
     def test_every_launch_site_names_its_callee(self):
         # A launch the scanner cannot name is silently skipped, so it must not
@@ -1465,6 +1503,20 @@ __global__ void only_tc02(float*, int, int) {}
             ["only_tc02 under #if defined(FLASHQLA_ARCH_150) && PH_XY_FACTOR"])
         self.assertEqual(
             self._launched_in_one_image_only(self._uncommented(body_guarded)), [])
+
+    def test_scanner_accepts_only_the_configured_single_image_guard(self):
+        guarded = """
+#if !defined(__HGGC_ARCH__) || __HGGC_ARCH__ == 100
+__global__ void decode(float* x) {}
+  decode<<<grid, block>>>(x);
+#endif
+"""
+        missing = ["decode under #if !defined(__HGGC_ARCH__) || __HGGC_ARCH__ == 100"]
+        for arch, expected in ((None, missing), (100, []), (150, missing)):
+            with self.subTest(arch=arch):
+                lines = self._uncommented(guarded, arch)
+                self.assertEqual(self._one_image_only(lines), expected)
+                self.assertEqual(self._launched_in_one_image_only(lines), expected)
 
     def test_scanner_checks_every_branch(self):
         else_only = """

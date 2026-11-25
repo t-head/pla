@@ -36,6 +36,9 @@ Namespaces and their compiled artifacts:
     pla.decode.gdn.v_last       -> pla/decode/gdn/v_last/_C.*.so         (src/decode/v-last/**)
     pla.decode.kda_replayssm_sglang -> pla/decode/kda_replayssm_sglang/_C.*.so
     pla.decode.kda_replayssm_vllm   -> pla/decode/kda_replayssm_vllm/_C.*.so
+    pla.decode.gdn_replayssm       -> pla/decode/gdn_replayssm/_C.*.so
+    pla.decode.gdn_replayssm_sglang -> shared gdn_replayssm extension
+    pla.decode.gdn_replayssm_hlm    -> shared gdn_replayssm extension
     pla.prefill.flashqla        -> pla/prefill/flashqla/_C.*.so          (src/prefill/flashqla/**)
     pla.prefill.flashkdapro     -> pla/prefill/flashkdapro/_C.*.so       (src/prefill/flashkdapro/**)
 
@@ -96,6 +99,8 @@ here = os.path.abspath(os.path.dirname(__file__))
 # ---------------------------------------------------------------------------
 ALL_NAMESPACES = ("pla.decode", "pla.decode.gdn.v_last",
                   "pla.decode.kda_replayssm_sglang", "pla.decode.kda_replayssm_vllm",
+                  "pla.decode.gdn_replayssm", "pla.decode.gdn_replayssm_sglang",
+                  "pla.decode.gdn_replayssm_hlm",
                   "pla.prefill.flashqla", "pla.prefill.flashkdapro")
 
 
@@ -323,6 +328,63 @@ for kda_namespace in ("pla.decode.kda_replayssm_sglang", "pla.decode.kda_replays
             extra_link_args=[],
         )
     )
+
+
+# ---------------------------------------------------------------------------
+# pla.decode.gdn_replayssm and its Python adapters
+# ---------------------------------------------------------------------------
+if any(ns in NAMESPACES for ns in (
+    "pla.decode.gdn_replayssm", "pla.decode.gdn_replayssm_sglang", "pla.decode.gdn_replayssm_hlm"
+)):
+    decode_dir = Path(here) / "src" / "decode"
+    common = decode_dir / "gdn_replayssm" / "common"
+    sglang = decode_dir / "gdn_replayssm_sglang" / "common"
+    hlm = decode_dir / "gdn_replayssm_hlm"
+    hlm_common = hlm / "common"
+    cached_ppu10 = hlm / "tc01" / "gdn_replayssm_cached_ppu10.cu"
+    cached_ppu15 = hlm / "tc02" / "gdn_replayssm_cached_ppu15.cu"
+    extension = Extension(
+        name='pla.decode.gdn_replayssm._C',
+        sources=[str(source) for source in (
+            common / "gdn_replayssm_host.cpp",
+            common / "gdn_replayssm.cu",
+            sglang / "gdn_replayssm_sglang_host.cpp",
+            sglang / "gdn_replayssm_sglang.cu",
+            hlm_common / "gdn_replayssm_hlm_host.cpp",
+            hlm_common / "gdn_replayssm_cached.cu",
+            cached_ppu10,
+            cached_ppu15,
+        )],
+        depends=[str(decode_dir.parent / "ppu_torch_stream.h")] + sorted(
+            str(header) for directory in (common, sglang, hlm)
+            for header in directory.rglob("*") if header.suffix in {".h", ".cuh"}),
+        extra_compile_args={
+            'cxx': ['-O3'],
+            'hgcc': [
+                '-x', 'hg',
+                '-O3',
+                '-std=c++17',
+                '--use_fast_math',
+                '-lineinfo',
+                '-mllvm', '-ppu-patch-fence-ppu=false',
+                '-mllvm', '-wno-loop-miss-transform',
+                '-mllvm', '-ppu-cg-to-kp1=true',
+                '-mllvm', '-ppu-fix-uninit=true',
+                '-mllvm', '-ppu-force-warpage=true',
+                '-mllvm', '-sort-copy-before-coalesce=true',
+                '-mllvm', '-ppu-eliminate-early-v2s=true',
+                '-mllvm', '-ppu-pref-fma-reuse=true',
+                '--threads', HGCC_THREADS,
+                '-arch=ppu_10', '-arch=ppu_15',
+            ],
+        },
+        include_dirs=[os.path.join(here, "src")],
+        extra_link_args=[],
+    )
+    extension.ppu10_sources = [str(cached_ppu10)]
+    extension.ppu15_sources = [str(cached_ppu15)]
+    extension.ppu_cuda_compat_headers = True
+    ext_modules.append(extension)
 
 
 # ---------------------------------------------------------------------------

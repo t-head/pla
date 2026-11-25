@@ -158,6 +158,10 @@ class PPUBuildExtension(build_ext):
             "-U__HGGC_NO_BFLOAT16_CONVERSIONS__",
         ]
         cxx_flags = list(postargs.get("cxx", []))
+        if getattr(extension, "ppu_cuda_compat_headers", False):
+            compat_include = self._ppu_sdk / "CUDA_SDK" / "include"
+            if (compat_include / "cuda_runtime.h").is_file():
+                cxx_flags.append(f"-I{compat_include}")
         if not any(flag.startswith("-std=") for flag in cxx_flags):
             cxx_flags.append("-std=c++17")
         base_flags = self._base_flags(extension)
@@ -233,12 +237,28 @@ class PPUBuildExtension(build_ext):
         if hasattr(extension, "fla_builder"):
             _, manifest = extension.fla_builder.compile_objects(self, extension)
 
+        specialized = {
+            target: getattr(extension, f"{directory}_sources", ())
+            for target, directory in (("ppu_10", "ppu10"), ("ppu_15", "ppu15"))
+        }
+        specialized_sources = {source for sources in specialized.values() for source in sources}
         objects = self.compile_sources(
-            extension.sources,
+            [path for path in extension.sources if path not in specialized_sources],
             output_dir,
             extension,
             depends=extension.depends,
         )
+        for target, sources in specialized.items():
+            if not sources:
+                continue
+            # Architecture-specific stubs carry a single device image.
+            compile_args = dict(extension.extra_compile_args)
+            compile_args["hgcc"] = [flag for flag in compile_args["hgcc"]
+                                    if not flag.startswith("-arch=") or flag == f"-arch={target}"]
+            objects += self.compile_sources(
+                sources, output_dir / target.replace("_", ""), extension, compile_args,
+                depends=extension.depends,
+            )
         objects += list(extension.extra_objects or [])
         link_command = self._link(extension, objects, self.get_ext_fullpath(extension.name))
 
