@@ -108,8 +108,8 @@ jobs:
         git config --global --add safe.directory "*"
         source /usr/local/PPU_SDK/envsetup.sh
         export PPU_SDK_DIR=/usr/local/PPU_SDK
-        # Make the ACTLIZE headers explicit instead of relying on setup.py's own
-        # 3rdparty/actlize probe; ci-infra has already checked the submodule out.
+        # Point at the submodule explicitly instead of relying on the built-in
+        # 3rdparty/actlize probe; ci-infra has already checked it out.
         export PPU_ACTLIZE_DIR="$PWD/3rdparty/actlize"
         "$PPU_SDK_DIR/bin/hgcc" --version
         # Drop any pre-installed copy so the fresh wheel is the only candidate.
