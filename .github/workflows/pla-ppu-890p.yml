@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 env:
-  SAIL_IMAGE: download.t-head.cn/docker_release/pytorch:sdk2.2.0-2.10.0-ubuntu24.04-hggcrt3-py312-20261005
+  SAIL_IMAGE: download.t-head.cn/docker_release/pytorch:sdk2.2.1-2.10.0-ubuntu24.04-hggcrt3-py312-20261123
 
 jobs:
   wait-review:
