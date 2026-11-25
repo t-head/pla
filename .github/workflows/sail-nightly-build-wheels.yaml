@@ -1,0 +1,129 @@
+name: sail nightly build pla
+
+on:
+  push:
+    branches:
+      - 'ci/add_nightly_build_fj'
+  schedule:
+    # Daily at 11:30 UTC (19:30 Beijing time), same slot as the other nightlies.
+    - cron: '30 11 * * *'
+  workflow_dispatch:
+    inputs:
+      package_name:
+        description: 'Name of the package to build and upload'
+        required: true
+        type: string
+        default: pla
+      framework:
+        description: 'Name of the dependent framework, e.g. torch'
+        required: true
+        type: string
+        default: torch
+      python_versions:
+        description: 'JSON array; allowed values: 38, 310, 312'
+        required: true
+        type: string
+        default: '["312"]'
+      os_versions:
+        description: 'JSON array; allowed values: ubuntu2004, ubuntu2204, ubuntu2404, alios7u2'
+        required: true
+        type: string
+        default: '["ubuntu2404"]'
+      runtime_versions:
+        description: 'JSON array; allowed HGGCRT versions: 2, 3'
+        required: true
+        type: string
+        default: '["3"]'
+      torch_versions:
+        description: 'JSON array; allowed values: 2.10.0, 2.13.0; [""] skips Torch installation'
+        required: true
+        type: string
+        default: '["2.13.0"]'
+      sdk_versions:
+        description: 'JSON array; allowed values: 2.1.1, 2.2.0, 2.2.1'
+        required: true
+        type: string
+        default: '["2.2.1"]'
+      branch:
+        description: 'Source branch, tag, or full commit SHA; leave empty to use the commit that triggered the workflow'
+        required: false
+        type: string
+        default: ''
+      package_version:
+        description: 'Artifactory package version and automatic upload directory prefix; does not override the wheel version'
+        required: true
+        type: string
+        default: 'master'
+      package_edition:
+        description: 'Artifactory package edition; defaults to oe, matching the release workflow'
+        required: true
+        type: string
+        default: oe
+      package_type:
+        description: 'Artifactory package type; defaults to pypi'
+        required: false
+        type: string
+        default: pypi
+      build_command:
+        description: 'Custom Bash build command; leave empty to build every PLA namespace from the repository root; only trusted configuration is accepted'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: nightly-build-${{ inputs.package_name || 'pla' }}-${{ inputs.branch || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    uses: t-head/ci-infra/.github/workflows/nightly-build.yml@main
+    secrets:
+      template_token: ${{ secrets.TEMPLATE_TOKEN }}
+      release_username: ${{ secrets.RELEASE_USERNAME }}
+      release_token: ${{ secrets.RELEASE_TOKEN }}
+    with:
+      package_name: ${{ inputs.package_name || 'pla' }}
+      framework: ${{ inputs.framework || 'torch' }}
+      template_repository: t-head/ci-infra
+      template_ref: main
+      python_versions: ${{ inputs.python_versions || '["312"]' }}
+      os_versions: ${{ inputs.os_versions || '["ubuntu2404"]' }}
+      runtime_versions: ${{ inputs.runtime_versions || '["3"]' }}
+      torch_versions: ${{ inputs.torch_versions || '["2.13.0"]' }}
+      sdk_versions: ${{ inputs.sdk_versions || '["2.2.1"]' }}
+      branch: ${{ inputs.branch || '' }}
+      # setup.py declares version='1.1.0' literally, so this only drives the
+      # Artifactory path and property.
+      package_version: ${{ inputs.package_version || 'master' }}
+      package_edition: ${{ inputs.package_edition || 'oe' }}
+      package_type: ${{ inputs.package_type || 'pypi' }}
+      build_command: |
+        ${{ inputs.build_command || 'unset PIP_INDEX_URL PYTHONPATH PLA_BUILD_NAMESPACE PPU_ACTLIZE_DIR
+        # setup.py may shell out to `git submodule update`; inside the container the
+        # checkout belongs to another uid, so git would refuse with "dubious ownership".
+        git config --global --add safe.directory "*"
+        source /usr/local/PPU_SDK/envsetup.sh
+        export PPU_SDK_DIR=/usr/local/PPU_SDK
+        # Make the ACTLIZE headers explicit instead of relying on setup.py's own
+        # 3rdparty/actlize probe; ci-infra has already checked the submodule out.
+        export PPU_ACTLIZE_DIR="$PWD/3rdparty/actlize"
+        "$PPU_SDK_DIR/bin/hgcc" --version
+        # Drop any pre-installed copy so the fresh wheel is the only candidate.
+        pip uninstall -y pla || true
+        # The collector keeps exactly one wheel whose name starts with pla.
+        rm -rf dist
+        # Build dependencies copied from pla-ut-upload-tmp.yml; pybind11 and ninja
+        # are used by ppu_build.PPUBuildExtension.
+        python -m pip install setuptools==69.5.1 setuptools-scm==9.2.2 \
+          packaging==24.2 wheel==0.45.1 pybind11==2.13.6 ninja==1.11.1.4 \
+          numpy==1.26.4 pandas==2.2.3 einops==0.8.1
+        export MAX_JOBS=20
+        # PLA reads HGCC_THREADS (not NVCC_THREADS) to cap per-file hgcc threads.
+        export HGCC_THREADS=2
+        # Full build: every namespace. The wheel lands in dist/.
+        python setup.py bdist_wheel
+        ls -lh dist/*.whl' }}
