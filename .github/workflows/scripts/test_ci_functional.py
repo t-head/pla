@@ -387,6 +387,17 @@ class FunctionalCITests(unittest.TestCase):
         self.assertIn("uses: actions/upload-artifact/merge@v4", workflow)
         self.assertIn("if: ${{ inputs.push }}", workflow)
         self.assertIn("uses: t-head/ci-infra/.github/workflows/push-tmp-wheel.yml@main", workflow)
+        # The template refuses to infer the wheel source from the calling
+        # repository, so build-test must record it from its checkout and the
+        # merge job must forward it to the publishing call.
+        source = workflow.split("- name: Record source information used for the build", 1)[1]
+        source = source.split("      - name:", 1)[0]
+        self.assertIn('printf \'commit=%s\\n\' "$(git rev-parse HEAD)"', source)
+        self.assertIn("git symbolic-ref --quiet --short HEAD", source)
+        self.assertIn("git tag --points-at HEAD", source)
+        for field in ("repo", "commit", "branch", "tag"):
+            self.assertIn(f"{field}: ${{{{ steps.source.outputs.{field} }}}}", workflow)
+            self.assertIn(f"{field}: ${{{{ needs.merge.outputs.{field} }}}}", workflow)
         for secret in ("RELEASE_USERNAME", "RELEASE_TOKEN", "TEMPLATE_TOKEN"):
             self.assertIn("secrets." + secret, workflow)
         self.assertNotIn("://", workflow)
