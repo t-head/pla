@@ -237,26 +237,27 @@ class PPUBuildExtension(build_ext):
         if hasattr(extension, "fla_builder"):
             _, manifest = extension.fla_builder.compile_objects(self, extension)
 
+        # cudafy rewrites complete target flags in both setup.py and this table.
         specialized = {
-            target: getattr(extension, f"{directory}_sources", ())
-            for target, directory in (("ppu_10", "ppu10"), ("ppu_15", "ppu15"))
+            "-arch=ppu_10": ("ppu10", getattr(extension, "ppu10_sources", ())),
+            "-arch=ppu_15": ("ppu15", getattr(extension, "ppu15_sources", ())),
         }
-        specialized_sources = {source for sources in specialized.values() for source in sources}
+        specialized_sources = {source for _, sources in specialized.values() for source in sources}
         objects = self.compile_sources(
             [path for path in extension.sources if path not in specialized_sources],
             output_dir,
             extension,
             depends=extension.depends,
         )
-        for target, sources in specialized.items():
+        for target_flag, (directory, sources) in specialized.items():
             if not sources:
                 continue
             # Architecture-specific stubs carry a single device image.
             compile_args = dict(extension.extra_compile_args)
             compile_args["hgcc"] = [flag for flag in compile_args["hgcc"]
-                                    if not flag.startswith("-arch=") or flag == f"-arch={target}"]
+                                    if flag not in specialized or flag == target_flag]
             objects += self.compile_sources(
-                sources, output_dir / target.replace("_", ""), extension, compile_args,
+                sources, output_dir / directory, extension, compile_args,
                 depends=extension.depends,
             )
         objects += list(extension.extra_objects or [])
