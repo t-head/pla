@@ -1722,7 +1722,7 @@ std::vector<torch::Tensor> fused_fwd(
 // Structural selection and FP64 recovery keep scratch local to a call/Graph.
 // A missing selection tensor retains the private force-all diagnostic mode.
 torch::Tensor precision_guard(torch::Tensor k, torch::Tensor cu, bool include_empty,
-    c10::optional<torch::Tensor> beta) {
+    c10::optional<torch::Tensor> beta, bool complete_layout) {
     TORCH_CHECK(k.is_cuda() && k.dim() == 4 && k.size(0) == 1 && k.size(3) == 128 &&
                 k.is_contiguous() && (k.scalar_type() == torch::kHalf ||
                 k.scalar_type() == torch::kBFloat16),
@@ -1740,14 +1740,29 @@ torch::Tensor precision_guard(torch::Tensor k, torch::Tensor cu, bool include_em
         "precision guard beta must be contiguous FP32 [1,T,H]");
     const c10::cuda::CUDAGuard guard(k.device());
     const auto device = logical_device_info(k);
-    const bool allow_parallel = device.compute_capability == 89 && device.num_cu == 39;
+    const int64_t heads = beta ? beta->size(2) : 0;
+    const int64_t guard_tasks = n * hg;
+    const bool tc01_short_windows = n > 1 && heads >= 24 && hg <= 8 &&
+        guard_tasks <= device.num_cu && t >= 256 && t <= 1024 && t >= n * 64;
+    const bool tc01_two_guard_waves = n <= 8 && guard_tasks <= 2 * device.num_cu &&
+        t >= n * 512;
+    const bool tc01_long_windows = hg <= 16 && t >= 2048 && t >= n * 256 && t <= 32831 &&
+        (guard_tasks <= device.num_cu || tc01_two_guard_waves || (hg <= 4 && n <= 64 && t >= 8192));
+    // The window grid spans T. The host plan knows whether T includes padding.
+    const bool tc01_windows = complete_layout &&
+        device.compute_capability == 80 && device.num_cu == 64 &&
+        (tc01_short_windows || tc01_long_windows);
+    const bool tc02_windows = device.compute_capability == 89 && device.num_cu == 39 &&
+        (n <= 3 || ((n == 16 || n == 32 || n == 64) && heads == 8 && (hg == 2 || hg == 4))) &&
+        hg <= 16 && ((t >= 1024 && t <= 32831) ||
+        (n == 1 && heads == 16 && hg == 4 && t >= 768 && t < 1024));
     auto flags = torch::empty({n,hg}, k.options().dtype(torch::kInt));
     if (!pla::bypass::enabled()) {
         flashqla_precision::launch_guard(k.data_ptr(),cu.data_ptr<int32_t>(),
             flags.data_ptr<int32_t>(),int(t),int(hg),int(n),dtype_tag(k),include_empty,
             pla::current_stream(k.get_device()),
-            beta ? beta->data_ptr<float>() : nullptr, beta ? int(beta->size(2)) : 0,
-            allow_parallel);
+            beta ? beta->data_ptr<float>() : nullptr, int(heads),
+            tc01_windows || tc02_windows);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
     return flags;
@@ -2072,7 +2087,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     m.def("_precision_guard", &precision_guard,
           py::arg("k"), py::arg("cu"), py::arg("include_empty") = false,
-          py::arg("beta") = c10::nullopt);
+          py::arg("beta") = c10::nullopt, py::arg("complete_layout") = false);
     m.def("_precision_guard_snapshot_short", &precision_guard_snapshot_short,
           py::arg("k"), py::arg("cu"), py::arg("include_empty"), py::arg("beta"),
           py::arg("initial"), py::arg("indices"), py::arg("heads"));

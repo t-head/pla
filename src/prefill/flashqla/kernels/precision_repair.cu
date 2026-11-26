@@ -732,13 +732,7 @@ void launch_guard(const void* k, const int32_t* cu, int32_t* flags,
     hggcStream_t stream, const float* beta, int heads, bool allow_parallel) {
     const int tasks = sequences*key_heads;
     if (!tasks) return;
-    // Private current-890P experiment. Preserve the exact structural classifier,
-    // short/empty rules and atomic OR result; expose independent windows only.
-    if (allow_parallel && sequences >= 1 &&
-        (sequences <= 3 || ((sequences == 16 || sequences == 32 || sequences == 64) && heads == 8 &&
-         (key_heads == 2 || key_heads == 4))) && key_heads <= 16 &&
-        ((tokens >= 1024 && tokens <= 32831) ||
-         (sequences == 1 && heads == 16 && key_heads == 4 && tokens >= 768 && tokens < 1024))) {
+    if (allow_parallel) {
         guard_init_parallel_kernel<<<1,256,0,stream>>>(
             cu,flags,tokens,key_heads,sequences,include_empty);
         const int windows=int((int64_t(tokens)+127)/128);
