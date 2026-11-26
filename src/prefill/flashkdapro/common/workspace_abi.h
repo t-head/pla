@@ -106,6 +106,15 @@ enum class KrWorkspaceLayout : int {
     kNormalAffineP = 1,
     kContiguousRawKrT = 2,
     kContiguousAffineP = 3,
+    // TC02 padded preparation stores logical [CH,DK] rows. AIU consumers
+    // stage them with 128-byte cube rows, independently of the older swizzle.
+    kRowMajorRaw = 4,
+    kRowMajorAffineP = 5,
 };
+
+constexpr bool kr_workspace_row_major(KrWorkspaceLayout layout) {
+    return layout == KrWorkspaceLayout::kRowMajorRaw ||
+           layout == KrWorkspaceLayout::kRowMajorAffineP;
+}
 
 }  // namespace flashkda

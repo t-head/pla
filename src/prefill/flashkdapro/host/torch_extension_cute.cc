@@ -88,12 +88,12 @@ namespace {
 
 namespace sp = pla::sanity::prefill;
 
-// Upstream appends an aligned (N+1)-entry tile-prefix table to the workspace.
+// Preserve the tile-prefix position and append a bounded precision-request list.
 // Keep the same internal ABI in bf16 allocation units; the K1 launcher derives
 // the table address from the end of the per-(head,tile) byte-image slots.
 int64_t tile_prefix_units(int N, bool is_varlen) {
     if (!is_varlen) return 0;
-    int64_t bytes = (int64_t(N + 1) * int64_t(sizeof(int32_t)) + 127) / 128 * 128;
+    int64_t bytes = (2 * int64_t(N + 1) * int64_t(sizeof(int32_t)) + 127) / 128 * 128;
     return bytes / int64_t(sizeof(at::BFloat16));
 }
 
@@ -165,7 +165,7 @@ constexpr int CP_FIXED_H12_MIN_SEQ_LEN = 16384;
 constexpr int CP_RAGGED_H12_N2_MIN_SEQ_LEN = 6144;
 constexpr int CP_RAGGED_H12_N3_MIN_SEQ_LEN = 4096;
 constexpr int CP_RAGGED_WIDE_MIN_SEQ_LEN = 4096;
-constexpr int64_t CP_MAX_AUX_BYTES = int64_t(1) << 30;   // chain + carries
+constexpr int64_t CP_MAX_AUX_BYTES = flashkda::KDA_MAX_AUX_BYTES;   // chain + carries
 
 // tc01 AUTO is a conservative additive admission path, matching FlashQLA's
 // legacy-plus-TFU model: shapes outside this measured interval remain serial,
@@ -225,6 +225,8 @@ struct CpPlan {
     bool automatic_short_merge = false;
     bool short_k1_lb8 = false;
     bool engage = false;
+    bool has_empty_sequences = true;
+    bool has_short_sequences = false;
     bool fma_front = false;
     int n_seg = 0;
     int bv = 32;
@@ -425,6 +427,8 @@ bool use_tc01_bt64_candidate(
 // Besides making cache keys complete, this prevents one launch from observing
 // a mixture of old and new values when an A/B harness updates the overrides.
 struct CpConfig {
+    bool bf16_resident = false;
+    bool bf16_row_major = false;
     bool automatic_nt256 = false;
     bool automatic_short_merge = false;
     bool short_k1_lb8 = false;
@@ -448,7 +452,8 @@ struct CpConfig {
     bool bt64_align = false;
 
     bool operator==(const CpConfig& other) const {
-        return short_k1_lb8 == other.short_k1_lb8 && automatic_short_merge == other.automatic_short_merge &&
+        return bf16_resident == other.bf16_resident && bf16_row_major == other.bf16_row_major &&
+            short_k1_lb8 == other.short_k1_lb8 && automatic_short_merge == other.automatic_short_merge &&
             automatic_nt256 == other.automatic_nt256 && mode == other.mode && bv == other.bv
             && min_seg_tiles == other.min_seg_tiles
             && max_h == other.max_h && balance == other.balance
@@ -621,8 +626,11 @@ CpPlan plan_cp(const std::vector<int64_t>& seq_len,
     int64_t tile_sum = 0;
     int64_t bt_sum = 0;
     int max_seq_tiles = 0;
+    p.has_empty_sequences = false;
     for (int i = 0; i < N; ++i) {
         seq_tiles[i] = int((seq_len[i] + KDA_CHUNK - 1) / KDA_CHUNK);
+        p.has_empty_sequences |= seq_tiles[i] == 0;
+        p.has_short_sequences |= seq_len[i] > 0 && seq_len[i] <= flashkda::KDA_DIRECT_MAX_TOKENS;
         ws_tile_base[i] = int(tile_sum);
         tile_sum += seq_tiles[i];
         seq_bt_base[i] = int(bt_sum);
@@ -838,6 +846,28 @@ int cp_cu_count() {
     static int cached[flashkda::host_runtime::kMaxCachedDevices] = {};
     std::call_once(queried[device], [&]() { cached[device] = query(); });
     return cached[device];
+}
+
+// Query once per device; resource usage can change with SDK/compiler versions.
+// The CP grid should fit the least resident of the three sequential passes.
+int bf16_cp_resident_blocks(bool row_major, bool verify = false, bool full_tiles = false) {
+    const int device = flashkda::host_runtime::current_device();
+    auto query = [row_major, verify, full_tiles]() {
+        int blocks = 0;
+        const auto error = query_flashkda_bf16_resident_blocks(&blocks, row_major, verify, full_tiles);
+        TORCH_CHECK(error == hggcSuccess && blocks > 0,
+                    "FlashKDApro BF16 occupancy query failed: ", hggcGetErrorString(error));
+        return blocks;
+    };
+    if (device < 0 || device >= flashkda::host_runtime::kMaxCachedDevices)
+        return query();
+    const int variant = verify ? 1 + int(full_tiles) : 0;
+    static std::once_flag queried[flashkda::host_runtime::kMaxCachedDevices][2][3];
+    static int cached[flashkda::host_runtime::kMaxCachedDevices][2][3] = {};
+    std::call_once(queried[device][row_major][variant], [&]() {
+        cached[device][row_major][variant] = query();
+    });
+    return cached[device][row_major][variant];
 }
 
 // Trusted host offsets allow tc02 to select a CP schedule before any
@@ -1343,28 +1373,91 @@ std::shared_ptr<CachedCpPlan> get_or_build_cp_plan(
     int T_total, int H, int N, bool is_varlen, const torch::Tensor& cu_t,
     const c10::optional<std::vector<int64_t>>& raw_cu_opt,
     const torch::Tensor& device_ref, const c10::cuda::CUDAStream& stream, double lower_bound,
-    bool use_measured_schedule = false) {
+    bool use_measured_schedule = false, bool bf16_resident = false,
+    flashkda::KrWorkspaceLayout resident_layout = flashkda::KrWorkspaceLayout::kNormalAffineP,
+    bool independent_outputs = true) {
     const int device = device_ref.get_device();
     const auto architecture = flashkda::host_runtime::current_architecture();
     CpConfig requested = cp_config_from_env();
-    if (use_measured_schedule)
+    requested.bf16_resident = bf16_resident;
+    requested.bf16_row_major = bf16_resident && flashkda::kr_workspace_row_major(resident_layout);
+    const bool bf16_auto = bf16_resident && requested.mode == 1;
+    if (use_measured_schedule && !bf16_resident)
         requested = tc02_measured_cp_config(requested, T_total, H, N, is_varlen,
                                           architecture, raw_cu_opt, lower_bound);
-    if (!cp_dispatch_candidate(
-            T_total, H, N, is_varlen, architecture, requested))
+    if (bf16_auto) {
+        // Count the actual serial CTA grid. Once it fills
+        // two CU waves, extra recurrence passes do not repay their work. With
+        // device-only lengths keep the serial path free of a host readback.
+        if (int64_t(N) * H * (128 / flashkda::KDA_BF16_SERIAL_ROWS)
+                >= int64_t(cp_cu_count()) * 2 ||
+            (2 * int64_t(N) * H >= cp_cu_count() && !independent_outputs) ||
+            (is_varlen && !raw_cu_opt))
+            return std::make_shared<CachedCpPlan>();
+    } else if (!cp_dispatch_candidate(
+                   T_total, H, N, is_varlen, architecture, requested)) {
         return std::make_shared<CachedCpPlan>();
+    }
 
     const std::vector<int64_t> raw_cu = resolve_raw_cu(
         T_total, N, is_varlen, cu_t, raw_cu_opt);
-    int64_t max_seq_len64 = 0;
+    int64_t max_seq_len64 = 0, min_seq_len64 = std::numeric_limits<int64_t>::max();
+    bool full_tiles = true;
     for (int i = 0; i < N; ++i) {
-        max_seq_len64 = std::max(
-            max_seq_len64, raw_cu[size_t(i + 1)] - raw_cu[size_t(i)]);
+        const int64_t length = raw_cu[size_t(i + 1)] - raw_cu[size_t(i)];
+        max_seq_len64 = std::max(max_seq_len64, length);
+        min_seq_len64 = std::min(min_seq_len64, length);
+        full_tiles &= length % 16 == 0;
     }
+    const bool checkpoint_grid = bf16_auto && 2 * int64_t(N) * H >= cp_cu_count();
+    // A nearly occupied serial grid needs at least two amortized checkpoint
+    // segments per request. Short or mixed tails retain the serial kernel.
+    if (checkpoint_grid && min_seq_len64 < 2 * 16 * flashkda::KDA_REPLAY_MIN_TILES)
+        return std::make_shared<CachedCpPlan>();
     const int max_seq_len = int(std::min<int64_t>(
         max_seq_len64, std::numeric_limits<int>::max()));
-    const CpConfig config = effective_cp_config(
+    CpConfig config = effective_cp_config(
         architecture, max_seq_len, H, N, is_varlen, requested);
+    if (bf16_auto) {
+        // A segmented BF16 CTA owns all 128 value rows. Balance total work
+        // over one resident grid, keeping at least eight C16 chunks per
+        // segment to amortize its pipeline and the merge launch.
+        int64_t tiles = 0;
+        for (int i = 0; i < N; ++i)
+            tiles += (raw_cu[size_t(i + 1)] - raw_cu[size_t(i)] + 15) / 16;
+        const int resident_blocks = bf16_cp_resident_blocks(config.bf16_row_major, checkpoint_grid, full_tiles);
+        const int full_grid = std::max(1, resident_blocks * cp_cu_count() / H);
+        // Short chains pay a larger fraction for replicated summary/replay.
+        // Keep two blocks available for the two-stage pipeline, but leave one
+        // resident block unused when each full-grid chain spans at most two
+        // checkpoint-admission windows. Long chains retain full residency.
+        // Keep one residency slot for fused classification CTAs. Short
+        // chains retain the existing spare slot for checkpoint overhead.
+        const int available_blocks = std::max(1, resident_blocks - int(checkpoint_grid));
+        const int active_blocks = available_blocks > 2
+            && (tiles + full_grid - 1) / full_grid <= 2 * flashkda::KDA_REPLAY_MIN_TILES
+            ? available_blocks - 1 : available_blocks;
+        const int target_segments = std::max(1, active_blocks * cp_cu_count() / H);
+        const char *segment_override = getenv("PLA_FLASHKDA_CP_SEG_TILES");
+        config.min_seg_tiles = segment_override && segment_override[0]
+            ? std::max(1, config.min_seg_tiles)
+            : 2 * int64_t(N) * H >= cp_cu_count() ? flashkda::KDA_REPLAY_MIN_TILES : 8;
+        const int64_t segment_tiles = std::max<int64_t>(
+            config.min_seg_tiles, (tiles + target_segments - 1) / target_segments);
+        if (!config.mult_set)
+            config.mult = int(((max_seq_len64 + 15) / 16 + segment_tiles - 1) / segment_tiles);
+        if (checkpoint_grid && !config.mult_set) {
+            const int waves = (cp_cu_count() + N * H - 1) / (N * H);
+            const int max_segments = 1 + flashkda::KDA_REPLAY_MIN_TILES
+                / (waves * flashkda::KDA_REPLAY_PREFIX_TILES);
+            config.mult = std::min(config.mult, max_segments);
+        }
+        if (config.mult < 2) return std::make_shared<CachedCpPlan>();
+        config.mode = 2;
+        config.bv = 128;
+        config.mult_set = true;
+        config.balance = true;
+    }
 
     CpPlanKey key;
     key.device = device;
@@ -1607,8 +1700,8 @@ std::vector<torch::Tensor> flashkda_prepare(
 // Out-params, matching upstream flash_kda.fwd: the caller owns `out` and the
 // optional `final_state`, so the state dtype (bf16 or fp32) is the caller's
 // choice and the final state is only computed when a tensor is supplied. The
-// recurrence always carries the state in bf16 internally (FlashKDA design); an
-// fp32 state is rounded on load and widened on store, at the boundary only.
+// default recurrence retains FP32 resident state. Explicit TC02 BF16 mode narrows
+// at load and recurrent updates, independently of the external storage dtype.
 void validate_fwd_sanity(
     torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g,
     torch::Tensor beta, torch::Tensor A_log, torch::Tensor dt_bias,
@@ -1664,7 +1757,7 @@ void flashkda_fwd_impl(
     c10::optional<torch::Tensor> cu_seqlens_opt,
     c10::optional<torch::Tensor> state_indices_opt,
     c10::optional<std::vector<int64_t>> raw_cu_seqlens_opt,
-    const flashkda::ConditionedArguments* conditioned) {
+    const flashkda::ConditionedArguments* conditioned, bool state_accum_fp32 = true) {
     if (pla::bypass::enabled()) {
         const c10::cuda::OptionalCUDAGuard guard(q.is_cuda()
             ? c10::optional<c10::Device>(q.device()) : c10::nullopt);
@@ -1774,7 +1867,31 @@ void flashkda_fwd_impl(
                     && beta.stride(1) == 1 && beta.stride(0) >= H
                     && beta.stride(0) <= std::numeric_limits<int>::max(),
                 "beta must be bf16 CUDA [T_total,H] contiguous in H");
-    if (conditioned && (T_total <= 3 || conditioned->force_direct)) {
+    // Serving already owns a trusted Host copy of cu_seqlens. It lets the
+    // common exact-length path skip the padding kernel without a D2H read.
+    // Standalone callers without that metadata use a lightweight device check;
+    // either way, padding logic never inflates the prepare-kernel ABI/resources.
+    auto zero_padded_output = [&](hggcStream_t output_stream) {
+        if (!is_varlen) return;
+        int valid_tokens = -1;
+        bool launch_padding = true;
+        if (raw_cu_seqlens_opt.has_value()) {
+            const auto& raw_cu = raw_cu_seqlens_opt.value();
+            TORCH_CHECK(
+                raw_cu.size() == size_t(N + 1),
+                "raw_cu_seqlens must have N+1 entries, got ", raw_cu.size(),
+                " for N=", N);
+            const int64_t endpoint = raw_cu.back();
+            launch_padding = endpoint >= 0 && endpoint < T_total;
+            if (launch_padding) valid_tokens = int(endpoint);
+        }
+        if (launch_padding) {
+            launch_flashkda_zero_padded_output_tail(
+                reinterpret_cast<void*>(out.data_ptr<at::BFloat16>()),
+                T_total, H, N, cu, valid_tokens, output_stream);
+        }
+    };
+    if (conditioned && (T_total <= flashkda::KDA_DIRECT_MAX_TOKENS || conditioned->force_direct)) {
         const hggcStream_t direct_stream = pla::current_stream(q.get_device());
         torch::Tensor protected_initial;
         const float* protected_ptr = nullptr;
@@ -1783,8 +1900,7 @@ void flashkda_fwd_impl(
             flashkda::launch_conditioned_preserve(*conditioned, protected_initial.data_ptr<float>(), direct_stream);
             protected_ptr = protected_initial.data_ptr<float>();
         }
-        if (is_varlen)
-            launch_flashkda_zero_padded_output_tail(out.data_ptr(), T_total, H, N, cu, -1, direct_stream);
+        zero_padded_output(direct_stream);
         flashkda::launch_conditioned_direct(*conditioned, false, direct_stream, nullptr, protected_ptr);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
         return;
@@ -1798,9 +1914,9 @@ void flashkda_fwd_impl(
     auto ws = ws_storage.narrow(0, 0, nht * flashkda::WS_SLOT_UNITS)
                   .view({nht, flashkda::WS_SLOT_UNITS});
 
-    // K2 carries recurrent values in bf16 internally. The caller's bf16/fp32
-    // state buffer is consumed and produced directly by the recurrence kernels;
-    // fp32 conversion happens only for the elements owned by each CTA. Indexed
+    // The caller's BF16/FP32 state buffers are consumed and produced directly.
+    // Resident precision is selected independently by state_accum_fp32; storage
+    // conversion happens only for the elements owned by each CTA. Indexed
     // serving pools therefore avoid gather/scatter and full-pool dtype staging.
     const void* init_ptr = nullptr;
     if (has_state_in) {
@@ -1819,29 +1935,23 @@ void flashkda_fwd_impl(
     const auto torch_stream = c10::cuda::getCurrentCUDAStream(q.get_device());
     const hggcStream_t stream = pla::current_stream(q.get_device());
 
-    // Serving already owns a trusted Host copy of cu_seqlens. It lets the
-    // common exact-length path skip the padding kernel without a D2H read.
-    // Standalone callers without that metadata use a lightweight device check;
-    // either way, padding logic never inflates the prepare-kernel ABI/resources.
-    if (is_varlen) {
-        int valid_tokens = -1;
-        bool launch_padding = true;
-        if (raw_cu_seqlens_opt.has_value()) {
-            const auto& raw_cu = raw_cu_seqlens_opt.value();
-            TORCH_CHECK(
-                raw_cu.size() == size_t(N + 1),
-                "raw_cu_seqlens must have N+1 entries, got ", raw_cu.size(),
-                " for N=", N);
-            const int64_t endpoint = raw_cu.back();
-            launch_padding = endpoint >= 0 && endpoint < T_total;
-            if (launch_padding) valid_tokens = int(endpoint);
+    zero_padded_output(stream);
+
+    auto separate_outputs = [&] {
+        bool separate = true;
+        const torch::Tensor* inputs[] = {&q, &k, &v, &g, &beta, &A_log, &dt_bias,
+                                         &cu_t, &state_indices_t};
+        for (const auto* input : inputs) {
+            if (!input->defined()) continue;
+            separate &= !sp::overlaps(out, *input);
+            if (has_state_out) separate &= !sp::overlaps(*final_state_opt, *input);
         }
-        if (launch_padding) {
-            launch_flashkda_zero_padded_output_tail(
-                reinterpret_cast<void*>(out.data_ptr<at::BFloat16>()),
-                T_total, H, N, cu, valid_tokens, stream);
-        }
-    }
+        if (has_state_in) separate &= !sp::overlaps(out, *initial_state_opt);
+        if (has_state_out) separate &= !sp::overlaps(out, *final_state_opt);
+        if (has_state_in && has_state_out)
+            separate &= !sp::overlaps(*initial_state_opt, *final_state_opt);
+        return separate;
+    };
 
     // ---- CP plan -----------------------------------------------------------
     // Trusted Host offsets let serving reuse a value-keyed plan across every
@@ -1852,15 +1962,37 @@ void flashkda_fwd_impl(
         T_total, H, N, is_varlen, cu_t, raw_cu_seqlens_opt,
         q, torch_stream, lower_bound, indexed_state && state_is_fp32 &&
         has_state_in && has_state_out && q.is_contiguous() && k.is_contiguous() &&
-        v.is_contiguous() && g.is_contiguous() && beta.is_contiguous());
+        v.is_contiguous() && g.is_contiguous() && beta.is_contiguous(),
+        /*bf16_resident=*/!state_accum_fp32,
+        !(conditioned && conditioned->value_guard) ? flashkda::KrWorkspaceLayout::kRowMajorAffineP
+                                                 : flashkda::KrWorkspaceLayout::kNormalAffineP,
+        state_accum_fp32 || (separate_outputs()
+            && !(conditioned && (conditioned->value_guard || conditioned->fla_normalization))));
     const CpPlan& cp = cp_cached->plan;
     const torch::Tensor& seg_tbl_d = cp_cached->seg_tbl_d;
     const torch::Tensor& seq_seg_d = cp_cached->seq_seg_d;
     const torch::Tensor& seg_bt_d = cp_cached->seg_bt_d;
-    const flashkda::KrWorkspaceLayout kr_layout =
-        select_kr_workspace_layout(
+    // Pairing exposes four row slices per chain and halves the serial loop.
+    // Keep the existing CP path for grids below one CU wave, and bound extra
+    // preparation storage by the same 1 GiB budget as context parallelism.
+    const int64_t paired_bytes = flashkda_paired_workspace_bytes(T_total, H, N);
+    const bool paired = state_accum_fp32 && !cp.engage
+        && !flashkda::host_runtime::current_device_is_tc01()
+        && cp_env_int("PLA_FLASHKDA_TC02_PAIRED", 1) != 0
+        && int64_t(T_total) >= int64_t(N) * 128
+        && int64_t(N) * H * 4 >= cp_cu_count()
+        && int64_t(N) * H <= cp_cu_count()
+        && paired_bytes <= CP_MAX_AUX_BYTES;
+    const bool padded_prepare = (!state_accum_fp32 || paired)
+        && !(conditioned && conditioned->value_guard);
+    flashkda::KrWorkspaceLayout kr_layout = padded_prepare
+        ? (state_accum_fp32 ? flashkda::KrWorkspaceLayout::kRowMajorRaw
+                            : flashkda::KrWorkspaceLayout::kRowMajorAffineP)
+        : !state_accum_fp32 ? flashkda::KrWorkspaceLayout::kNormalAffineP : paired
+        ? flashkda::KrWorkspaceLayout::kNormalRaw
+        : select_kr_workspace_layout(
         T_total, H, N, total_tiles, is_varlen, cp);
-    const bool fp16_state = cp.engage
+    const bool fp16_state = state_accum_fp32 && cp.engage
         && !flashkda::host_runtime::current_device_is_tc01()
         && cp_env_int("PLA_FLASHKDA_CP_STATE_FP16", 0) != 0;
     const int64_t q_stride = flashkda::layout::token_stride(q);
@@ -1880,7 +2012,8 @@ void flashkda_fwd_impl(
             N, total_tiles, cu, is_varlen,
             tile_offset, tile_count, head_offset, head_count, ready,
             reinterpret_cast<void*>(ws.data_ptr<at::BFloat16>()),
-            /*force_plain=*/cp.engage, /*cp_fma_front=*/cp.fma_front,
+            /*force_plain=*/state_accum_fp32 && (cp.engage || paired),
+            /*cp_fma_front=*/state_accum_fp32 && cp.fma_front,
             /*fp16_kd_qd=*/fp16_state, kr_layout, target_stream,
             conditioned && conditioned->value_guard ? conditioned->v : nullptr, cp.short_k1_lb8);
     };
@@ -1918,13 +2051,64 @@ void flashkda_fwd_impl(
         }
     }
 
-    launch_prepare_range(0, total_tiles, 0, H, nullptr, stream);
-
+    // Raw FP32 consumers use the same rounded BF16 fields, but require
+    // the established Kr permutation. Keep their FP32 state recurrence;
+    // only the producer and its private shared-memory layout are replaced.
+    const bool padded_raw = state_accum_fp32 && !paired && !fp16_state && !cp.fma_front
+        && !flashkda::host_runtime::current_device_is_tc01()
+        && kr_layout == flashkda::KrWorkspaceLayout::kNormalRaw
+        && !(conditioned && conditioned->value_guard);
     torch::Tensor conditioned_flags, conditioned_state, deferred_final, value_flags;
+    const bool aggregate_prepared_flags = (padded_prepare || padded_raw) && conditioned
+        && !conditioned->value_guard && !conditioned->preserve_initial;
+    if (aggregate_prepared_flags)
+        conditioned_flags = torch::empty({N, H}, q.options().dtype(torch::kInt));
+    // The ordinary serial grid's wave budget bounds fused classification
+    // work per request, without a separate launch. Larger requests retain the independently scheduled classifier.
+    bool repair_in_serial = (!state_accum_fp32 || padded_raw) && !paired && !cp.engage && !bt64_ready
+        && aggregate_prepared_flags && (raw_cu_seqlens_opt || !is_varlen);
+    if (repair_in_serial) {
+        // A single logical request has no batch prefix or precision queue.
+        // Multi-request grids retain their bounded fused-classification work.
+        if (N > 1) {
+            constexpr int wave_tokens = 16 * (flashkda::KDA_BF16_SERIAL_ROWS / 16 + 2);
+            if (raw_cu_seqlens_opt) {
+                const auto& offsets = *raw_cu_seqlens_opt;
+                for (int i = 0; i < N; ++i)
+                    repair_in_serial &= offsets[i + 1] - offsets[i] <= wave_tokens;
+            } else repair_in_serial &= T_total <= wave_tokens;
+        }
+        repair_in_serial &= separate_outputs();
+    }
+    if (state_accum_fp32 && repair_in_serial)
+        kr_layout = flashkda::KrWorkspaceLayout::kRowMajorRaw;
+    // Deferral is limited to read-only state: aliased state keeps its
+    // original pre-recurrence classifier and snapshot ordering.
+    const bool classify_in_prescan = !state_accum_fp32 && cp.engage
+        && aggregate_prepared_flags && !bt64_ready;
     auto repair_args = conditioned ? *conditioned : flashkda::ConditionedArguments{};
+    torch::Tensor prepared_keys, prepared_conditions;
+    const int32_t* prepared_tile_prefix = nullptr;
+    if (padded_prepare || padded_raw) {
+        // Resolved serial conditions consume normalized keys inside K1.
+        prepared_keys = torch::empty({repair_in_serial ? int64_t(0) : nht, 256}, opt_bf16);
+        prepared_conditions = torch::empty({nht}, q.options().dtype(torch::kInt));
+        prepared_tile_prefix = launch_flashkda_bf16_prepare(q.data_ptr(), k.data_ptr(), g.data_ptr(), beta.data_ptr(),
+            A_log.data_ptr<float>(), dt_bias.data_ptr<float>(), float(scale), gate_scale,
+            T_total, H, N, total_tiles, int(beta.stride(0)), q_stride, k_stride,
+            cu, ws.data_ptr(), prepared_keys.data_ptr(), /*affine=*/!state_accum_fp32, stream,
+            padded_raw && kr_layout == flashkda::KrWorkspaceLayout::kNormalRaw,
+            aggregate_prepared_flags ? conditioned_flags.data_ptr<int32_t>() : nullptr,
+            classify_in_prescan || repair_in_serial, prepared_conditions.data_ptr<int32_t>(), repair_in_serial ? &repair_args : nullptr);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    } else {
+        launch_prepare_range(0, total_tiles, 0, H, nullptr, stream);
+    }
+
     const int32_t* final_indices = state_indices;
     if (conditioned) {
-        conditioned_flags = torch::empty({N, H}, q.options().dtype(torch::kInt));
+        if (!conditioned_flags.defined())
+            conditioned_flags = torch::empty({N, H}, q.options().dtype(torch::kInt));
         if (conditioned->value_guard) {
             conditioned_state = torch::empty({int64_t(N) * H * 65}, q.options().dtype(torch::kFloat));
             repair_args.value_scales = conditioned_state.data_ptr<float>();
@@ -1943,16 +2127,33 @@ void flashkda_fwd_impl(
             }
         } else {
             conditioned_state = torch::empty(
-                {conditioned->initial_state ? int64_t(N) * H * 128 * 128 : 0},
+                {conditioned->initial_state && !aggregate_prepared_flags ? int64_t(N) * H * 128 * 128 : 0},
                 q.options().dtype(torch::kFloat));
         }
-        flashkda::launch_conditioned_workspace_snapshot(
-            repair_args, ws.data_ptr(), total_tiles,
-            conditioned_flags.data_ptr<int32_t>(), conditioned_state.data_ptr<float>(), stream);
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        // Repair already supports reading an unchanged original state directly.
+        // Aliased/in-place state retains the established pre-write snapshot.
+        if (!aggregate_prepared_flags) {
+            flashkda::launch_conditioned_workspace_snapshot(
+                repair_args, ws.data_ptr(), total_tiles,
+                conditioned_flags.data_ptr<int32_t>(), conditioned_state.data_ptr<float>(), stream);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        }
+    }
+    // Complete read-only precision work in the existing bias launch when
+    // its grid can retain one independent warp per value row. No input may be
+    // overwritten before the ordinary replay has consumed it.
+    bool repair_in_prescan = classify_in_prescan && raw_cu_seqlens_opt.has_value()
+        && !cp.has_empty_sequences;
+    if (repair_in_prescan) {
+        constexpr int repair_warps = flashkda::WS_DK / 16 + 1;
+        for (int i = 0; i < N; ++i)
+            repair_in_prescan &= int64_t(cp.seq_seg[2 * i + 1]) * repair_warps >= flashkda::WS_DK;
+        repair_in_prescan &= separate_outputs();
     }
     auto finish_conditioned = [&] {
-        if (conditioned) {
+        if (conditioned && !repair_in_prescan && !repair_in_serial) {
+            const float *initial_snapshot = aggregate_prepared_flags
+                ? nullptr : conditioned_state.data_ptr<float>();
             static constexpr int64_t measured_offsets[] =
                 {0, 5963, 13826, 22400, 32230, 32768};
             const bool repair_cache = !repair_args.value_guard && !repair_args.fla_normalization
@@ -1967,16 +2168,71 @@ void flashkda_fwd_impl(
                 auto workspace = torch::empty({flashkda::conditioned_cache_bytes(T_total)},
                                               q.options().dtype(torch::kUInt8));
                 flashkda::launch_conditioned_repair_cached(
-                    repair_args, conditioned_flags.data_ptr<int32_t>(), conditioned_state.data_ptr<float>(),
+                    repair_args, conditioned_flags.data_ptr<int32_t>(), initial_snapshot,
                     workspace.data_ptr(), T_total, stream);
             } else {
                 flashkda::launch_conditioned_repair(
                     repair_args, conditioned_flags.data_ptr<int32_t>(),
-                    repair_args.value_guard ? nullptr : conditioned_state.data_ptr<float>(), stream);
+                    repair_args.value_guard ? nullptr : initial_snapshot, stream, cp.has_short_sequences);
             }
             C10_CUDA_KERNEL_LAUNCH_CHECK();
         }
     };
+
+    if (!state_accum_fp32) {
+        // Trusted host offsets can exclude empty requests without reading
+        // device metadata. Unknown/empty layouts retain the identity copy.
+        bool may_have_empty = !cp.engage || cp.has_empty_sequences;
+        if (!cp.engage && raw_cu_seqlens_opt) {
+            const auto& offsets = *raw_cu_seqlens_opt;
+            may_have_empty = std::adjacent_find(offsets.begin(), offsets.end(),
+                [](int64_t first, int64_t next) { return first >= next; }) != offsets.end();
+        }
+        // The conditioned finish already preserves empty requests in their
+        // public dtype, including indexed and aliased state. Avoid a duplicate
+        // identity copy before the recurrence.
+        if (may_have_empty && !conditioned)
+            launch_flashkda_bf16_empty_state(init_ptr, final_ptr, state_indices, final_indices,
+                state_is_fp32, cu, N, H, stream);
+        if (!cp.engage) {
+            int value_rows = flashkda::KDA_BF16_SERIAL_ROWS;
+            if (repair_in_serial) {
+                // Choose the split grid nearest the visible CU count; avoid
+                // doubling a nearly full wave. Longer chains retain their
+                // wide tiles; no device sequence lengths are read on the host.
+                int slices = 1;
+                while (slices < flashkda::KDA_BF16_SERIAL_ROWS / 16
+                       && 3 * int64_t(N) * H * slices < 2 * int64_t(cp_cu_count())) slices *= 2;
+                value_rows /= slices;
+            }
+            launch_flashkda_bf16_recurrence(out.data_ptr(), v.data_ptr(), v_stride, ws.data_ptr(), init_ptr, final_ptr, state_indices, final_indices,
+                state_is_fp32, T_total, H, N, total_tiles, cu, kr_layout, stream,
+                repair_in_serial ? &repair_args : nullptr,
+                repair_in_serial ? prepared_keys.data_ptr() : nullptr,
+                repair_in_serial ? prepared_conditions.data_ptr<int32_t>() : nullptr,
+                prepared_tile_prefix, value_rows);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+            finish_conditioned();
+            return;
+        }
+    }
+
+    if (state_accum_fp32 && repair_in_serial) {
+        launch_flashkda_fp32_serial(out.data_ptr(), v.data_ptr(), v_stride, ws.data_ptr(), init_ptr, final_ptr, state_indices, final_indices,
+            state_is_fp32, T_total, H, N, total_tiles, cu, prepared_tile_prefix, repair_args, stream);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        return;
+    }
+
+    if (paired) {
+        auto scratch = torch::empty({paired_bytes}, q.options().dtype(torch::kUInt8));
+        launch_flashkda_paired_recurrence(out.data_ptr(), v.data_ptr(), v_stride,
+            ws.data_ptr(), init_ptr, final_ptr, state_indices, final_indices,
+            state_is_fp32, T_total, H, N, total_tiles, cu, scratch.data_ptr(), kr_layout, stream);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        finish_conditioned();
+        return;
+    }
 
     // ---- BT64xCP composed pipeline ---------------------------------------
     // cp.bt64_align only engages inside the tc01 H8/N1 AUTO window under the
@@ -2109,23 +2365,84 @@ void flashkda_fwd_impl(
     auto opt_cp_state = fp16_state
         ? opt_bf16.dtype(torch::kFloat16) : opt_bf16;
     auto chain_state = torch::empty({2, cp.n_seg, H, 128, 128}, opt_cp_state);
-    auto carries = torch::empty({cp.n_seg, H, 128, 128}, opt_cp_state);
 
     if (cp_env_int("PLA_FLASHKDA_CP_VERBOSE", 0)) {
         fprintf(stderr, "[flashkdapro] CP engaged: T=%d H=%d N=%d n_seg=%d bv=%d\n",
                 T_total, H, N, cp.n_seg, cp.bv);
     }
 
-    const bool use_zero_flags = cp.automatic_short_merge && cp.bv == 64 && !fp16_state;
+    torch::Tensor replay_prefix, zero_slices;
+    bool full_cp_tiles = true, checkpoint_eligible = false;
+    if (!state_accum_fp32) {
+        int shortest=std::numeric_limits<int>::max();
+        for (int i=0;i<cp.n_seg;++i) {
+            const int length=cp.seg_tbl[i*flashkda::KDA_SEG_STRIDE+flashkda::KDA_SEG_LEN];
+            full_cp_tiles &= length % 16 == 0;
+            if (length>0) shortest=std::min(shortest,(length+15)/16);
+        }
+        const int64_t checkpoint_bytes=int64_t(cp.n_seg)*H*128*128*sizeof(at::BFloat16);
+        const bool disjoint=!sp::overlaps(out,v) && !sp::overlaps(out,beta)
+            && (!has_state_in || !sp::overlaps(out,*initial_state_opt))
+            && (!has_state_out || !sp::overlaps(out,*final_state_opt));
+        if (shortest!=std::numeric_limits<int>::max()
+            && shortest>=flashkda::KDA_REPLAY_MIN_TILES && disjoint
+            && checkpoint_bytes<=CP_MAX_AUX_BYTES/4)
+            checkpoint_eligible = true;
+    }
+
+    // Bound ordered checkpoint verification by the existing replay budget.
+    // Larger verification chains keep the parallel affine-proof pipeline.
+    bool verify_prefix = !state_accum_fp32 && checkpoint_eligible
+        && classify_in_prescan && !repair_in_prescan && !cp.has_empty_sequences
+        && separate_outputs() && !repair_args.value_guard && !repair_args.fla_normalization;
+    if (verify_prefix) {
+        int longest_chain = 0;
+        for (int i = 0; i < N; ++i)
+            longest_chain = std::max(longest_chain, cp.seq_seg[2 * i + 1] - 1);
+        int const waves = (cp_cu_count() + N * H - 1) / (N * H);
+        verify_prefix = int64_t(waves) * longest_chain * flashkda::KDA_REPLAY_PREFIX_TILES
+            <= flashkda::KDA_REPLAY_MIN_TILES;
+    }
+    if (verify_prefix) {
+        zero_slices = torch::empty({cp.n_seg, H}, q.options().dtype(torch::kInt));
+        // The unused affine-A slots hold checkpoints; true carries repair B
+        // in place after every prefix reader has completed.
+        launch_flashkda_bf16_cp_verify(ws.data_ptr(), chain_state.data_ptr(), zero_slices.data_ptr<int32_t>(),
+            seg_tbl_d.data_ptr<int32_t>(), cp.n_seg, total_tiles,
+            kr_layout, {prepared_keys.data_ptr(), conditioned_flags.data_ptr<int32_t>(),
+                seq_seg_d.data_ptr<int32_t>(), N, prepared_conditions.data_ptr<int32_t>()},
+            repair_args, full_cp_tiles, stream);
+        cp_check("checkpoint verification");
+        return;
+    }
+
+    auto carries = torch::empty({cp.n_seg, H, 128, 128}, opt_cp_state);
+    if (checkpoint_eligible)
+        replay_prefix = torch::empty({cp.n_seg,H,128,128},opt_bf16);
+
+    const bool use_zero_flags = !fp16_state && (!state_accum_fp32
+        || (cp.automatic_short_merge && cp.bv == 64));
     if (use_zero_flags) {
-        auto zero_slices = torch::empty({cp.n_seg, H, 2}, q.options().dtype(torch::kInt));
-        launch_flashkda_cp_prescan_zero_flags(v.data_ptr(), beta.data_ptr(), ws.data_ptr(),
-            chain_state.data_ptr(), zero_slices.data_ptr<int32_t>(), T_total, H, cp.n_seg,
-            total_tiles, seg_tbl_d.data_ptr<int32_t>(), stream);
+        zero_slices = torch::empty({cp.n_seg, H, 2}, q.options().dtype(torch::kInt));
+        if (!state_accum_fp32)
+            launch_flashkda_bf16_cp_prescan(v.data_ptr(), v_stride, ws.data_ptr(),
+                chain_state.data_ptr(), zero_slices.data_ptr<int32_t>(), T_total, H, cp.n_seg,
+                total_tiles, seg_tbl_d.data_ptr<int32_t>(), kr_layout, stream,
+                out.data_ptr(), replay_prefix.defined()?replay_prefix.data_ptr():nullptr, full_cp_tiles,
+                classify_in_prescan ? flashkda::PreparedClassification{
+                    prepared_keys.data_ptr(), conditioned_flags.data_ptr<int32_t>(),
+                    seq_seg_d.data_ptr<int32_t>(), N, prepared_conditions.data_ptr<int32_t>()}
+                    : flashkda::PreparedClassification{},
+                carries.data_ptr(), repair_in_prescan ? &repair_args : nullptr);
+        else
+            launch_flashkda_cp_prescan_zero_flags(v.data_ptr(), beta.data_ptr(), ws.data_ptr(),
+                chain_state.data_ptr(), zero_slices.data_ptr<int32_t>(), T_total, H, cp.n_seg,
+                total_tiles, seg_tbl_d.data_ptr<int32_t>(), stream);
         cp_check("pre_scan");
         launch_flashkda_cp_merge_zero_flags(chain_state.data_ptr(), init_ptr, carries.data_ptr(),
             state_indices, state_is_fp32, seq_seg_d.data_ptr<int32_t>(), zero_slices.data_ptr<int32_t>(),
-            H, N, cp.n_seg, stream);
+            H, N, cp.n_seg, stream, !state_accum_fp32,
+            repair_in_prescan ? conditioned_flags.data_ptr<int32_t>() : nullptr);
     } else {
         launch_flashkda_cp_prescan(
             reinterpret_cast<const void*>(v.data_ptr<at::BFloat16>()), v_stride,
@@ -2143,6 +2460,20 @@ void flashkda_fwd_impl(
             seq_seg_d.data_ptr<int32_t>(), H, N, cp.n_seg, stream);
     }
     cp_check("merge");
+
+    if (!state_accum_fp32) {
+        launch_flashkda_bf16_cp_segment(out.data_ptr(), v.data_ptr(), v_stride, ws.data_ptr(), carries.data_ptr(), final_ptr,
+            final_indices, state_is_fp32, T_total, H, cp.n_seg, total_tiles,
+            seg_tbl_d.data_ptr<int32_t>(), kr_layout, stream,
+            replay_prefix.defined()?replay_prefix.data_ptr():nullptr,
+            chain_state.data_ptr(),zero_slices.data_ptr<int32_t>(), full_cp_tiles,
+            repair_in_prescan ? flashkda::PreparedClassification{nullptr,
+                conditioned_flags.data_ptr<int32_t>(), seq_seg_d.data_ptr<int32_t>(), N}
+                : flashkda::PreparedClassification{});
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        finish_conditioned();
+        return;
+    }
 
     const int segment_bv = use_zero_flags && ((H == 8 && T_total == 1768) || (H == 16 && T_total == 1017))
         ? 32 : cp.bv;
@@ -2172,10 +2503,14 @@ flashkda::ConditionedArguments conditioned_arguments(
     const auto device = q.device();
     const int64_t t = q.size(0), h = q.size(1);
     TORCH_CHECK(t <= INT32_MAX && h > 0 && h <= INT32_MAX, "invalid KDA dimensions");
-    for (const auto* x : {&q, &k, &v, &g, &out})
+    for (const auto* x : {&q, &k, &v})
+        TORCH_CHECK(x->device() == device && x->scalar_type() == torch::kBFloat16 &&
+                    flashkda::layout::qkv_native(*x) && x->sizes() == q.sizes(),
+                    "q/k/v must have packed BF16 head rows [T,H,128] on the same device");
+    for (const auto* x : {&g, &out})
         TORCH_CHECK(x->device() == device && x->scalar_type() == torch::kBFloat16 &&
                     x->is_contiguous() && x->sizes() == q.sizes(),
-                    "q/k/v/g/out must be contiguous BF16 [T,H,128] on the same device");
+                    "g/out must be contiguous BF16 [T,H,128] on the same device");
     TORCH_CHECK(beta.device() == device && beta.scalar_type() == torch::kBFloat16 &&
                 beta.dim() == 2 && beta.size(0) == t && beta.size(1) == h &&
                 beta.stride(1) == 1 && beta.stride(0) >= h && beta.stride(0) <= INT32_MAX,
@@ -2224,6 +2559,9 @@ flashkda::ConditionedArguments conditioned_arguments(
     a.final_slots = final ? int(final->size(0)) : 0;
     a.state_fp32 = initial ? initial->scalar_type() == torch::kFloat
                           : final && final->scalar_type() == torch::kFloat;
+    a.q_stride = flashkda::layout::token_stride(q);
+    a.k_stride = flashkda::layout::token_stride(k);
+    a.v_stride = flashkda::layout::token_stride(v);
     a.scale = scale; a.lower_bound = lower_bound;
     a.fla_normalization = fla_normalization;
     a.value_guard = cp_env_int("PLA_FLASHKDA_VALUE_GUARD", 0) != 0;
@@ -2249,17 +2587,20 @@ void flashkda_fwd(
     c10::optional<torch::Tensor> final_state_opt,
     c10::optional<torch::Tensor> cu_seqlens_opt,
     c10::optional<torch::Tensor> state_indices_opt,
-    c10::optional<std::vector<int64_t>> raw_cu_seqlens_opt) {
+    c10::optional<std::vector<int64_t>> raw_cu_seqlens_opt,
+    bool state_accum_fp32) {
     if (pla::bypass::enabled() || !q.is_cuda()) {
         flashkda_fwd_impl(
             std::move(q), std::move(k), std::move(v), std::move(g), std::move(beta),
             std::move(A_log), std::move(dt_bias), std::move(out), scale, lower_bound,
             std::move(initial_state_opt), std::move(final_state_opt),
             std::move(cu_seqlens_opt), std::move(state_indices_opt),
-            std::move(raw_cu_seqlens_opt), nullptr);
+            std::move(raw_cu_seqlens_opt), nullptr, state_accum_fp32);
         return;
     }
     const c10::cuda::CUDAGuard device_guard(q.device());
+    TORCH_CHECK(state_accum_fp32 || !flashkda::host_runtime::current_device_is_tc01(),
+                "BF16 state accumulation requires TC02");
     torch::Tensor initial = initial_state_opt.value_or(torch::Tensor());
     torch::Tensor final = final_state_opt.value_or(torch::Tensor());
     torch::Tensor indices = state_indices_opt.value_or(torch::Tensor());
@@ -2284,15 +2625,15 @@ void flashkda_fwd(
     // of the live state. The public storage and staging checks above apply
     // before either kernel path can modify the caller's buffers.
     c10::optional<flashkda::ConditionedArguments> conditioned;
-    if (lower_bound == -5.0 &&
-        flashkda::host_runtime::current_architecture() ==
-            flashkda::host_runtime::PpuArchitecture::kTc02 && cp_cu_count() == 39 &&
+    if (flashkda::host_runtime::current_architecture() ==
+            flashkda::host_runtime::PpuArchitecture::kTc02 &&
+        (!state_accum_fp32 || (lower_bound == -5.0 && cp_cu_count() == 39 &&
         q.is_contiguous() && k.is_contiguous() && v.is_contiguous() &&
         g.is_contiguous() && beta.is_contiguous() &&
         cu_seqlens_opt && cu_seqlens_opt->scalar_type() == torch::kInt &&
         raw_cu_seqlens_opt && raw_cu_seqlens_opt->size() >= 2 &&
         raw_cu_seqlens_opt->size() == static_cast<size_t>(cu_seqlens_opt->numel()) &&
-        raw_cu_seqlens_opt->front() == 0 && raw_cu_seqlens_opt->back() == q.size(0)) {
+        raw_cu_seqlens_opt->front() == 0 && raw_cu_seqlens_opt->back() == q.size(0)))) {
         validate_fwd_sanity(q, k, v, g, beta, A_log, dt_bias, out, scale, lower_bound,
                             initial_state_opt, final_state_opt, cu_seqlens_opt,
                             state_indices_opt, raw_cu_seqlens_opt);
@@ -2313,7 +2654,7 @@ void flashkda_fwd(
         std::move(A_log), std::move(dt_bias), std::move(out), scale, lower_bound,
         std::move(initial_state_opt), std::move(final_state_opt),
         std::move(cu_seqlens_opt), std::move(state_indices_opt),
-        std::move(raw_cu_seqlens_opt), conditioned ? &*conditioned : nullptr);
+        std::move(raw_cu_seqlens_opt), conditioned ? &*conditioned : nullptr, state_accum_fp32);
     staged.publish();
 }
 
@@ -2589,7 +2930,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("cu_seqlens") = c10::optional<torch::Tensor>(),
           py::arg("state_indices") = c10::optional<torch::Tensor>(),
           py::arg("raw_cu_seqlens") =
-              c10::optional<std::vector<int64_t>>());
+              c10::optional<std::vector<int64_t>>(),
+          py::arg("state_accum_fp32") = true);
     m.def("flashkda_cp_plan", &flashkda_cp_plan,
           "Probe CP dispatch. The measured schedule assumes the qualified indexed FP32 input contract.",
           py::arg("T_total"), py::arg("H"),

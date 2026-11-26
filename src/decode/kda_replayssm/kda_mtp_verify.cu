@@ -55,8 +55,11 @@
 #include <hggc_runtime.h>
 
 #include <cstdint>
+#include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <utility>
+#include <type_traits>
 
 #include "kda_mtp_abi.h"
 
@@ -163,6 +166,9 @@ __device__ __forceinline__ float bfly_max(float x, int width) {
 
 using pla::kda_mtp::NativeVerify;
 using pla::kda_mtp::OnormArgs;
+using pla::kda_mtp::RecordFormat;
+template <RecordFormat FORMAT>
+using RecordOperand = std::conditional_t<FORMAT == RecordFormat::kReplay, BF16, float>;
 
 // Output epilogue of the verify kernels. kPlain stores bf16 o. kNorm applies
 // the gated output RMSNorm in the CTA; it needs all 128 value rows of a head,
@@ -232,8 +238,14 @@ using pla::kda_mtp::ConvStrides;
 using pla::kda_mtp::WindowStrides;
 using pla::kda_mtp::VerifyStrides;
 
-template <int VS, Out MODE, bool NATIVE = false, typename... Args>
-__global__ __launch_bounds__(THREADS) void verify_kernel(
+template <RecordFormat FORMAT, int VS> struct VerifyGeometry {
+  static constexpr int Threads = FORMAT != RecordFormat::kReplay && VS > 1 ? 128 : THREADS;
+  static constexpr int Groups = FORMAT != RecordFormat::kReplay && VS > 1 ? 16 : KGRPS;
+};
+
+template <int VS, Out MODE, bool NATIVE = false,
+          RecordFormat FORMAT = RecordFormat::kReplay, bool PREPARE = false, typename... Args>
+__global__ __launch_bounds__(VerifyGeometry<FORMAT, VS>::Threads) void verify_kernel(
     const BF16* __restrict__ x_q, const BF16* __restrict__ x_k,
     const BF16* __restrict__ x_v, const BF16* __restrict__ g_in,
     const BF16* __restrict__ beta_in, const float* __restrict__ w_q,
@@ -243,7 +255,8 @@ __global__ __launch_bounds__(THREADS) void verify_kernel(
     const float* __restrict__ dt_bias, const float* __restrict__ h0,
     BF16* __restrict__ out, BF16* __restrict__ ic_q,
     BF16* __restrict__ ic_k, BF16* __restrict__ ic_v,
-    BF16* __restrict__ ring_rawv, BF16* __restrict__ ring_rawk,
+    RecordOperand<FORMAT>* __restrict__ ring_rawv,
+    RecordOperand<FORMAT>* __restrict__ ring_rawk,
     float* __restrict__ ring_g, float* __restrict__ ring_beta,
     IndexArg slot_idx, IndexArg scratch_idx,
     IndexArg cu_seqlens, int H, int T_LOOP, int L, float scale,
@@ -254,10 +267,17 @@ __global__ __launch_bounds__(THREADS) void verify_kernel(
                 "verify takes only the argument for its active layout or epilogue");
   const auto native = verify_arg<NativeVerify, NATIVE>(args...);
   [[maybe_unused]] const auto onorm = verify_arg<OnormArgs, MODE != Out::kPlain>(args...);
-  constexpr bool PROTECT = NATIVE && pla::kda_mtp::kNativeNumericalProtection;
+  constexpr bool PROTECT = NATIVE && FORMAT == RecordFormat::kReplay &&
+                           pla::kda_mtp::kNativeNumericalProtection;
+  static_assert(FORMAT == RecordFormat::kReplay || NATIVE, "operand records use native ownership");
+  static_assert(!PREPARE || (NATIVE && FORMAT != RecordFormat::kReplay && VS == 1));
+  constexpr int THREADS = VerifyGeometry<FORMAT, VS>::Threads;
+  constexpr int KGRPS = VerifyGeometry<FORMAT, VS>::Groups;
+  constexpr int VROWS = THREADS / KGRPS, VPASSES = DIM / VROWS;
+  constexpr int F4_PER_THREAD = DIM / (4 * KGRPS);
   const int i_hv = blockIdx.x;
   const int i_n = blockIdx.y;
-  const int i_vs = blockIdx.z;              // v-split index (0..VS-1)
+  const int i_vs = VS == 1 ? 0 : int(blockIdx.z);  // v-split index (0..VS-1)
   const bool ring_writer = (i_vs == 0);     // only split 0 writes shared rings
   constexpr int PASSES_PB = VPASSES / VS;   // value-row passes per block
   static_assert(VPASSES % VS == 0, "VS must divide VPASSES");
@@ -297,6 +317,73 @@ __global__ __launch_bounds__(THREADS) void verify_kernel(
           else
             out[(long)(bos + t) * H * DIM + head_off + j] = __float2bfloat16(0.f);
         }
+    return;
+  }
+
+  if constexpr (PREPARE) {
+    const int channel = tid, lane = tid & 31, warp = tid >> 5;
+    const long ch = head_off + channel;
+    const BF16* inputs[] = {x_q, x_k, x_v};
+    const BF16* caches[] = {cs_q, cs_k, cs_v};
+    BF16* windows[] = {ic_q, ic_k, ic_v};
+    const ConvStrides cs[] = {strides.cs_q, strides.cs_k, strides.cs_v};
+    const WindowStrides ws[] = {strides.ic_q, strides.ic_k, strides.ic_v};
+    const int64_t xs[] = {strides.x_q, strides.x_k, strides.x_v};
+    const float4 weights[] = {reinterpret_cast<const float4*>(w_q)[ch],
+        reinterpret_cast<const float4*>(w_k)[ch], reinterpret_cast<const float4*>(w_v)[ch]};
+    float history[3][3];
+#pragma unroll
+    for (int a = 0; a < 3; ++a)
+#pragma unroll
+      for (int j = 0; j < 3; ++j)
+        history[a][j] = __bfloat162float(caches[a][
+            (long)slot * cs[a].slot + ch * cs[a].channel + j * cs[a].window]);
+    // Alternating norm tables let the next token start without overwriting
+    // another warp's current sums. The next barrier retires those readers.
+    __shared__ float norms[2][2][4];
+    const float exp_a = __expf(A_log[i_hv]), bias = dt_bias[ch];
+    for (int t = 0; t < n_tok; ++t) {
+      const int tok = bos + t;
+      float value[3];
+#pragma unroll
+      for (int a = 0; a < 3; ++a) {
+        const float x = __bfloat162float(inputs[a][(long)tok * xs[a] + ch]);
+        const float4 w = weights[a];
+        float c = x * w.w;
+        c += history[a][0] * w.x;
+        c += history[a][1] * w.y;
+        c += history[a][2] * w.z;
+        value[a] = ppu_silu(c);
+        history[a][0] = history[a][1]; history[a][1] = history[a][2]; history[a][2] = x;
+#pragma unroll
+        for (int j = 0; j < 3; ++j)
+          windows[a][(long)srow * ws[a].row + t * ws[a].step +
+              ch * ws[a].channel + j * ws[a].window] = __float2bfloat16(history[a][j]);
+      }
+      const float qq = bfly_add(value[0] * value[0], 32);
+      const float kk = bfly_add(value[1] * value[1], 32);
+      if (lane == 0) { norms[t & 1][0][warp] = qq; norms[t & 1][1][warp] = kk; }
+      __syncthreads();
+      float qsum = 0.f, ksum = 0.f;
+#pragma unroll
+      for (int w = 0; w < 4; ++w) {
+        qsum += norms[t & 1][0][w]; ksum += norms[t & 1][1][w];
+      }
+      const long record = ((long)ring_row * H + i_hv) * L * DIM + t * DIM;
+      const float b = ppu_sigmoid(__bfloat162float(beta_in[(long)tok * strides.beta + i_hv]));
+      const float gate = lower_bound * ppu_sigmoid(gate_product(exp_a,
+          __bfloat162float(g_in[(long)tok * strides.g + ch]) + bias));
+      ring_rawk[record + channel] = value[1] * rsqrtf(ksum + L2_EPS);
+      ring_g[record + channel] = __expf(gate);
+      if constexpr (FORMAT == RecordFormat::kCompact) {
+        ring_rawv[record + channel] = value[2];
+        if (channel == 0) ring_beta[((long)ring_row * H + i_hv) * L + t] = b;
+      }
+      float* dst = native.prepared + ((long)tok * H + i_hv) * pla::kda_mtp::kPreparedRecordStride;
+      dst[channel] = value[0] * (rsqrtf(qsum + L2_EPS) * scale);
+      dst[DIM + channel] = value[2];
+      if (channel == 0) dst[2 * DIM] = b;
+    }
     return;
   }
 
@@ -371,9 +458,13 @@ __global__ __launch_bounds__(THREADS) void verify_kernel(
                                               tok * strides.g + head_off + j]) +
                                               dt_bias[head_off + j])));
       if (ring_writer) {
-        ring_rawk[ro_base + j] = __float2bfloat16(ck);
-        ring_rawv[ro_base + j] = __float2bfloat16(cv);
-        ring_g[ro_base + j] = gk;
+        if constexpr (FORMAT == RecordFormat::kReplay) {
+          ring_rawk[ro_base + j] = __float2bfloat16(ck);
+          ring_rawv[ro_base + j] = __float2bfloat16(cv);
+          ring_g[ro_base + j] = gk;
+        } else if constexpr (FORMAT == RecordFormat::kCompact) {
+          ring_rawv[ro_base + j] = cv;
+        }
       }
 
       sh.q[j] = cq;
@@ -403,7 +494,7 @@ __global__ __launch_bounds__(THREADS) void verify_kernel(
     }
     if (tid == 0) {
       sh.beta = ppu_sigmoid(__bfloat162float(beta_in[tok * strides.beta + i_hv]));
-      if (ring_writer)
+      if (ring_writer && FORMAT != RecordFormat::kCorrection)
         ring_beta[((long)ring_row * H + i_hv) * (long)L + t] = sh.beta;
     }
     __syncthreads();  // phase 1 done writing sh.q/k/v/decay
@@ -471,6 +562,14 @@ __global__ __launch_bounds__(THREADS) void verify_kernel(
     const float kfold = (VS >= 2) ? nk : 1.0f;   // compile-time select
     const float qfold = (VS >= 2) ? nq : 1.0f;
 
+    if constexpr (FORMAT != RecordFormat::kReplay) {
+      if (ring_writer)
+        for (int j = tid; j < DIM; j += THREADS) {
+          ring_rawk[ro_base + j] = sh.k[j] * kfold;
+          ring_g[ro_base + j] = sh.decay[j];
+        }
+    }
+
     const float4* sq4 = reinterpret_cast<const float4*>(sh.q);
     const float4* sk4 = reinterpret_cast<const float4*>(sh.k);
     const float4* sd4 = reinterpret_cast<const float4*>(sh.decay);
@@ -502,6 +601,8 @@ __global__ __launch_bounds__(THREADS) void verify_kernel(
       shk = bfly_add(shk, KGRPS) * kfold;   // kfold = nk (VS>=2) or 1 (folded)
       const float vn = (sh.v[v] - shk) * beta;
       const float vnk = vn * kfold;         // rank-1: st += vn * (kfold*k)
+      if constexpr (FORMAT == RecordFormat::kCorrection)
+        if (k_grp == 0) ring_rawv[ro_base + v] = vn;
 
       float shq = 0.f;
       float state_residual = 0.f, state_terms = 0.f, projection_terms = 0.f;
@@ -579,7 +680,86 @@ __global__ __launch_bounds__(THREADS) void verify_kernel(
       }
     }
   }
-  // recurrent_state is read-only for verify: nothing is written back
+  if constexpr (FORMAT == RecordFormat::kCompact) {
+#pragma unroll
+    for (int p = 0; p < PASSES_PB; ++p) {
+      const int v = v_local + (i_vs * PASSES_PB + p) * VROWS;
+      float4* dst = reinterpret_cast<float4*>(native.terminal +
+          ((long)i_n * H + i_hv) * DIM * DIM + (long)v * DIM);
+#pragma unroll
+      for (int i = 0; i < F4_PER_THREAD; ++i)
+        dst[k_grp + KGRPS * i] = st[p][i];
+    }
+  }
+  // The persistent recurrent state remains read-only in every record format.
+}
+
+// Prepare owns convolution windows and normalized operands once. Independent
+// half-warps then stream those operands through disjoint resident state rows.
+template <int SPLITS, RecordFormat FORMAT>
+__global__ __launch_bounds__(128) void verify_prepared_records(
+    const float* h0, BF16* out, float* values, const float* keys, const float* decay,
+    IndexArg slots, IndexArg cu, int H, int Q, NativeVerify native) {
+  const int n = blockIdx.y, h = blockIdx.x, tid = threadIdx.x;
+  auto index = [](IndexArg a, int i) -> int64_t {
+    return a.wide ? static_cast<const int64_t*>(a.data)[i * a.stride]
+                  : static_cast<const int*>(a.data)[i * a.stride];
+  };
+  const int64_t bos = index(cu, n), end = index(cu, n + 1), slot = index(slots, n);
+  if (index(cu, 0) != 0 || bos < 0 || end < bos || end > native.tokens ||
+      end - bos > Q || bos == end || slot >= native.slots || slot <= native.null_block_id)
+    return;  // The prepare kernel alone zeroes padded outputs.
+  constexpr int ROWS = DIM / SPLITS, PASSES = ROWS / 8;
+  const int lane = tid & 15, row = int(blockIdx.z) * ROWS + tid / 16;
+  const float4* initial = reinterpret_cast<const float4*>(
+      h0 + slot * native.state_slot_stride + ((long)h * DIM + row) * DIM);
+  float4 state[PASSES][2];
+#pragma unroll
+  for (int p = 0; p < PASSES; ++p)
+#pragma unroll
+    for (int i = 0; i < 2; ++i) state[p][i] = initial[p * 8 * DIM / 4 + 2 * lane + i];
+  for (int t = 0; t < end - bos; ++t) {
+    const long record = ((long)n * H + h) * Q * DIM + t * DIM;
+    const float* prepared = native.prepared + ((bos + t) * H + h) * pla::kda_mtp::kPreparedRecordStride;
+    float4 k[2], q[2], d[2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      k[i] = reinterpret_cast<const float4*>(keys + record)[2 * lane + i];
+      d[i] = reinterpret_cast<const float4*>(decay + record)[2 * lane + i];
+      q[i] = reinterpret_cast<const float4*>(prepared)[2 * lane + i];
+    }
+#pragma unroll
+    for (int p = 0; p < PASSES; ++p) {
+      float hk = 0.f;
+#pragma unroll
+      for (int i = 0; i < 2; ++i) {
+        auto& s = state[p][i];
+        s.x *= d[i].x; s.y *= d[i].y; s.z *= d[i].z; s.w *= d[i].w;
+        hk = fmaf(s.w,k[i].w,fmaf(s.z,k[i].z,fmaf(s.y,k[i].y,fmaf(s.x,k[i].x,hk))));
+      }
+      const int v = row + p * 8;
+      const float correction = (prepared[DIM + v] - bfly_add(hk,16)) * prepared[2 * DIM];
+      if constexpr (FORMAT == RecordFormat::kCorrection)
+        if (lane == 0) values[record + v] = correction;
+      float hq = 0.f;
+#pragma unroll
+      for (int i = 0; i < 2; ++i) {
+        auto& s = state[p][i];
+        s.x = fmaf(correction,k[i].x,s.x); s.y = fmaf(correction,k[i].y,s.y);
+        s.z = fmaf(correction,k[i].z,s.z); s.w = fmaf(correction,k[i].w,s.w);
+        hq = fmaf(s.w,q[i].w,fmaf(s.z,q[i].z,fmaf(s.y,q[i].y,fmaf(s.x,q[i].x,hq))));
+      }
+      hq = bfly_add(hq,16);
+      if (lane == 0) out[((bos + t) * H + h) * DIM + v] = __float2bfloat16(hq);
+    }
+  }
+  if constexpr (FORMAT == RecordFormat::kCompact) {
+    auto* dst = reinterpret_cast<float4*>(native.terminal + ((long)n * H + h) * DIM * DIM + row * DIM);
+#pragma unroll
+    for (int p = 0; p < PASSES; ++p)
+#pragma unroll
+      for (int i = 0; i < 2; ++i) dst[p * 8 * DIM / 4 + 2 * lane + i] = state[p][i];
+  }
 }
 
 // Butterfly transpose-reduce. On entry each lane holds N partials; every level
@@ -1328,10 +1508,11 @@ void launch_verify_vsplit(
     verify_kernel<VS, MODE><<<grid, THREADS, smem, stream>>>(PLA_VERIFY_GENERIC_ARGS);
   } else {
     if (smem > 48 * 1024) {
-      hggcFuncSetAttribute(verify_kernel<VS, MODE, false, OnormArgs>,
+      hggcFuncSetAttribute(verify_kernel<VS, MODE, false, RecordFormat::kReplay, false, OnormArgs>,
                            hggcFuncAttributeMaxDynamicSharedMemorySize, smem);
     }
-    verify_kernel<VS, MODE, false, OnormArgs><<<grid, THREADS, smem, stream>>>(
+    verify_kernel<VS, MODE, false, RecordFormat::kReplay, false, OnormArgs>
+        <<<grid, THREADS, smem, stream>>>(
         PLA_VERIFY_GENERIC_ARGS, onorm);
   }
 #undef PLA_VERIFY_GENERIC_ARGS
@@ -1474,6 +1655,34 @@ void launch_verify(
   if (norm) launch_onorm(out, onorm, rows, H, stream);
 }
 
+RecordVerifyPlan record_verify_plan(int heads, int requests, int steps) {
+  int device = -1, units = 0;
+  if (!current_device_is_ppu15(&device) ||
+      hggcDeviceGetAttribute(&units, hggcDevAttrMultiProcessorCount, device) != hggcSuccess || units <= 0)
+    return {};
+  const int64_t work = int64_t(heads) * requests;
+  if (work < units) return {4 * work <= units ? 16 : 8, false};
+  if (steps == 1) return {};
+  // A second launch pays off once the producer fills its resident grid.
+  // Below that, keep the original fused kernel and its parameter reuse.
+  static std::atomic<int> capacities[64]{};
+  int capacity = device >= 0 && device < 64 ? capacities[device].load(std::memory_order_relaxed) : 0;
+  if (!capacity) {
+    int compact = 0, correction = 0;
+    if (hggcOccupancyMaxActiveBlocksPerMultiprocessor(&compact,
+            reinterpret_cast<const void*>(verify_kernel<1, Out::kPlain, true,
+                RecordFormat::kCompact, true, NativeVerify>), 128, 0) != hggcSuccess ||
+        hggcOccupancyMaxActiveBlocksPerMultiprocessor(&correction,
+            reinterpret_cast<const void*>(verify_kernel<1, Out::kPlain, true,
+                RecordFormat::kCorrection, true, NativeVerify>), 128, 0) != hggcSuccess)
+      return {};
+    capacity = units * std::max(compact, correction);
+    if (capacity <= 0) return {};
+    if (device >= 0 && device < 64) capacities[device].store(capacity, std::memory_order_relaxed);
+  }
+  return work >= capacity ? RecordVerifyPlan{4, true} : RecordVerifyPlan{};
+}
+
 void launch_verify_native(
     const void* x_q, const void* x_k, const void* x_v,
     const void* g_in, const void* beta_in,
@@ -1486,13 +1695,68 @@ void launch_verify_native(
     float scale, float lower_bound, VerifyStrides strides,
     NativeVerify native, hggcStream_t stream) {
   if (N == 0) return;
-  const bool ppu15 = current_device_is_ppu15();
-  if (Q == 4 && static_cast<int64_t>(H) * N >= 768 &&
+  auto issue_generic = [&](auto format) {
+    constexpr auto F = decltype(format)::value;
+    auto issue = [&](auto split, auto prepare) {
+      constexpr int VS = decltype(split)::value;
+      verify_kernel<VS, Out::kPlain, true, F, decltype(prepare)::value>
+        <<<dim3(H, N, VS), decltype(prepare)::value ? 128 : VerifyGeometry<F, VS>::Threads,
+           decltype(prepare)::value ? 0 : sizeof(Smem), stream>>>(
+      static_cast<const BF16*>(x_q), static_cast<const BF16*>(x_k),
+      static_cast<const BF16*>(x_v), static_cast<const BF16*>(g_in),
+      static_cast<const BF16*>(beta_in), w_q, w_k, w_v,
+      static_cast<const BF16*>(cs_q), static_cast<const BF16*>(cs_k),
+      static_cast<const BF16*>(cs_v), a_log, dt_bias, h0,
+      static_cast<BF16*>(out), static_cast<BF16*>(ic_q),
+      static_cast<BF16*>(ic_k), static_cast<BF16*>(ic_v),
+      static_cast<RecordOperand<F>*>(rawv), static_cast<RecordOperand<F>*>(rawk), gate, beta,
+      slots, slots, cu, H, Q, Q, scale, lower_bound, strides, native);
+    };
+    if constexpr (F != RecordFormat::kReplay) {
+      if (native.prepared) {
+        issue(std::integral_constant<int, 1>{}, std::true_type{});
+        verify_prepared_records<4, F><<<dim3(H, N, 4), 128, 0, stream>>>(
+            h0, static_cast<BF16*>(out), static_cast<float*>(rawv),
+            static_cast<const float*>(rawk), gate, slots, cu, H, Q, native);
+        return;
+      }
+      if (native.row_splits == 16) {
+        issue(std::integral_constant<int, 16>{}, std::false_type{});
+        return;
+      }
+      if (native.row_splits == 8) {
+        issue(std::integral_constant<int, 8>{}, std::false_type{});
+        return;
+      }
+    }
+    issue(std::integral_constant<int, 1>{}, std::false_type{});
+  };
+  if (native.format == RecordFormat::kCompact) {
+    issue_generic(std::integral_constant<RecordFormat, RecordFormat::kCompact>{});
+    return;
+  }
+  if (native.format == RecordFormat::kCorrection) {
+    issue_generic(std::integral_constant<RecordFormat, RecordFormat::kCorrection>{});
+    return;
+  }
+  int device = -1, units = 0;
+  const bool ppu15 = current_device_is_ppu15(&device);
+  if (ppu15)
+    hggcDeviceGetAttribute(&units, hggcDevAttrMultiProcessorCount, device);
+  // A resident grid amortizes channel-parallel preparation. Smaller grids
+  // retain the original serial recurrence, with the same raw-record ABI.
+  // Each live request needs at least one token; padded rows add no work.
+  const bool parallel = kNativeNumericalProtection
+      ? Q == 4 && static_cast<int64_t>(H) * N >= 768
+      : units > 0 && static_cast<int64_t>(H) * std::min(N, native.tokens) >= units;
+  if (parallel &&
       use_verify_fast(H, N, Q) && ppu15 &&
       reinterpret_cast<uintptr_t>(w_q) % 16 == 0 &&
       reinterpret_cast<uintptr_t>(w_k) % 16 == 0 &&
       reinterpret_cast<uintptr_t>(w_v) % 16 == 0) {
-    verify_steps_kernel<4, 1, false, Out::kPlain, true><<<dim3(H, N, 1), 128, 0, stream>>>(
+    auto issue = [&](auto steps) {
+      verify_steps_kernel<decltype(steps)::value, 1, false, Out::kPlain, true>
+          <<<dim3(H, N, 1), 128, 0, stream>>>(
         static_cast<const BF16*>(x_q), static_cast<const BF16*>(x_k),
         static_cast<const BF16*>(x_v), static_cast<const BF16*>(g_in),
         static_cast<const BF16*>(beta_in), w_q, w_k, w_v,
@@ -1502,17 +1766,21 @@ void launch_verify_native(
         static_cast<BF16*>(ic_k), static_cast<BF16*>(ic_v),
         static_cast<BF16*>(rawv), static_cast<BF16*>(rawk), gate, beta,
         slots, slots, cu, H, Q, scale, lower_bound, strides, h0, native);
+    };
+    if constexpr (kNativeNumericalProtection) {
+      issue(std::integral_constant<int, 4>{});
+    } else {
+#define PLA_NATIVE_VERIFY_STEPS(S) case S: issue(std::integral_constant<int, S>{}); break
+      switch (Q) {
+        PLA_NATIVE_VERIFY_STEPS(1); PLA_NATIVE_VERIFY_STEPS(2);
+        PLA_NATIVE_VERIFY_STEPS(3); PLA_NATIVE_VERIFY_STEPS(4);
+        PLA_NATIVE_VERIFY_STEPS(5); PLA_NATIVE_VERIFY_STEPS(6);
+        PLA_NATIVE_VERIFY_STEPS(7); PLA_NATIVE_VERIFY_STEPS(8);
+      }
+#undef PLA_NATIVE_VERIFY_STEPS
+    }
   } else {
-    verify_kernel<1, Out::kPlain, true><<<dim3(H, N, 1), THREADS, sizeof(Smem), stream>>>(
-      static_cast<const BF16*>(x_q), static_cast<const BF16*>(x_k),
-      static_cast<const BF16*>(x_v), static_cast<const BF16*>(g_in),
-      static_cast<const BF16*>(beta_in), w_q, w_k, w_v,
-      static_cast<const BF16*>(cs_q), static_cast<const BF16*>(cs_k),
-      static_cast<const BF16*>(cs_v), a_log, dt_bias, h0,
-      static_cast<BF16*>(out), static_cast<BF16*>(ic_q),
-      static_cast<BF16*>(ic_k), static_cast<BF16*>(ic_v),
-      static_cast<BF16*>(rawv), static_cast<BF16*>(rawk), gate, beta,
-      slots, slots, cu, H, Q, Q, scale, lower_bound, strides, native);
+    issue_generic(std::integral_constant<RecordFormat, RecordFormat::kReplay>{});
   }
   if constexpr (kNativeNumericalProtection) {
     if (ppu15) verify_precise_native<<<(static_cast<int64_t>(H) * N + 127) / 128, 128, 0, stream>>>(

@@ -42,6 +42,7 @@
 #include "bypass_exec.h"
 #include "op_forge_case.h"
 #include "sanity_checks.h"
+#include "kda_tc02.h"
 #include <limits>
 #include <unordered_set>
 #include "generated/fused_sigmoid_gating_dispatch_k_last_packed.h"
@@ -155,6 +156,35 @@ torch::Tensor fused_sigmoid_gating_delta_rule_forward_k_last_packed(
                 "initial_state_source dtype not supported: ", state_dtype);
     TunedParams tp = get_tuned_k_last_packed(
         B, H, HV, K, V, state_dtype == torch::kBFloat16);
+    // The raw packed entry shares TC02 KDA transport with the split-view
+    // entry; GQA/GDN and explicit tunable configurations keep their dispatch.
+    if (is_kda && H == HV && mixed_qkv.scalar_type() == at::kBFloat16
+        && A_log.scalar_type() == at::kFloat && A_log.is_contiguous()
+        && dt_bias.scalar_type() == at::kBFloat16 && dt_bias.is_contiguous()
+        && a.is_contiguous() && b.is_contiguous() && mixed_qkv.stride(1) == 1
+        && out.is_contiguous() && initial_state_indices
+        && initial_state_indices->dim() == 1 && initial_state_indices->is_contiguous()
+        && initial_state_source->stride(-1) == 1 && initial_state_source->stride(-2) == K
+        && initial_state_source->stride(-3) == V*K
+        && reinterpret_cast<uintptr_t>(initial_state_source->data_ptr()) % 16 == 0
+        && initial_state_source->stride(0)*initial_state_source->element_size() % 16 == 0) {
+        const auto plan = pla::kda_decode_tc02_plan(mixed_qkv.get_device(), B, H,
+                                                  state_dtype == at::kBFloat16, tp.bv);
+        if (plan != pla::KdaDecodeTc02Plan::Fallback) {
+            const auto* q = mixed_qkv.data_ptr<at::BFloat16>();
+            const pla::KdaDecodeTc02Args args{
+                q, q + H*K, q + 2*H*K, a.data_ptr(), b.data_ptr(), dt_bias.data_ptr(),
+                A_log.data_ptr<float>(), initial_state_source->data_ptr(), out.data_ptr(),
+                cu_seqlens ? cu_seqlens->data_ptr<int32_t>() : nullptr,
+                initial_state_indices->data_ptr<int32_t>(), initial_state_source->stride(0),
+                stride_qkv, stride_qkv, stride_qkv, stride_a, stride_b, B, H,
+                static_cast<int>(initial_state_source->size(0)), static_cast<int>(mixed_qkv.size(0)),
+                scale_val, softplus_beta, softplus_threshold, false, use_qk_l2norm_in_kernel,
+                is_sglang_val, state_dtype == at::kBFloat16};
+            pla::launch_kda_decode_tc02(args, plan, pla::current_stream());
+            return out;
+        }
+    }
 
     int hv_per_h = HV / H;
     TORCH_CHECK(tp.bv > 0 && tp.wn > 0 && tp.sn > 0 && V % tp.bv == 0,

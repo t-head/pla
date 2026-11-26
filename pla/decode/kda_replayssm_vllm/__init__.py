@@ -3,7 +3,8 @@
 """Native, request-row KDA replay contracts for a vLLM-style runner.
 
 This namespace has no vLLM, Triton or CuTe runtime dependency. Verify and commit
-must use the same replay records; RecoverSSM correction records are incompatible.
+must use the same record object and format. External RecoverSSM records are not
+interchangeable with these request-row records.
 """
 from dataclasses import dataclass
 from numbers import Integral, Real
@@ -13,8 +14,19 @@ import torch
 
 from . import _C
 
-__all__ = ["KDAReplayRecords", "KDAReplayCommitPlan", "KDAReplayCommitContext",
-           "kda_replay_verify"]
+__all__ = ["KDAReplayRecords", "KDACompactRecords", "KDACorrectionRecords",
+           "KDAReplayCommitPlan", "KDAReplayCommitContext", "kda_replay_verify"]
+
+
+def _record_shape(rows, heads, steps):
+    if rows < 0 or heads < 1 or not 1 <= steps <= 32:
+        raise ValueError("records require R >= 0, H > 0 and Q in [1, 32]")
+    return (rows, heads, steps, 128)
+
+
+def _conv_records(rows, heads, steps, device):
+    return torch.empty((rows, steps, 3 * heads * 128, 3),
+                       dtype=torch.bfloat16, device=device)
 
 
 @dataclass(frozen=True)
@@ -27,15 +39,65 @@ class KDAReplayRecords:
 
     @classmethod
     def allocate(cls, max_num_reqs, num_heads, spec_query_len, device):
-        if max_num_reqs < 0 or num_heads < 1 or not 1 <= spec_query_len <= 32:
-            raise ValueError("records require R >= 0, H > 0 and Q in [1, 32]")
-        shape = (max_num_reqs, num_heads, spec_query_len, 128)
+        shape = _record_shape(max_num_reqs, num_heads, spec_query_len)
         return cls(torch.empty(shape, dtype=torch.bfloat16, device=device),
                    torch.empty(shape, dtype=torch.bfloat16, device=device),
                    torch.empty(shape, dtype=torch.float32, device=device),
                    torch.empty(shape[:-1], dtype=torch.float32, device=device),
-                   torch.empty((max_num_reqs, spec_query_len, 3 * num_heads * 128, 3),
-                               dtype=torch.bfloat16, device=device))
+                   _conv_records(max_num_reqs, num_heads, spec_query_len, device))
+
+
+@dataclass(frozen=True)
+class KDACompactRecords:
+    """FP32 recurrence operands and one private terminal state per request.
+
+    The terminal state stays separate from the read-only checkpoint. Commit
+    publishes it for a full acceptance, or replays the accepted operand prefix.
+    FP32 values retain the fused convolution result without another rounding.
+    """
+    key: torch.Tensor
+    decay: torch.Tensor
+    value: torch.Tensor
+    beta: torch.Tensor
+    conv: torch.Tensor
+    terminal_state: torch.Tensor
+
+    @classmethod
+    def allocate(cls, max_num_reqs, num_heads, spec_query_len, device):
+        shape = _record_shape(max_num_reqs, num_heads, spec_query_len)
+        operands = [torch.empty(shape, device=device, dtype=torch.float32) for _ in range(3)]
+        return cls(*operands, torch.empty(shape[:-1], device=device, dtype=torch.float32),
+                   _conv_records(max_num_reqs, num_heads, spec_query_len, device),
+                   torch.empty((max_num_reqs, num_heads, 128, 128),
+                               device=device, dtype=torch.float32))
+
+
+@dataclass(frozen=True)
+class KDACorrectionRecords:
+    """FP32 normalized keys, decays and rank-one correction vectors.
+
+    Commit folds the accepted corrections without recomputing state projections.
+    No full-state snapshots or terminal-state matrix are stored.
+    """
+    key: torch.Tensor
+    decay: torch.Tensor
+    correction: torch.Tensor
+    conv: torch.Tensor
+
+    @classmethod
+    def allocate(cls, max_num_reqs, num_heads, spec_query_len, device):
+        shape = _record_shape(max_num_reqs, num_heads, spec_query_len)
+        operands = [torch.empty(shape, device=device, dtype=torch.float32) for _ in range(3)]
+        return cls(*operands, _conv_records(max_num_reqs, num_heads, spec_query_len, device))
+
+
+def _record_args(records):
+    if isinstance(records, KDACompactRecords):
+        return (records.value, records.key, records.decay, records.beta,
+                records.conv, 1, records.terminal_state)
+    if isinstance(records, KDACorrectionRecords):
+        return (records.correction, records.key, records.decay, None, records.conv, 2, None)
+    return (records.rawv, records.rawk, records.g, records.beta, records.conv, 0, None)
 
 
 def kda_replay_verify(*, mixed_qkv, raw_g, raw_beta, conv_weight, conv_state,
@@ -61,11 +123,12 @@ def kda_replay_verify(*, mixed_qkv, raw_g, raw_beta, conv_weight, conv_state,
         raise TypeError("scale and lower_bound must be host numeric scalars")
     if not isinstance(null_block_id, Integral):
         raise TypeError("null_block_id must be a host integer")
+    value, key, gate, beta, windows, mode, terminal = _record_args(records)
     return _C.verify(mixed_qkv, raw_g, raw_beta, conv_weight, conv_state, checkpoint_state,
-                     A_log, dt_bias, out, records.rawv, records.rawk, records.g,
-                     records.beta, records.conv, query_start_loc, state_indices,
+                     A_log, dt_bias, out, value, key, gate,
+                     beta, windows, query_start_loc, state_indices,
                      conv_state_layout, 128 ** -0.5 if scale is None else float(scale),
-                     float(lower_bound), null_block_id)
+                     float(lower_bound), null_block_id, mode, terminal)
 
 
 @dataclass(frozen=True)
@@ -176,14 +239,17 @@ class KDAReplayCommitContext:
         descriptors = []
         keepalive = []
         layer_writes = []
+        record_mode = _record_args(layers[0].replay_records)[5]
         for index, layer in enumerate(layers):
             conv, state = layer.kv_cache
-            records = layer.replay_records
-            tensors = (conv, state, records.rawv, records.rawk, records.g,
-                       records.beta, records.conv)
+            value, key, gate, beta, windows, mode, terminal = _record_args(layer.replay_records)
+            if mode != record_mode:
+                raise ValueError("context layers must use the same record format")
+            tensors = (conv, state, value, key, gate, beta, windows)
             descriptors.append(_C.layer_descriptor(*tensors, conv_state_layout,
                                                    heads, slots, spec_query_len,
-                                                   max_num_reqs))
+                                                    max_num_reqs, mode, terminal))
+            tensors = tuple(t for t in (*tensors, terminal) if t is not None)
             if any(t.device != device for t in tensors):
                 raise ValueError("all context layers must share one device")
             writes = _cache_writes(conv, state, conv_state_layout)
@@ -203,6 +269,7 @@ class KDAReplayCommitContext:
         result._heads, result._slots = heads, slots
         result._q, result._capacity = spec_query_len, max_num_reqs
         result._null = null_block_id
+        result._record_mode = record_mode
         return result
 
     def commit(self, num_sampled, state_indices, query_start_loc,
@@ -230,5 +297,6 @@ class KDAReplayCommitContext:
         _C.commit(self._table, self._candidate, self._buffer, num_sampled,
                   state_indices, query_start_loc, request_indices, block_table,
                   num_computed_tokens, 0 if not all(align) else mamba_block_size,
-                  self._heads, self._slots, self._q, self._null, token_capacity)
+                   self._heads, self._slots, self._q, self._null, token_capacity,
+                   self._record_mode)
         return self.plan

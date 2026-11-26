@@ -176,6 +176,7 @@ if "pla.decode" in NAMESPACES:
         # host halves of the two TUs above: they hold the tensor unpacking, which
         # cannot live in a device TU compiled against the native headers
         'src/decode/k-last/fused_kda_decode_ref_host.cpp',
+        'src/decode/k-last/kda_tc02.cu',
         'src/decode/k-last/fused_kda_decode_mega.cu',
         'src/decode/k-last/fused_kda_decode_mega_host.cpp',
     ] + generated_sources
@@ -184,8 +185,12 @@ if "pla.decode" in NAMESPACES:
         Extension(
             name='pla.decode._C',
             sources=decode_sources,
-            depends=[os.path.join(here, 'src', 'decode', 'k-last',
-                                  'generated', 'tuned_dispatch.h')],
+            depends=[
+                os.path.join(here, 'src', 'decode', 'k-last', name)
+                for name in ('generated/tuned_dispatch.h',
+                             'fused_sigmoid_gating_k_last_kernel.cuh',
+                             'kda_tc02.h')
+            ],
             extra_compile_args={
                 'cxx': ['-O3'],
                 'hgcc': [
@@ -648,8 +653,11 @@ if "pla.prefill.flashkdapro" in NAMESPACES:
     flashkda_source_manifest = (
         os.path.join("host", "torch_extension_cute.cc"),
         os.path.join("kernels", "kernel1_prepare.cu"),
+        os.path.join("kernels", "kernel1_bf16.cu"),
         os.path.join("kernels", "kernel2_recurrence.cu"),
         os.path.join("kernels", "kernel2_recurrence_nows.cu"),
+        os.path.join("kernels", "kernel2_paired.cu"),
+        os.path.join("kernels", "kernel2_bf16.cu"),
         os.path.join("kernels", "kernel3_cp.cu"),
         os.path.join("tc01", "kernel_bt64_prefill_tc01.cu"),
     )
@@ -707,6 +715,10 @@ if "pla.prefill.flashkdapro" in NAMESPACES:
     if probe_only:
         ext_modules = [extension]
 
+
+# PLA's Torch host bindings use the SDK compatibility headers.
+for extension in ext_modules:
+    extension.ppu_cuda_compat_headers = True
 
 print(f"[pla] building namespaces: {', '.join(NAMESPACES)} "
       f"(MAX_JOBS={os.environ['MAX_JOBS']}, HGCC_THREADS={HGCC_THREADS})")

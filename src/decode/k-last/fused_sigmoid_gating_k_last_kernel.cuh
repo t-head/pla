@@ -409,10 +409,16 @@ __global__ void fused_sigmoid_gating_delta_kernel(
             float dt_val = static_cast<float>(dt_bias[i_hv]);
             bg_arr[hs] = compute_bg<USE_LOWER_BOUND>(a_val, dt_val, b_A_log, softplus_beta_or_lower_bound, softplus_threshold);
         }
+#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ == 150
+        constexpr bool SplitInputProducers = IS_KDA && WARP_NUM >= HV_PER_CTA + 2;
+#else
+        constexpr bool SplitInputProducers = false;
+#endif
         if constexpr (IS_KDA) {
+            const unsigned gate_warp = unsigned(warp_id) - (SplitInputProducers ? 2u : 0u);
             #pragma unroll
-            if (warp_id < HV_PER_CTA) {
-                int i_hv = hv_base + warp_id;
+            if (gate_warp < HV_PER_CTA) {
+                int i_hv = hv_base + gate_warp;
                 float b_A_log = A_log[i_hv];
 
                 uint2 a_raw = *reinterpret_cast<const uint2*>(a + bos * stride_a + i_hv * 128 + k_idx);
@@ -429,21 +435,38 @@ __global__ void fused_sigmoid_gating_delta_kernel(
                 float bg2 = compute_bg<USE_LOWER_BOUND>(a23.x, dt23.x, b_A_log, softplus_beta_or_lower_bound, softplus_threshold);
                 float bg3 = compute_bg<USE_LOWER_BOUND>(a23.y, dt23.y, b_A_log, softplus_beta_or_lower_bound, softplus_threshold);
 
-                *reinterpret_cast<float4*>(smem_bg + warp_id * K + k_idx) = make_float4(bg0, bg1, bg2, bg3);
+                *reinterpret_cast<float4*>(smem_bg + gate_warp * K + k_idx) = make_float4(bg0, bg1, bg2, bg3);
             }
         }
 
-        // Q/K: warp0 ALONE loads + l2-normalizes (its 32 lanes cover K=128)
-        // and publishes to smem_q/smem_k; siblings load them once after the
-        // first block barrier they hit anyway (the task-0 barrier under
-        // use_initial_state, the unified !use_initial_state barrier below).
-        // The per-warp redundant l2norm chain this replaces was pure
-        // issue-bandwidth waste — the kernel is instruction-budget bound and
-        // the (WN-1) sibling copies of the 10-shuffle reduction never bought
-        // anything once the prologue went barrier-free.
+        // Publish normalized Q/K before the existing first-state barrier.
+        // TC02 KDA splits producers; the combined GDN/TC01 path keeps them in
+        // warp 0. Siblings consume the shared vectors once after that join.
         float4 q_vec_decode;
         float4 k_vec_decode;
-        if (warp_id == 0) {
+        if constexpr (SplitInputProducers) {
+            // Q, K and the KDA gate have independent producers. Their stores
+            // join at the existing first-state barrier, with no extra sync.
+            if (warp_id < 2) {
+                const scalar_t* src = warp_id == 0
+                    ? q + bos * stride_q + i_h * 128 + k_idx
+                    : k + bos * stride_k + i_h * 128 + k_idx;
+                const uint2 raw = *reinterpret_cast<const uint2*>(src);
+                float2 lo = TypeConverter<scalar_t>::convert(raw.x);
+                float2 hi = TypeConverter<scalar_t>::convert(raw.y);
+                float factor = warp_id == 0 ? scale : 1.f;
+                if (use_qk_l2norm) {
+                    float sq = lo.x*lo.x + lo.y*lo.y + hi.x*hi.x + hi.y*hi.y;
+                    #pragma unroll
+                    for (int offset = 16; offset > 0; offset /= 2)
+                        sq += __shfl_xor_sync(0xffffffff, sq, offset);
+                    factor *= rsqrtf(sq + 1e-6f);
+                }
+                lo.x *= factor; lo.y *= factor; hi.x *= factor; hi.y *= factor;
+                *reinterpret_cast<float4*>((warp_id == 0 ? smem_q : smem_k) + k_idx)
+                    = make_float4(lo.x, lo.y, hi.x, hi.y);
+            }
+        } else if (warp_id == 0) {
             const scalar_t* q_src = q + bos * stride_q + i_h * 128 + k_idx;
             const scalar_t* k_src = k + bos * stride_k + i_h * 128 + k_idx;
             uint2 q_raw = *reinterpret_cast<const uint2*>(q_src);
@@ -1007,9 +1030,19 @@ __global__ void fused_sigmoid_gating_delta_kernel(
                     v_delta += h_val.z * k_vec.z;
                     v_delta += h_val.w * k_vec.w;
 
-                    #pragma unroll
-                    for (int offset = 16; offset > 0; offset /= 2) v_delta += __shfl_down_sync(0xffffffff, v_delta, offset);
-                    v_delta = __shfl_sync(0xffffffff, v_delta, 0);
+#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ == 150
+                    if constexpr (IS_KDA) {
+                        #pragma unroll
+                        for (int offset = 16; offset > 0; offset /= 2)
+                            v_delta += __shfl_xor_sync(0xffffffff, v_delta, offset);
+                    } else
+#endif
+                    {
+                        #pragma unroll
+                        for (int offset = 16; offset > 0; offset /= 2)
+                            v_delta += __shfl_down_sync(0xffffffff, v_delta, offset);
+                        v_delta = __shfl_sync(0xffffffff, v_delta, 0);
+                    }
 
                     float v_new = (v_val - v_delta) * b_beta;
 

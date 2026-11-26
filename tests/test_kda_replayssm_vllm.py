@@ -146,7 +146,8 @@ def folded(state, records, row, count):
 
 
 def oracle_commit(layer, records, offsets, slots, counts, mapping=None,
-                  block_table=None, computed=None, block_size=None, null_block_id=0):
+                  block_table=None, computed=None, block_size=None, null_block_id=0,
+                  fold_state=folded):
     conv, state = ds(layer), layer.kv_cache[1]
     old = state.clone()
     expected_state, expected_conv = old.clone(), conv.clone()
@@ -167,9 +168,9 @@ def oracle_commit(layer, records, offsets, slots, counts, mapping=None,
                 boundary = block_table[row][next_boundary // block_size - 1]
         if n:
             if bc:
-                expected_state[boundary] = folded(old[slot], records, b, bc)
+                expected_state[boundary] = fold_state(old[slot], records, b, bc)
                 expected_conv[boundary, :, :3] = records.conv[b, bc - 1]
-            expected_state[final] = folded(old[slot], records, b, n)
+            expected_state[final] = fold_state(old[slot], records, b, n)
             expected_conv[final, :, :3] = records.conv[b, n - 1]
         plan[0].append(n)
         plan[1].append(final if n else 0)
@@ -634,7 +635,7 @@ def case_graph(device, phase, q=5, heads=1, rows=2, align=True):
             run()
     for turn in range(3):
         layer.raw.copy_(initial)
-        offsets, slots = ([0, 2, 2], [2, 0]) if turn == 1 else ([0, 1, 1 + q], [2, 7])
+        offsets, slots = ([0, min(2, q), min(2, q)], [2, 0]) if turn == 1 else ([0, 1, 1 + q], [2, 7])
         cu.copy_(vector(padded(offsets, offsets[-1]), device))
         si.copy_(vector(padded(slots, 0), device))
         accepted = [0, q] if turn == 1 else [2, q] if turn == 2 and not align else [1, 3]
@@ -1587,6 +1588,10 @@ def main():
             cases.append(("graph_" + phase, lambda p=phase: case_graph(device, p)))
             cases.append(("graph_Q4_native_" + phase, lambda p=phase:
                           case_graph(device, p, q=4, heads=12, rows=128)))
+            for q, heads in ((1, 24), (2, 24), (3, 24), (5, 24), (8, 24), (3, 1)):
+                cases.append((f"graph_native_Q{q}_H{heads}_{phase}",
+                              lambda p=phase, q=q, h=heads:
+                              case_graph(device, p, q=q, heads=h, rows=64)))
             if phase != "verify":
                 cases.append(("graph_Q4_noalign_" + phase, lambda p=phase:
                               case_graph(device, p, q=4, heads=12, rows=128, align=False)))

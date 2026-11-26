@@ -85,6 +85,7 @@ def flashkda_fwd(
     state_pool: Optional[torch.Tensor] = None,      # [slots,H,DV,DK] bf16/fp32 (in-place)
     state_indices: Optional[torch.Tensor] = None,   # [N] int32 cache slots
     raw_cu_seqlens: Optional[Tuple[int, ...]] = None,  # trusted Host offsets
+    *, state_accum_dtype: Optional[torch.dtype] = None,
 ) -> None:
     """FlashKDA prefill forward. Writes ``out`` (and ``final_state`` if given).
 
@@ -122,6 +123,10 @@ def flashkda_fwd(
         state_indices: ``[N]`` contiguous int32 cache slots. Indices must be in
             range and unique within the batch. Serving owns this invariant, so
             the hot path intentionally performs no device-to-host validation.
+        state_accum_dtype: TC02 resident-state precision, independent of state
+            storage. None/float32 retain FP32; bfloat16 opts into BF16 carries.
+            Preparation and numerical repair use their own arithmetic.
+            Empty rows preserve storage exactly. TC01 keeps its default backend.
         raw_cu_seqlens: Trusted Host copy of ``cu_seqlens`` values. Serving can
             pass the request metadata offsets so the CP planner never reads the
             device tensor back to the CPU. Plans and their device descriptor
@@ -156,9 +161,13 @@ def flashkda_fwd(
     Explicit splits do not select state automatically. A non-state algorithm
     override keeps H4 AUTO serial and disables device-only AUTO CP.
     """
+    if state_accum_dtype not in (None, torch.float32, torch.bfloat16):
+        raise ValueError("state_accum_dtype must be None, torch.float32, or torch.bfloat16")
     if not q.is_cuda:
         raise ValueError("q must be a CUDA tensor")
     backend = select_backend(torch.cuda.get_device_capability(q.device))
+    if state_accum_dtype is torch.bfloat16 and torch.cuda.get_device_capability(q.device) != (8, 9):
+        raise ValueError("BF16 state accumulation requires TC02")
     if backend == 'fla':
         # An explicit IMPL takes precedence over the frozen rules; rule diversion runs only without an explicit override,
         # and the decision consumes only host integers and tensor shapes (no hot-path D2H); replay does not re-select.
@@ -218,8 +227,10 @@ def flashkda_fwd(
         else:
             cu32 = cu_seqlens.contiguous()
 
+    precision = {"state_accum_fp32": False} if state_accum_dtype is torch.bfloat16 else {}
     flashkda_cute.flashkda_fwd(
         q, k, v, g, beta, A_log, dt_bias, out,
         float(scale), float(lower_bound), initial_state, final_state, cu32,
         state_indices, raw_cu_seqlens,
+        **precision
     )

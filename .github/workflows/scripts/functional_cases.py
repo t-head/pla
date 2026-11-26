@@ -72,6 +72,7 @@ def cases():
              "--bs-cap=64", "--layers=2,4"), 2400, "markers"),
         Case("kda-replayssm-vllm", "decode", ("tests/test_kda_replayssm_vllm.py", "--phase=functional"),
              1800, "markers"),
+        Case("kda-state-records", "decode", ("test_kda_state_records.py",), 1800, "pytest"),
         Case("kda-spec-recurrent", "decode", ("scripts/decode/test_kda_decode.py",), 1200),
         Case("kda-pad-slot", "decode", ("scripts/decode/kda_fusion/test_pad_slot.py",), 900),
         Case("kda-commit-layouts", "decode",
@@ -132,4 +133,6 @@ def cases():
         "real-gate-prefill", "prefill",
         ("test_kimi_k3_real_gate_prefill.py", "test_qwen38_real_gate_prefill.py"),
         1800, "pytest"))
+    result.append(Case("kda-prefill-tc02", "prefill",
+                       ("test_kda_prefill_tc02.py",), 1800, "pytest"))
     return result

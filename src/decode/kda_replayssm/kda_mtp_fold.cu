@@ -46,6 +46,7 @@
 #include <hggc_runtime.h>
 
 #include <cstdint>
+#include <type_traits>
 
 #include "kda_mtp_abi.h"
 
@@ -53,6 +54,9 @@ namespace {
 
 using BF16 = __ppu_bfloat16;
 using pla::kda_mtp::IndexArg;
+using pla::kda_mtp::RecordFormat;
+template <RecordFormat FORMAT>
+using RecordOperand = std::conditional_t<FORMAT == RecordFormat::kReplay, BF16, float>;
 
 // Branch-free: an int64 index's low word (== static_cast<int>, little endian)
 // is int32 element 2*i. A wide/narrow branch made the compiler drain every
@@ -188,19 +192,30 @@ static_assert(KDIM % 32 == 0, "K must spread evenly over a warp");
 // Stage the whole accepted window once, up front (H20 "attempt C"): barriers
 // drop from 3*n_commit to exactly one. Each warp takes whole steps so its ksq
 // reduction is warp-local; the single __syncthreads only publishes the table.
-template <bool STAGE_VALUES>
+template <bool STAGE_VALUES, RecordFormat FORMAT = RecordFormat::kReplay>
 __device__ __forceinline__ void stage_window(
     float* __restrict__ s_kk, float* __restrict__ s_dc, int warp, int lane,
-    int nwarps, int n_commit, const BF16* __restrict__ rawk_p,
+    int nwarps, int n_commit, const RecordOperand<FORMAT>* __restrict__ rawk_p,
     const float* __restrict__ gk_p, float* s_v, float* s_beta,
-    const BF16* rawv_p, const float* beta_p, int v_base, int V) {
+    const RecordOperand<FORMAT>* rawv_p, const float* beta_p, int v_base, int V) {
   constexpr int BV = STAGE_VALUES ? STAGE_BV : KDA_FOLD_BV;
   for (int t = warp; t < n_commit; t += nwarps) {
-    const BF16* rk = rawk_p + (long)t * KDIM;
+    const auto* rk = rawk_p + (long)t * KDIM;
     const float* gk = gk_p + (long)t * KDIM;
     float* kk_t = s_kk + (long)t * KDIM;
     float* dc_t = s_dc + (long)t * KDIM;
-    if constexpr (STAGE_VALUES) {
+    if constexpr (FORMAT != RecordFormat::kReplay) {
+      static_assert(STAGE_VALUES, "operand records use the staged fold");
+      reinterpret_cast<float4*>(kk_t)[lane] = reinterpret_cast<const float4*>(rk)[lane];
+      reinterpret_cast<float4*>(dc_t)[lane] = reinterpret_cast<const float4*>(gk)[lane];
+#pragma unroll
+      for (int i = 0; i < (BV + 31) / 32; ++i) {
+        const int v = lane + i * 32;
+        if (v < BV) s_v[t * BV + v] = rawv_p[(long)t * V + v_base + v];
+      }
+      if constexpr (FORMAT == RecordFormat::kCompact)
+        if (lane == 0) s_beta[t] = beta_p[t];
+    } else if constexpr (STAGE_VALUES) {
       const uint2 packed = reinterpret_cast<const uint2*>(rk)[lane];
       const float4 gate = reinterpret_cast<const float4*>(gk)[lane];
       const float bv = beta_p[t];
@@ -252,11 +267,11 @@ __device__ __forceinline__ void stage_window(
 // gk     [layers, slots, HV, L, K] fp32
 // beta   [layers, slots, HV, L]    fp32
 template <bool STAGE_VALUES, int ROWS, bool NATIVE = false, bool GLOBAL_STORE = false,
-          bool INPLACE = false>
+          bool INPLACE = false, RecordFormat FORMAT = RecordFormat::kReplay>
 __global__ __launch_bounds__(STAGE_VALUES ? STAGE_LANES / ROWS : THREADS)
 void fold_kernel(
-    float* __restrict__ h0, const BF16* __restrict__ rawv,
-    const BF16* __restrict__ rawk, const float* __restrict__ gkc,
+    float* __restrict__ h0, const RecordOperand<FORMAT>* __restrict__ rawv,
+    const RecordOperand<FORMAT>* __restrict__ rawk, const float* __restrict__ gkc,
     const float* __restrict__ betac, IndexArg slot_idx, IndexArg accept_lens,
     IndexArg track_idx, IndexArg track_step, long stride_h_layer,
     long stride_h_slot, long stride_rawv_layer, long stride_rawv_slot,
@@ -264,7 +279,8 @@ void fold_kernel(
     long stride_gk_slot, long stride_beta_layer, long stride_beta_slot, int H,
     int HV, int V, int L, int null_block_id, bool has_track,
     pla::kda_mtp::NativeFold native = {}) {
-  constexpr bool PROTECT = NATIVE && GLOBAL_STORE && pla::kda_mtp::kNativeNumericalProtection;
+  constexpr bool PROTECT = NATIVE && GLOBAL_STORE && FORMAT == RecordFormat::kReplay &&
+                           pla::kda_mtp::kNativeNumericalProtection;
   static_assert(STAGE_VALUES || ROWS == 1, "only the staged path blocks rows");
   constexpr int THREADS = STAGE_VALUES ? STAGE_LANES / ROWS : KDA_FOLD_THREADS;
   if constexpr (INPLACE) has_track = false;
@@ -304,15 +320,20 @@ void fold_kernel(
   const int i_hv = i_hvl % HV;
   const int i_h = i_hv / (HV / H);
   if (slot <= null_block_id || n_commit <= 0) return;
+  const float* terminal = nullptr;
+  bool use_terminal = false;
+  int replay_count = n_commit;
   if constexpr (NATIVE) {
-    const int64_t* table = native.layers + i_layer * pla::kda_mtp::kReplayColumns;
+    constexpr int columns = FORMAT == RecordFormat::kReplay ?
+        pla::kda_mtp::kReplayColumns : pla::kda_mtp::kStateRecordColumns;
+    const int64_t* table = native.layers + i_layer * columns;
     const auto descriptor = [&](int column) {
       if constexpr (GLOBAL_STORE) return __ldg(table + column);
       else return table[column];
     };
     h0 = reinterpret_cast<float*>(descriptor(pla::kda_mtp::kState));
-    rawv = reinterpret_cast<const BF16*>(descriptor(pla::kda_mtp::kRawV));
-    rawk = reinterpret_cast<const BF16*>(descriptor(pla::kda_mtp::kRawK));
+    rawv = reinterpret_cast<const RecordOperand<FORMAT>*>(descriptor(pla::kda_mtp::kRawV));
+    rawk = reinterpret_cast<const RecordOperand<FORMAT>*>(descriptor(pla::kda_mtp::kRawK));
     gkc = reinterpret_cast<const float*>(descriptor(pla::kda_mtp::kGate));
     betac = reinterpret_cast<const float*>(descriptor(pla::kda_mtp::kBeta));
     stride_h_layer = stride_rawv_layer = stride_rawk_layer = 0;
@@ -322,6 +343,13 @@ void fold_kernel(
     stride_rawk_slot = (long)H * L * KDIM;
     stride_gk_slot = (long)HV * L * KDIM;
     stride_beta_slot = (long)HV * L;
+    if constexpr (FORMAT == RecordFormat::kCompact) {
+      terminal = reinterpret_cast<const float*>(descriptor(pla::kda_mtp::kTerminal));
+      const int length = index_at(native.offsets, i_n + 1) - index_at(native.offsets, i_n);
+      use_terminal = n_commit == length;
+      if (use_terminal)
+        replay_count = has_track && t_track_raw < n_commit ? t_track_raw : 0;
+    }
   }
   const int record_row = NATIVE ? i_n : slot;
 
@@ -336,16 +364,18 @@ void fold_kernel(
   // element (v, k) lives at v*K + k -- the Triton tile is [K, V] transposed
   float* p_h_row = h_base + (long)v * KDIM;
 
-  const BF16* rawk_p =
+  const auto* rawk_p =
       rawk + i_layer * stride_rawk_layer + record_row * stride_rawk_slot +
       (long)i_h * L * KDIM;
-  const BF16* rawv_p =
+  const auto* rawv_p =
       rawv + i_layer * stride_rawv_layer + record_row * stride_rawv_slot +
       (long)i_hv * L * V;
   const float* gk_p = gkc + i_layer * stride_gk_layer + record_row * stride_gk_slot +
                       (long)i_hv * L * KDIM;
-  const float* beta_p = betac + i_layer * stride_beta_layer +
-                        record_row * stride_beta_slot + (long)i_hv * L;
+  const float* beta_p = nullptr;
+  if constexpr (FORMAT != RecordFormat::kCorrection)
+    beta_p = betac + i_layer * stride_beta_layer +
+             record_row * stride_beta_slot + (long)i_hv * L;
 
   bool check_condition = false;
   if constexpr (PROTECT) {
@@ -382,19 +412,24 @@ void fold_kernel(
   }
   float* const s_v = s_dc + (long)L * KDIM;
   float* const s_beta = s_v + (STAGE_VALUES ? L * BV : 0);
-  stage_window<STAGE_VALUES>(s_kk, s_dc, tid >> 5, tid & 31, THREADS / 32,
-      n_commit, rawk_p, gk_p, s_v, s_beta, rawv_p, beta_p, i_vtile * BV, V);
+  stage_window<STAGE_VALUES, FORMAT>(s_kk, s_dc, tid >> 5, tid & 31, THREADS / 32,
+      replay_count, rawk_p, gk_p, s_v, s_beta, rawv_p, beta_p, i_vtile * BV, V);
   if constexpr (STAGE_VALUES) {
 #pragma unroll
     for (int r = 0; r < ROWS; ++r)
 #pragma unroll
       for (int i = 0; i < F4_PER_THREAD; ++i)
-        st[r][i] = p_h4[r * ROW_STEP * KDIM / 4 + f4_index<KGRPS>(k_grp, i)];
+        if constexpr (FORMAT == RecordFormat::kCompact) {
+          st[r][i] = replay_count ? p_h4[r * ROW_STEP * KDIM / 4 + f4_index<KGRPS>(k_grp, i)] :
+                                   make_float4(0.f, 0.f, 0.f, 0.f);
+        } else {
+          st[r][i] = p_h4[r * ROW_STEP * KDIM / 4 + f4_index<KGRPS>(k_grp, i)];
+        }
     __syncthreads();
   }
 
   bool repair_needed = false;
-  for (int t = 0; t < n_commit; ++t) {
+  for (int t = 0; t < replay_count; ++t) {
     const float4* sh_kk4 =
         reinterpret_cast<const float4*>(s_kk + (long)t * KDIM);
     const float4* sh_dc4 =
@@ -419,10 +454,10 @@ void fold_kernel(
       for (int r = 0; r < ROWS; ++r) {
         float4& s = st[r][i];
         s.x *= d4.x; s.y *= d4.y; s.z *= d4.z; s.w *= d4.w;
-        if constexpr (STAGE_VALUES) {
+        if constexpr (STAGE_VALUES && FORMAT != RecordFormat::kCorrection) {
           shk[r] = fmaf(s.w, k4[i].w, fmaf(s.z, k4[i].z,
                    fmaf(s.y, k4[i].y, fmaf(s.x, k4[i].x, shk[r]))));
-        } else {
+        } else if constexpr (FORMAT != RecordFormat::kCorrection) {
           shk[r] += s.x * k4[i].x + s.y * k4[i].y + s.z * k4[i].z +
                     s.w * k4[i].w;
         }
@@ -431,10 +466,12 @@ void fold_kernel(
 
 #pragma unroll
     for (int r = 0; r < ROWS; ++r) {
-      const float sum = warp_bfly_add(shk[r], KGRPS);
-      const float vv = STAGE_VALUES ? s_v[t * BV + v_local + r * ROW_STEP] :
-          (v_ok ? __bfloat162float(rawv_p[(long)t * V + v]) : 0.f);
-      const float vn = (vv - sum) * (STAGE_VALUES ? s_beta[t] : beta_p[t]);
+      const float sum = FORMAT == RecordFormat::kCorrection ? 0.f : warp_bfly_add(shk[r], KGRPS);
+      float vv;
+      if constexpr (STAGE_VALUES) vv = s_v[t * BV + v_local + r * ROW_STEP];
+      else vv = v_ok ? __bfloat162float(rawv_p[(long)t * V + v]) : 0.f;
+      const float vn = FORMAT == RecordFormat::kCorrection ? vv :
+          (vv - sum) * (STAGE_VALUES ? s_beta[t] : beta_p[t]);
       float state_scale = 0.f, residual_scale = 0.f;
 #pragma unroll
       for (int i = 0; i < F4_PER_THREAD; ++i) {
@@ -520,6 +557,18 @@ void fold_kernel(
 #pragma unroll
       for (int i = 0; i < F4_PER_THREAD; ++i) {
         const int offset = r * ROW_STEP * KDIM / 4 + f4_index<KGRPS>(k_grp, i);
+        if constexpr (FORMAT == RecordFormat::kCompact) {
+          if (use_terminal) {
+            const auto* cached = reinterpret_cast<const float4*>(terminal +
+                ((long)i_n * HV + i_hv) * V * KDIM + (long)v * KDIM);
+            st[r][i] = cached[offset];
+            if (has_track && t_track_raw == n_commit && slot_track > null_block_id) {
+              auto* boundary = reinterpret_cast<float4*>(h0 +
+                  (long)slot_track * stride_h_slot + (long)i_hv * V * KDIM + (long)v * KDIM);
+              store_native_state_vector(boundary + offset, st[r][i]);
+            }
+          }
+        }
         if constexpr (NATIVE && GLOBAL_STORE)
           store_native_state_vector(o4 + offset, st[r][i]);
         else
@@ -779,27 +828,29 @@ void launch_fold_native(const int64_t* layers, IndexArg source,
                         IndexArg boundary, IndexArg boundary_lengths,
                         int nlayers, int batch, int heads, int Q, int slots,
                         int null_block_id, bool has_align, int* precision_flags,
-                        hggcStream_t stream) {
+                        hggcStream_t stream, RecordFormat format, IndexArg offsets) {
   if (!batch) return;
   constexpr int rows = 2;
   const int smem = Q * (2 * KDIM + STAGE_BV + 1) * sizeof(float);
+  auto issue = [&](auto tag) {
+    constexpr auto F = decltype(tag)::value;
 #define PLA_NATIVE_FOLD_LAUNCH(GLOBAL_STORE, INPLACE)                          \
   do {                                                                        \
     if (smem > 48 * 1024)                                                      \
-      hggcFuncSetAttribute(fold_kernel<true, rows, true, GLOBAL_STORE, INPLACE>, \
+      hggcFuncSetAttribute(fold_kernel<true, rows, true, GLOBAL_STORE, INPLACE, F>, \
                           hggcFuncAttributeMaxDynamicSharedMemorySize, smem);  \
-    fold_kernel<true, rows, true, GLOBAL_STORE, INPLACE>                        \
+    fold_kernel<true, rows, true, GLOBAL_STORE, INPLACE, F>                     \
         <<<dim3(128 / STAGE_BV, heads * nlayers, batch),                        \
            STAGE_LANES / rows, smem, stream>>>(                               \
         nullptr, nullptr, nullptr, nullptr, nullptr, source, lengths,          \
         boundary, boundary_lengths, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,              \
         heads, heads, 128, Q, null_block_id, true,                              \
-        {layers, final_indices, slots, precision_flags});                      \
+        {layers, final_indices, slots, precision_flags, offsets});             \
   } while (false)
   if (current_device_is_ppu15()) {
     if (has_align) PLA_NATIVE_FOLD_LAUNCH(true, false);
     else PLA_NATIVE_FOLD_LAUNCH(true, true);
-    if constexpr (kNativeNumericalProtection) {
+    if constexpr (F == RecordFormat::kReplay && kNativeNumericalProtection) {
       const long tiles = (long)batch * heads * nlayers * (KDIM / STAGE_BV);
       if (has_align)
         fold_precise_native<false><<<(tiles + 127) / 128, 128, 0, stream>>>(
@@ -812,6 +863,15 @@ void launch_fold_native(const int64_t* layers, IndexArg source,
     }
   } else PLA_NATIVE_FOLD_LAUNCH(false, false);
 #undef PLA_NATIVE_FOLD_LAUNCH
+  };
+  switch (format) {
+    case RecordFormat::kReplay:
+      issue(std::integral_constant<RecordFormat, RecordFormat::kReplay>{}); break;
+    case RecordFormat::kCompact:
+      issue(std::integral_constant<RecordFormat, RecordFormat::kCompact>{}); break;
+    case RecordFormat::kCorrection:
+      issue(std::integral_constant<RecordFormat, RecordFormat::kCorrection>{}); break;
+  }
 }
 
 namespace {
@@ -825,7 +885,7 @@ __device__ __forceinline__ void copy_native_conv_vector(const BF16* src, BF16* d
 #endif
 }
 
-template <bool TILED>
+template <bool TILED, bool STATE_RECORDS = false>
 __global__ void native_conv_scatter(const int64_t* layers, IndexArg lengths,
                                    IndexArg final_indices, IndexArg boundary,
                                    IndexArg boundary_lengths, int heads, int Q,
@@ -833,7 +893,7 @@ __global__ void native_conv_scatter(const int64_t* layers, IndexArg lengths,
   const int row = blockIdx.x, layer = blockIdx.y;
   const int count = index_at(lengths, row);
   if (count <= 0) return;
-  const int64_t* table = layers + layer * kReplayColumns;
+  const int64_t* table = layers + layer * (STATE_RECORDS ? kStateRecordColumns : kReplayColumns);
   BF16* dst = reinterpret_cast<BF16*>(table[kConv]);
   const BF16* src = reinterpret_cast<const BF16*>(table[kWindows]);
   const int final_slot = index_at(final_indices, row);
@@ -898,20 +958,25 @@ void launch_conv_native(const int64_t* layers, IndexArg lengths,
                         IndexArg final_indices, IndexArg boundary,
                         IndexArg boundary_lengths, int nlayers, int batch,
                         int heads, int Q, int slots, int null_block_id,
-                        hggcStream_t stream) {
+                        hggcStream_t stream, RecordFormat format) {
   if (!batch) return;
-  const int64_t gate = conv_packed_gate();
-  if (gate >= 0 && (int64_t)batch * heads * 3 * KDIM * nlayers >= gate &&
-      current_device_is_ppu15()) {
-    const int tiles = (3 * heads * KDIM + kConvBlock * kConvDPerThread - 1) /
-                      (kConvBlock * kConvDPerThread);
-    native_conv_scatter<true><<<dim3(batch, nlayers, tiles), kConvBlock, 0, stream>>>(
-        layers, lengths, final_indices, boundary, boundary_lengths, heads, Q, slots, null_block_id);
-  } else {
-    native_conv_scatter<false><<<dim3(batch, nlayers, (3 * heads * KDIM * 3 + 255) / 256),
-                                256, 0, stream>>>(layers, lengths, final_indices, boundary,
-                                                 boundary_lengths, heads, Q, slots, null_block_id);
-  }
+  auto issue = [&](auto state_records) {
+    constexpr bool extra = decltype(state_records)::value;
+    const int64_t gate = conv_packed_gate();
+    if (gate >= 0 && (int64_t)batch * heads * 3 * KDIM * nlayers >= gate &&
+        current_device_is_ppu15()) {
+      const int tiles = (3 * heads * KDIM + kConvBlock * kConvDPerThread - 1) /
+                        (kConvBlock * kConvDPerThread);
+      native_conv_scatter<true, extra><<<dim3(batch, nlayers, tiles), kConvBlock, 0, stream>>>(
+          layers, lengths, final_indices, boundary, boundary_lengths, heads, Q, slots, null_block_id);
+    } else {
+      native_conv_scatter<false, extra><<<dim3(batch, nlayers, (3 * heads * KDIM * 3 + 255) / 256),
+                                  256, 0, stream>>>(layers, lengths, final_indices, boundary,
+                                                   boundary_lengths, heads, Q, slots, null_block_id);
+    }
+  };
+  if (format == RecordFormat::kReplay) issue(std::false_type{});
+  else issue(std::true_type{});
 }
 
 }  // namespace kda_mtp
