@@ -32,6 +32,88 @@ FULL_CORPUS_SHA256 = "f664127ae6852fc11976f278056a9e2a7bd023bd7cb4b398812ee19913
 REFERENCE_PREFIX_SHA256 = "c697c9aad3c695df9bf003f78363019e6d9681625a3a4ebf78dfd3214b0d84b3"
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a PPU device")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("include_empty", [False, True])
+@pytest.mark.parametrize("offsets, key_heads, heads", [
+    ([0, 1, 1, 2050, 4099], 8, 32),
+    ([0, 1, 1, 171, 344], 8, 32),
+    ([*range(32), 4501, 8001, 11366], 2, 6),
+    ([*range(6), 1933, 3861], 16, 48),
+])
+def test_tc01_window_guard_matches_serial_after_input_changes(dtype, include_empty, offsets, key_heads, heads):
+    from pla.prefill.flashqla import _C
+
+    device = torch.cuda.get_device_properties(0)
+    if (device.major, device.minor, device.multi_processor_count) != (8, 0, 64):
+        pytest.skip("window guard dispatch under test requires 64-CU tc01")
+    cu = torch.tensor(offsets, device="cuda", dtype=torch.int32)
+    # Appending empty requests exceeds all parallel dispatch limits.
+    serial_cu = torch.tensor(
+        offsets + [offsets[-1]] * (66 - len(offsets)), device="cuda", dtype=torch.int32)
+    generator = torch.Generator(device="cuda").manual_seed(51923)
+    keys = torch.randn((1, offsets[-1], key_heads, D), generator=generator, device="cuda", dtype=dtype)
+    beta = torch.full((1, offsets[-1], heads), 0.25, device="cuda", dtype=torch.float32)
+    original = _C._precision_guard(keys, serial_cu, include_empty, beta)[:len(offsets) - 1]
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        flags = _C._precision_guard(keys, cu, include_empty, beta)
+    graph.replay()
+    torch.testing.assert_close(flags, original, rtol=0, atol=0)
+
+    start, end = offsets[-3:-1]
+    tail = start + (end - start - 2) // 32 * 32
+    keys[0, tail + 1, 0].copy_(-keys[0, tail, 0])
+    beta[0, -1, -1] = 1.0
+    planted = _C._precision_guard(keys, serial_cu, include_empty, beta)[:len(offsets) - 1]
+    graph.replay()
+    assert planted[-2, 0].item() == planted[-1, -1].item() == 1
+    torch.testing.assert_close(flags, planted, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a PPU device")
+def test_tc01_short_pnd_unstaged_repair_matches_staged(monkeypatch):
+    from pla.prefill.flashqla import _C
+
+    device = torch.cuda.get_device_properties(0)
+    if (device.major, device.minor, device.multi_processor_count) != (8, 0, 64):
+        pytest.skip("short packed repair dispatch requires 64-CU tc01")
+    heads, key_heads = 32, 8
+    offsets = (0, 1, 2, 3, 344)
+    cu = torch.tensor(offsets, dtype=torch.int32, device="cuda")
+    indices = torch.tensor([3, 1, 0, 2], dtype=torch.int32, device="cuda")
+    torch.manual_seed(72439)
+    qkv = torch.randn((offsets[-1], (2 * key_heads + heads) * D),
+                      dtype=torch.bfloat16, device="cuda")
+    a = torch.randn((offsets[-1], heads), dtype=qkv.dtype, device="cuda")
+    b = torch.zeros_like(a)
+    b[-1, 0] = 100
+    a_log = torch.zeros(heads, dtype=torch.float32, device="cuda")
+    dt_bias = torch.zeros_like(a_log)
+    initial = torch.randn((5, heads, D, D), dtype=torch.float32, device="cuda") * 0.01
+
+    def run(pool):
+        return gdn_prefill_packed_qkv_fwd(
+            qkv, a, b, a_log, dt_bias, cu, num_qk_heads=key_heads, num_v_heads=heads,
+            initial_state=pool, initial_state_indices=indices, raw_cu_seqlens=offsets)[2]
+
+    with monkeypatch.context() as settings:
+        settings.setenv("PLA_FLASHQLA_PRECISION_DV_PER_WARP", "2")
+        settings.setenv("PLA_FLASHQLA_PRECISION_STAGE_TOKENS", "32")
+        reference_pool = initial.clone()
+        reference = run(reference_pool)
+    monkeypatch.delenv("PLA_FLASHQLA_PRECISION_DV_PER_WARP", raising=False)
+    monkeypatch.delenv("PLA_FLASHQLA_PRECISION_STAGE_TOKENS", raising=False)
+    candidate_pool = initial.clone()
+    with patch.object(_C, "_precision_repair", wraps=_C._precision_repair) as repair:
+        candidate = run(candidate_pool)
+    assert repair.call_args.kwargs["dv_per_warp"] == 4
+    assert repair.call_args.kwargs["staged_tokens"] == 0
+    torch.testing.assert_close(candidate, reference, rtol=0, atol=0)
+    torch.testing.assert_close(candidate_pool, reference_pool, rtol=0, atol=0)
+
+
 def _metrics(actual, expected):
     actual = actual.float().flatten()
     expected = expected.float().flatten()

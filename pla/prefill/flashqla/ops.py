@@ -566,10 +566,12 @@ def chunk_gated_delta_rule_fwd(
     if not flashqla_cute._precision_bypass_enabled():
         if os.environ.get("PLA_FLASHQLA_PRECISION_ACCUMULATOR", "fp64") != "fp64":
             raise ValueError("precision diagnostics support only FP64 accumulation")
-        dv_per_warp = int(os.environ.get("PLA_FLASHQLA_PRECISION_DV_PER_WARP", "2"))
+        repair_dv_override = os.environ.get("PLA_FLASHQLA_PRECISION_DV_PER_WARP")
+        dv_per_warp = int(repair_dv_override if repair_dv_override is not None else "2")
         if dv_per_warp not in (1, 2, 4):
             raise ValueError("precision DV per warp must be 1, 2, or 4")
-        staged_tokens = int(os.environ.get("PLA_FLASHQLA_PRECISION_STAGE_TOKENS", "32"))
+        repair_stage_override = os.environ.get("PLA_FLASHQLA_PRECISION_STAGE_TOKENS")
+        staged_tokens = int(repair_stage_override if repair_stage_override is not None else "32")
         if staged_tokens not in (0, 32):
             raise ValueError("precision staged tokens must be 0 or 32")
         # Preserve raw recurrence inputs before fast state writers. The guard
@@ -628,12 +630,27 @@ def chunk_gated_delta_rule_fwd(
             and len(raw_cu) == 2 and cu32.numel() == 2
             and repair_values[1].is_contiguous() and repair_values[3].is_contiguous()
             and _cuda_device_properties(q.device.index) == (8, 9, 39))
+        tc01_live_indexed = (
+            indexed_state and use_raw_gating and complete_layout and q.dtype == torch.bfloat16
+            and initial_state.dtype == torch.float32
+            and ((batch > 1 and 12 <= H <= 32 and batch * H >= 128 and num_tokens >= 256)
+                 or (batch == 1 and H >= 48 and 4096 <= num_tokens <= 32768))
+            and _cuda_device_properties(q.device.index) == (8, 0, 64))
         if (initial_state is not None and not force_precision and not direct_precision
-                and batch * H * DK * DV * 4 > _MAX_REPAIR_SNAPSHOT_BYTES):
+                and (tc01_live_indexed or batch * H * DK * DV * 4 > _MAX_REPAIR_SNAPSHOT_BYTES)):
             # Fast kernels skip selected heads. Their original state remains
             # available to FP64 repair even if the other heads update in place.
             live_initial = initial_state
         if live_initial is not None:
+            if tc01_live_indexed and num_tokens <= 512 and batch * H <= 256:
+                short_requests = sum(0 < end - start <= 3 for start, end in zip(raw_cu, raw_cu[1:]))
+                if short_requests * 2 >= batch:
+                    # Most repairs cover only a few tokens. Read them directly
+                    # and reuse each Q/K load across more value columns.
+                    if repair_dv_override is None:
+                        dv_per_warp = 4
+                    if repair_stage_override is None:
+                        staged_tokens = 0
             precision_flags = flashqla_cute._precision_guard(
                 repair_values[1], cu32, not indexed_state, repair_values[3])
             snapshot = torch.empty(0, device=q.device, dtype=torch.float32)

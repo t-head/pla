@@ -1740,14 +1740,27 @@ torch::Tensor precision_guard(torch::Tensor k, torch::Tensor cu, bool include_em
         "precision guard beta must be contiguous FP32 [1,T,H]");
     const c10::cuda::CUDAGuard guard(k.device());
     const auto device = logical_device_info(k);
-    const bool allow_parallel = device.compute_capability == 89 && device.num_cu == 39;
+    const int64_t heads = beta ? beta->size(2) : 0;
+    const int64_t guard_tasks = n * hg;
+    const bool tc01_short_windows = n > 1 && heads >= 24 && hg <= 8 &&
+        guard_tasks <= device.num_cu && t >= 256 && t <= 1024 && t >= n * 64;
+    const bool tc01_two_guard_waves = n <= 8 && guard_tasks <= 2 * device.num_cu &&
+        t >= n * 512;
+    const bool tc01_long_windows = hg <= 16 && t >= 2048 && t >= n * 256 && t <= 32831 &&
+        (guard_tasks <= device.num_cu || tc01_two_guard_waves || (hg <= 4 && n <= 64 && t >= 8192));
+    const bool tc01_windows = device.compute_capability == 80 && device.num_cu == 64 &&
+        (tc01_short_windows || tc01_long_windows);
+    const bool tc02_windows = device.compute_capability == 89 && device.num_cu == 39 &&
+        (n <= 3 || ((n == 16 || n == 32 || n == 64) && heads == 8 && (hg == 2 || hg == 4))) &&
+        hg <= 16 && ((t >= 1024 && t <= 32831) ||
+        (n == 1 && heads == 16 && hg == 4 && t >= 768 && t < 1024));
     auto flags = torch::empty({n,hg}, k.options().dtype(torch::kInt));
     if (!pla::bypass::enabled()) {
         flashqla_precision::launch_guard(k.data_ptr(),cu.data_ptr<int32_t>(),
             flags.data_ptr<int32_t>(),int(t),int(hg),int(n),dtype_tag(k),include_empty,
             pla::current_stream(k.get_device()),
-            beta ? beta->data_ptr<float>() : nullptr, beta ? int(beta->size(2)) : 0,
-            allow_parallel);
+            beta ? beta->data_ptr<float>() : nullptr, int(heads),
+            tc01_windows || tc02_windows);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
     return flags;
