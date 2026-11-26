@@ -193,6 +193,37 @@ class PPUBuildExtensionTests(unittest.TestCase):
         for edge in edges:
             self.assertTrue(edge.endswith(" | " + str(header.resolve())))
 
+    def test_replay_build_targets_each_specialized_source_once(self):
+        native = ("-arch=ppu_10", "-arch=ppu_15")
+        converted = ("-gencode=arch=compute_80a,code=sm_80a",
+                     "-gencode=arch=compute_89,code=sm_89")
+        backend_source = (ROOT / "ppu_build.py").read_text()
+        for targets in (native, converted):
+            with self.subTest(targets=targets):
+                # cudafy rewrites complete architecture flag literals in Python sources.
+                source = backend_source.replace(native[0], targets[0]).replace(native[1], targets[1])
+                command = load_backend(self.torch_root, source).PPUBuildExtension()
+                command.build_temp = str(self.root)
+                command.get_ext_fullpath = lambda _: str(self.root / "_C.so")
+                extension = FakeExtension("pla.decode.gdn_replayssm._C",
+                                          ["common.cu", "tc01.cu", "tc02.cu"],
+                                          extra_compile_args={"hgcc": ["-O3", *targets]})
+                extension.ppu10_sources = ["tc01.cu"]
+                extension.ppu15_sources = ["tc02.cu"]
+                compiled = []
+
+                def capture(sources, output_dir, ext, extra_postargs=None, depends=None):
+                    flags = (extra_postargs or ext.extra_compile_args)["hgcc"]
+                    compiled.extend((path, flags) for path in sources)
+                    return []
+
+                with patch.object(command, "compile_sources", side_effect=capture), \
+                        patch.object(command, "_link"):
+                    command.build_extension(extension)
+                self.assertCountEqual(compiled, [("common.cu", ["-O3", *targets]),
+                                                 ("tc01.cu", ["-O3", targets[0]]),
+                                                 ("tc02.cu", ["-O3", targets[1]])])
+
     def test_configure_toolchain_uses_only_native_ppu_sdk_paths(self):
         sdk = self.root / "ppu-sdk"
         (sdk / "bin").mkdir(parents=True)
