@@ -48,17 +48,14 @@ def test_tc01_window_guard_matches_serial_after_input_changes(dtype, include_emp
     if (device.major, device.minor, device.multi_processor_count) != (8, 0, 64):
         pytest.skip("window guard dispatch under test requires 64-CU tc01")
     cu = torch.tensor(offsets, device="cuda", dtype=torch.int32)
-    # Appending empty requests exceeds all parallel dispatch limits.
-    serial_cu = torch.tensor(
-        offsets + [offsets[-1]] * (66 - len(offsets)), device="cuda", dtype=torch.int32)
     generator = torch.Generator(device="cuda").manual_seed(51923)
     keys = torch.randn((1, offsets[-1], key_heads, D), generator=generator, device="cuda", dtype=dtype)
     beta = torch.full((1, offsets[-1], heads), 0.25, device="cuda", dtype=torch.float32)
-    original = _C._precision_guard(keys, serial_cu, include_empty, beta)[:len(offsets) - 1]
+    original = _C._precision_guard(keys, cu, include_empty, beta)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        flags = _C._precision_guard(keys, cu, include_empty, beta)
+        flags = _C._precision_guard(keys, cu, include_empty, beta, complete_layout=True)
     graph.replay()
     torch.testing.assert_close(flags, original, rtol=0, atol=0)
 
@@ -66,23 +63,65 @@ def test_tc01_window_guard_matches_serial_after_input_changes(dtype, include_emp
     tail = start + (end - start - 2) // 32 * 32
     keys[0, tail + 1, 0].copy_(-keys[0, tail, 0])
     beta[0, -1, -1] = 1.0
-    planted = _C._precision_guard(keys, serial_cu, include_empty, beta)[:len(offsets) - 1]
+    planted = _C._precision_guard(keys, cu, include_empty, beta)
     graph.replay()
     assert planted[-2, 0].item() == planted[-1, -1].item() == 1
     torch.testing.assert_close(flags, planted, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a PPU device")
-def test_tc01_short_pnd_unstaged_repair_matches_staged(monkeypatch):
+def test_tc01_padded_prefill_matches_compact_in_graph():
     from pla.prefill.flashqla import _C
 
     device = torch.cuda.get_device_properties(0)
     if (device.major, device.minor, device.multi_processor_count) != (8, 0, 64):
-        pytest.skip("short packed repair dispatch requires 64-CU tc01")
-    heads, key_heads = 32, 8
-    offsets = (0, 1, 2, 3, 344)
+        pytest.skip("padded guard dispatch requires 64-CU tc01")
+    tokens, heads = 2048, 16
+    offsets = (0, 3)
     cu = torch.tensor(offsets, dtype=torch.int32, device="cuda")
-    indices = torch.tensor([3, 1, 0, 2], dtype=torch.int32, device="cuda")
+    generator = torch.Generator(device="cuda").manual_seed(76421)
+    q, k, v = (
+        torch.randn((1, tokens, heads, D), generator=generator, dtype=torch.bfloat16, device="cuda")
+        for _ in range(3)
+    )
+    g = torch.full((1, tokens, heads), -0.2, dtype=torch.float32, device="cuda")
+    beta = torch.full_like(g, 0.5)
+
+    def run(length):
+        return chunk_gated_delta_rule_fwd(
+            q[:, :length], k[:, :length], v[:, :length], g[:, :length], beta[:, :length],
+            cu_seqlens=cu, raw_cu_seqlens=offsets, auto_cp=False, output_final_state=False)[2]
+
+    expected = run(offsets[-1])
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run(tokens)
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with patch.object(_C, "_precision_guard", wraps=_C._precision_guard) as guard:
+        with torch.cuda.graph(graph, stream=stream):
+            actual = run(tokens)
+    assert guard.call_args.kwargs["complete_layout"] is False
+    torch.cuda.current_stream().wait_stream(stream)
+    graph.replay()
+    torch.testing.assert_close(actual[:, :offsets[-1]], expected, rtol=0, atol=0)
+    assert torch.count_nonzero(actual[:, offsets[-1]:]).item() == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a PPU device")
+@pytest.mark.parametrize("heads,key_heads,offsets,slots,repair_schedule", [
+    (32, 8, (0, 1, 2, 3, 344), [3, 1, 5, 2], (4, 0)),
+    (48, 16, (0, 4096), [3], (2, 32)),
+], ids=["mixed-short-pnd", "wide-single-request"])
+def test_tc01_live_initial_matches_snapshot(monkeypatch, heads, key_heads, offsets, slots, repair_schedule):
+    from pla.prefill.flashqla import _C, ops
+
+    device = torch.cuda.get_device_properties(0)
+    if (device.major, device.minor, device.multi_processor_count) != (8, 0, 64):
+        pytest.skip("live indexed repair dispatch requires 64-CU tc01")
+    cu = torch.tensor(offsets, dtype=torch.int32, device="cuda")
+    indices = torch.tensor(slots, dtype=torch.int32, device="cuda")
     torch.manual_seed(72439)
     qkv = torch.randn((offsets[-1], (2 * key_heads + heads) * D),
                       dtype=torch.bfloat16, device="cuda")
@@ -91,27 +130,37 @@ def test_tc01_short_pnd_unstaged_repair_matches_staged(monkeypatch):
     b[-1, 0] = 100
     a_log = torch.zeros(heads, dtype=torch.float32, device="cuda")
     dt_bias = torch.zeros_like(a_log)
-    initial = torch.randn((5, heads, D, D), dtype=torch.float32, device="cuda") * 0.01
+    initial = torch.randn((7, heads, D, D), dtype=torch.float32, device="cuda") * 0.01
 
     def run(pool):
         return gdn_prefill_packed_qkv_fwd(
             qkv, a, b, a_log, dt_bias, cu, num_qk_heads=key_heads, num_v_heads=heads,
             initial_state=pool, initial_state_indices=indices, raw_cu_seqlens=offsets)[2]
 
-    with monkeypatch.context() as settings:
-        settings.setenv("PLA_FLASHQLA_PRECISION_DV_PER_WARP", "2")
-        settings.setenv("PLA_FLASHQLA_PRECISION_STAGE_TOKENS", "32")
-        reference_pool = initial.clone()
-        reference = run(reference_pool)
     monkeypatch.delenv("PLA_FLASHQLA_PRECISION_DV_PER_WARP", raising=False)
     monkeypatch.delenv("PLA_FLASHQLA_PRECISION_STAGE_TOKENS", raising=False)
+    reference_pool = initial.clone()
+    # Disable only the Python live-state admission for the reference. Its
+    # native kernels still see the true device properties.
+    with patch.object(ops, "_cuda_device_properties", return_value=(8, 0, 63)), \
+            patch.object(_C, "_precision_snapshot", wraps=_C._precision_snapshot) as snapshot, \
+            patch.object(_C, "_precision_repair", wraps=_C._precision_repair) as repair:
+        reference = run(reference_pool)
+    snapshot.assert_called_once()
+    assert repair.call_args.kwargs["live_initial"] is None
+
     candidate_pool = initial.clone()
-    with patch.object(_C, "_precision_repair", wraps=_C._precision_repair) as repair:
+    with patch.object(_C, "_precision_snapshot", wraps=_C._precision_snapshot) as snapshot, \
+            patch.object(_C, "_precision_repair", wraps=_C._precision_repair) as repair:
         candidate = run(candidate_pool)
-    assert repair.call_args.kwargs["dv_per_warp"] == 4
-    assert repair.call_args.kwargs["staged_tokens"] == 0
-    torch.testing.assert_close(candidate, reference, rtol=0, atol=0)
-    torch.testing.assert_close(candidate_pool, reference_pool, rtol=0, atol=0)
+    snapshot.assert_not_called()
+    args = repair.call_args.kwargs
+    assert args["live_initial"] is candidate_pool
+    assert (args["dv_per_warp"], args["staged_tokens"]) == repair_schedule
+    assert args["flags"][-1, 0].item() == 1
+    assert args["flags"][-1, -1].item() == 0
+    assert torch.equal(candidate.view(torch.int16), reference.view(torch.int16))
+    assert torch.equal(candidate_pool.view(torch.int32), reference_pool.view(torch.int32))
 
 
 def _metrics(actual, expected):

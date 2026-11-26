@@ -1722,7 +1722,7 @@ std::vector<torch::Tensor> fused_fwd(
 // Structural selection and FP64 recovery keep scratch local to a call/Graph.
 // A missing selection tensor retains the private force-all diagnostic mode.
 torch::Tensor precision_guard(torch::Tensor k, torch::Tensor cu, bool include_empty,
-    c10::optional<torch::Tensor> beta) {
+    c10::optional<torch::Tensor> beta, bool complete_layout) {
     TORCH_CHECK(k.is_cuda() && k.dim() == 4 && k.size(0) == 1 && k.size(3) == 128 &&
                 k.is_contiguous() && (k.scalar_type() == torch::kHalf ||
                 k.scalar_type() == torch::kBFloat16),
@@ -1748,7 +1748,9 @@ torch::Tensor precision_guard(torch::Tensor k, torch::Tensor cu, bool include_em
         t >= n * 512;
     const bool tc01_long_windows = hg <= 16 && t >= 2048 && t >= n * 256 && t <= 32831 &&
         (guard_tasks <= device.num_cu || tc01_two_guard_waves || (hg <= 4 && n <= 64 && t >= 8192));
-    const bool tc01_windows = device.compute_capability == 80 && device.num_cu == 64 &&
+    // The window grid spans T. The host plan knows whether T includes padding.
+    const bool tc01_windows = complete_layout &&
+        device.compute_capability == 80 && device.num_cu == 64 &&
         (tc01_short_windows || tc01_long_windows);
     const bool tc02_windows = device.compute_capability == 89 && device.num_cu == 39 &&
         (n <= 3 || ((n == 16 || n == 32 || n == 64) && heads == 8 && (hg == 2 || hg == 4))) &&
@@ -2085,7 +2087,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     m.def("_precision_guard", &precision_guard,
           py::arg("k"), py::arg("cu"), py::arg("include_empty") = false,
-          py::arg("beta") = c10::nullopt);
+          py::arg("beta") = c10::nullopt, py::arg("complete_layout") = false);
     m.def("_precision_guard_snapshot_short", &precision_guard_snapshot_short,
           py::arg("k"), py::arg("cu"), py::arg("include_empty"), py::arg("beta"),
           py::arg("initial"), py::arg("indices"), py::arg("heads"));

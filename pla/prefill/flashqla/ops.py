@@ -652,7 +652,8 @@ def chunk_gated_delta_rule_fwd(
                     if repair_stage_override is None:
                         staged_tokens = 0
             precision_flags = flashqla_cute._precision_guard(
-                repair_values[1], cu32, not indexed_state, repair_values[3])
+                repair_values[1], cu32, not indexed_state, repair_values[3],
+                complete_layout=complete_layout)
             snapshot = torch.empty(0, device=q.device, dtype=torch.float32)
         elif tiny_indexed:
             snapshot = torch.empty(0, device=q.device, dtype=torch.float32)
@@ -667,7 +668,8 @@ def chunk_gated_delta_rule_fwd(
         else:
             precision_flags = (None if force_precision or direct_precision else
                                flashqla_cute._precision_guard(
-                                   repair_values[1], cu32, not indexed_state, repair_values[3]))
+                                   repair_values[1], cu32, not indexed_state, repair_values[3],
+                                   complete_layout=complete_layout))
             snapshot = (flashqla_cute._precision_snapshot(
                 initial_state, initial_state_indices, cu32, H, precision_flags)
                 if initial_state is not None else
