@@ -636,8 +636,26 @@ def chunk_gated_delta_rule_fwd(
             and ((batch > 1 and 12 <= H <= 32 and batch * H >= 128 and num_tokens >= 256)
                  or (batch == 1 and H >= 48 and 4096 <= num_tokens <= 32768))
             and _cuda_device_properties(q.device.index) == (8, 0, 64))
+        # Packed PnD selects all single-token rows for repair. Their state
+        # stays untouched by the fast forward, so repair can load it in place.
+        tc02_live_pnd = False
+        if (indexed_state and use_raw_gating and complete_layout
+                and q.dtype == torch.bfloat16 and state_dtype == torch.float32
+                and 8 <= batch <= 136 and 8 <= H <= 48 and 512 <= num_tokens <= 32768
+                and _cuda_device_properties(q.device.index) == (8, 9, 39)):
+            lengths = tuple(end - start for start, end in zip(raw_cu, raw_cu[1:]))
+            decode_rows = lengths.count(1)
+            prefill_rows = batch - decode_rows
+            long_pnd = num_tokens >= 2048 and 1 <= prefill_rows <= 6
+            # Short mixed batches can spend more time snapshotting than
+            # repairing. Reuse the skipped state for these packed grids.
+            short_pnd = ((H, Hg) in ((8, 1), (24, 8)) and batch <= 48
+                         and max(lengths) <= 384 and 1 <= prefill_rows <= 7)
+            tc02_live_pnd = (min(lengths) > 0 and 2 * decode_rows >= batch
+                             and (long_pnd or short_pnd))
         if (initial_state is not None and not force_precision and not direct_precision
-                and (tc01_live_indexed or batch * H * DK * DV * 4 > _MAX_REPAIR_SNAPSHOT_BYTES)):
+                and (tc01_live_indexed or tc02_live_pnd
+                     or batch * H * DK * DV * 4 > _MAX_REPAIR_SNAPSHOT_BYTES)):
             # Fast kernels skip selected heads. Their original state remains
             # available to FP64 repair even if the other heads update in place.
             live_initial = initial_state

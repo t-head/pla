@@ -1746,12 +1746,15 @@ void FLASHQLA_KKT_LAUNCHER(
          (H == 24 && Hg == 8 && num_tokens >= 1024 && num_tokens <= 16384));
     dim3 group_grid(num_chunks * Hg > 0 ? num_chunks * Hg : 1);
     // Private measured T1211 neighborhood. Exact N1 full-packed calls omit
-    // chunk_indices; packed/padded calls keep their prior dispatch unchanged.
-    const bool use_group8 = num_cu == 39 && single_sequence &&
+    // chunk_indices. The 39-CU packed H16/Hg2 range also benefits from this grouping.
+    const bool use_packed_group8 = dtype_tag != 0 && H == 16 && Hg == 2 &&
+        sequences >= 8 && sequences <= 12 && num_tokens >= 16384 && num_tokens <= 24576;
+    const bool use_single_group8 = single_sequence &&
         ((H == 16 && Hg == 2 && ((sequences == 1 && num_tokens == 847) ||
           (num_tokens >= 1024 && num_tokens < 1409))) ||
          (H == 32 && Hg == 4 && num_tokens >= 128 && num_tokens < 256) ||
          ((num_tokens == 24 || num_tokens == 48) && ((H == 64 && Hg == 8) || (H == 128 && Hg == 16))));
+    const bool use_group8 = num_cu == 39 && (use_packed_group8 || use_single_group8);
     const bool medium_h8_group = sequences == 2 && !single_sequence && H == 8 &&
         ((Hg == 2 && num_tokens == 1041 && num_chunks == 33) ||
          (Hg == 4 && num_tokens == 920 && num_chunks == 29));

@@ -1752,8 +1752,15 @@ torch::Tensor precision_guard(torch::Tensor k, torch::Tensor cu, bool include_em
     const bool tc01_windows = complete_layout &&
         device.compute_capability == 80 && device.num_cu == 64 &&
         (tc01_short_windows || tc01_long_windows);
+    // One CTA per sequence and key head can underfill M890P on a long packed batch.
+    const bool tc02_underfilled_packed = k.scalar_type() == torch::kBFloat16 && beta &&
+        n > 3 && t >= 8192 &&
+        (guard_tasks <= device.num_cu ||
+         (complete_layout && heads == 8 && hg == 2 && n >= 40 && n <= 48 &&
+          t >= 16384 && t <= 20480));
     const bool tc02_windows = device.compute_capability == 89 && device.num_cu == 39 &&
-        (n <= 3 || ((n == 16 || n == 32 || n == 64) && heads == 8 && (hg == 2 || hg == 4))) &&
+        (n <= 3 || tc02_underfilled_packed ||
+         ((n == 16 || n == 32 || n == 64) && heads == 8 && (hg == 2 || hg == 4))) &&
         hg <= 16 && ((t >= 1024 && t <= 32831) ||
         (n == 1 && heads == 16 && hg == 4 && t >= 768 && t < 1024));
     auto flags = torch::empty({n,hg}, k.options().dtype(torch::kInt));
@@ -2052,7 +2059,9 @@ void precision_repair(torch::Tensor q, torch::Tensor k, torch::Tensor v,
         !snapshot.numel() && !flags && a.fuse_suffix), "invalid tiny indexed repair arguments");
     a.load_indexed_state = load_indexed_state;
     int repair_block_cap = 256;
-    if (n == 64 && h == 8 && (hg == 2 || hg == 4) && staged_tokens == 32) {
+    if (staged_tokens == 32 && h == 8 &&
+        ((n == 64 && (hg == 2 || hg == 4)) ||
+         (hg == 2 && a.live_initial && n >= 40 && n <= 48 && t >= 16384 && t <= 20480))) {
         const auto n64_device = logical_device_info(q);
         if (n64_device.compute_capability == 89 && n64_device.num_cu == 39)
             repair_block_cap = 2048;

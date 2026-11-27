@@ -1824,9 +1824,16 @@ void launch_fused_fwd_cp_cute(
       (raw_batch_size == 2 && H == 32 && Hg == 4 && num_tokens == 920) ||
       (raw_batch_size == 1 && H == 24 && Hg == 8 && num_tokens == 823) ||
       (raw_batch_size == 1 && H == 16 && Hg == 8 && num_tokens == 508);
+  // These packed 39-CU grids benefit from the indexed register chain.
+  const bool packed_indexed_stream = !state_bf16 && dtype_tag != 0 &&
+      cp_seq_map == nullptr &&
+      ((H == 16 && Hg == 2 && raw_batch_size >= 8 && raw_batch_size <= 12 &&
+        num_tokens >= 16384 && num_tokens <= 24576) ||
+       (H == 12 && Hg == 4 && raw_batch_size >= 6 && raw_batch_size <= 8 &&
+        num_tokens >= 8192 && num_tokens <= 12288));
   const bool use_tc02_gva_stream_state =
       !is_tc01 && num_cu == 39 && raw_state != nullptr &&
-      (lowhead_stream_shape || medium_stream_shape ||
+      (lowhead_stream_shape || medium_stream_shape || packed_indexed_stream ||
        (raw_batch_size == 1 && num_tokens == 8192 &&
         ((H == 12 && Hg == 4 && batch_size == 6) ||
          (H == 6 && Hg == 2 && batch_size == 12)) && cp_seq_map != nullptr));
