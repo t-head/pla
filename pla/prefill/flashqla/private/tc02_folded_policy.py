@@ -17,6 +17,10 @@ def _raw_admitted(heads, key_heads, lengths, tokens):
 
     if (heads, key_heads) == (64, 8):
         return batch == 2 and 8192 <= tokens <= 12288
+    if (heads, key_heads) == (32, 4) and batch == 3 and tokens == 8192:
+        # The long row dominates this grid. Fold the per-chunk coefficients
+        # while retaining the existing automatic CP decision.
+        return min(lengths) >= 512 and 3 * max(lengths) >= 2 * tokens
     if (heads, key_heads) not in ((8, 2), (8, 4), (16, 4), (24, 8)) or batch > 8:
         return False
     longest = max(lengths)

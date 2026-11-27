@@ -103,6 +103,9 @@ constexpr int kDimV = 128;
 constexpr int kHeadElems = kDimK * kDimV;   // 16384, per-(v-head) state stride
 constexpr int kKernelWidth = 4;
 constexpr int kConvStateWidth = kKernelWidth - 1;   // 3 history taps
+constexpr int kTwoValueRowsWarps = 16;
+constexpr int kValueRowsPerWarp = 2;
+constexpr int kLanesPerValueRow = 32 / kValueRowsPerWarp;
 
 // ----------------------------------------------------------------------------
 // Small device helpers (sigmoid uses the PPU hardware op when available).
@@ -143,6 +146,113 @@ __device__ __forceinline__ float conv_w(const float* __restrict__ w, int channel
 //   output_gate  : [.,B,H,128]      -> og[i_n*onorm_row + i_hv*128 + v]
 //   out          : [1, B, H, 128]   -> out[i_n*dim + i_hv*128 + v]
 // ----------------------------------------------------------------------------
+
+// Each subgroup of lanes owns one value row, including the entire key
+// reduction. Consecutive value rows share the same warp and RMSNorm.
+template <typename scalar_t>
+__device__ __forceinline__ void decode_two_value_rows(
+    float* state, const float4 (&first_state)[kValueRowsPerWarp],
+    const float* q, const float* k, const float* decay,
+    const scalar_t* v, float beta, const scalar_t* gate,
+    const float* norm_weight, float norm_eps, scalar_t* output,
+    float q_scale, float k_scale, float* partial_norm, float* raw_output) {
+  constexpr int lanes_per_row = kLanesPerValueRow;
+  constexpr int value_step = kTwoValueRowsWarps * kValueRowsPerWarp;
+  constexpr int tiles = kDimV / value_step;
+  const int lane = threadIdx.x;
+  const int warp = threadIdx.y;
+  const int key = (lane % lanes_per_row) * 4;
+  const int first_value = warp * kValueRowsPerWarp + lane / lanes_per_row;
+
+  float4 query[kValueRowsPerWarp];
+  float4 key_vec[kValueRowsPerWarp];
+  float4 decay_vec[kValueRowsPerWarp];
+  float4 h[kValueRowsPerWarp];
+  #pragma unroll
+  for (int part = 0; part < kValueRowsPerWarp; ++part) {
+    const int offset = key + part * (lanes_per_row * 4);
+    query[part] = *reinterpret_cast<const float4*>(q + offset);
+    key_vec[part] = *reinterpret_cast<const float4*>(k + offset);
+    float4& qi = query[part];
+    float4& ki = key_vec[part];
+    qi = {qi.x * q_scale, qi.y * q_scale, qi.z * q_scale, qi.w * q_scale};
+    ki = {ki.x * k_scale, ki.y * k_scale, ki.z * k_scale, ki.w * k_scale};
+    decay_vec[part] = *reinterpret_cast<const float4*>(decay + offset);
+    h[part] = first_state[part];
+  }
+
+  float norm = 0.0f;
+  #pragma unroll
+  for (int tile = 0; tile < tiles; ++tile) {
+    const int value = first_value + tile * value_step;
+    float4 updated[kValueRowsPerWarp];
+    float prediction = 0.0f;
+    #pragma unroll
+    for (int part = 0; part < kValueRowsPerWarp; ++part) {
+      const float4 d = decay_vec[part];
+      const float4 ki = key_vec[part];
+      const float4 s = h[part];
+      updated[part] = {s.x * d.x, s.y * d.y, s.z * d.z, s.w * d.w};
+      const float4 decayed = updated[part];
+      prediction += decayed.x * ki.x + decayed.y * ki.y +
+                    decayed.z * ki.z + decayed.w * ki.w;
+      if (tile + 1 < tiles) {
+        const int next = (value + value_step) * kDimK + key + part * (lanes_per_row * 4);
+        h[part] = *reinterpret_cast<const float4*>(state + next);
+      }
+    }
+    #pragma unroll
+    for (int offset = lanes_per_row / 2; offset > 0; offset /= 2) {
+      prediction += __shfl_xor_sync(0xffffffff, prediction, offset);
+    }
+    const float residual = (static_cast<float>(v[value]) - prediction) * beta;
+    float result = 0.0f;
+    #pragma unroll
+    for (int part = 0; part < kValueRowsPerWarp; ++part) {
+      const float4 ki = key_vec[part];
+      float4 s = updated[part];
+      s.x += ki.x * residual;
+      s.y += ki.y * residual;
+      s.z += ki.z * residual;
+      s.w += ki.w * residual;
+      float* dst = state + value * kDimK + key + part * (lanes_per_row * 4);
+#ifdef __HGGC_ARCH__
+      *(Global v4float*)(dst) = *(v4float*)&s;
+#else
+      *reinterpret_cast<float4*>(dst) = s;
+#endif
+      const float4 qi = query[part];
+      result += s.x * qi.x + s.y * qi.y + s.z * qi.z + s.w * qi.w;
+    }
+    #pragma unroll
+    for (int offset = lanes_per_row / 2; offset > 0; offset /= 2) {
+      result += __shfl_xor_sync(0xffffffff, result, offset);
+    }
+    if (lane % lanes_per_row == 0) {
+      raw_output[value] = result;
+    }
+    norm += result * result;
+  }
+  norm += __shfl_xor_sync(0xffffffff, norm, lanes_per_row);
+  if (lane == 0) {
+    partial_norm[warp] = norm;
+  }
+  __syncthreads();
+
+  const int value = warp * 32 + lane;
+  if (value < kDimV) {
+    float sum_sq = 0.0f;
+    #pragma unroll
+    for (int w = 0; w < kTwoValueRowsWarps; w += 4) {
+      const float4 partial = *reinterpret_cast<const float4*>(partial_norm + w);
+      sum_sq = sum_sq + partial.x + partial.y + partial.z + partial.w;
+    }
+    const float inv_rms = rsqrtf(sum_sq / kDimV + norm_eps);
+    output[value] = static_cast<scalar_t>(raw_output[value] * inv_rms *
+        norm_weight[value] * ppu_sigmoid(static_cast<float>(gate[value])));
+  }
+}
+
 template <typename scalar_t, int WARP_NUM, int BV, int STAGE_NUM, int CORE_ROWS,
           bool APPLY_ONORM, bool USE_LOWER_BOUND, bool PARALLEL_EPILOGUE>
 __global__ void fused_kda_decode_ppu_kernel(
@@ -187,8 +297,12 @@ __global__ void fused_kda_decode_ppu_kernel(
   constexpr int PIPE_STAGES = STAGE_NUM;
   static_assert(CORE_ROWS == 2 || CORE_ROWS == 4,
                 "KDA recurrent core only supports 2 or 4 rows per iteration");
-  static_assert(WARP_NUM == 4 || WARP_NUM == 8,
-                "KDA mega kernel only supports WARP_NUM=4 or 8");
+  constexpr bool TWO_VALUE_ROWS = WARP_NUM == kTwoValueRowsWarps;
+  static_assert(WARP_NUM == 4 || WARP_NUM == 8 || TWO_VALUE_ROWS,
+                "unsupported warp count for KDA mega decode");
+  static_assert(!TWO_VALUE_ROWS || (APPLY_ONORM && USE_LOWER_BOUND &&
+                                    PARALLEL_EPILOGUE && BV == kDimV),
+                "the two-value-row path requires gated RMSNorm and a lower bound");
 
   const int i_n = blockIdx.z;                 // batch row
   const int i_h = blockIdx.y;                 // qk head
@@ -274,17 +388,29 @@ __global__ void fused_kda_decode_ppu_kernel(
     }
   };
 
-  // Kick off the recurrent-state prefetch as early as possible so its DMA
-  // overlaps the Stage-A conv / gate transcendental compute below.
+  float4 first_state[kValueRowsPerWarp];
+  if constexpr (!TWO_VALUE_ROWS) {
+    // Kick off the recurrent-state prefetch as early as possible so its DMA
+    // overlaps the Stage-A conv / gate transcendental compute below.
 #ifdef PPU_KDA_USE_AIU
-  issue_aiu_ld(0, 0);
+    issue_aiu_ld(0, 0);
 #endif
-  #pragma unroll
-  for (int i = 0; i < PIPE_STAGES; ++i) {
+    #pragma unroll
+    for (int i = 0; i < PIPE_STAGES; ++i) {
 #ifndef PPU_KDA_USE_AIU
-    issue_async_stage(i, i, i < TOTAL_TASKS);
+      issue_async_stage(i, i, i < TOTAL_TASKS);
 #endif
-    cp_async_commit();
+      cp_async_commit();
+    }
+  } else {
+    const int key = (lane_id % kLanesPerValueRow) * 4;
+    const int value = warp_id * kValueRowsPerWarp + lane_id / kLanesPerValueRow;
+    const float* row = h0_cta_base - k_idx + value * kDimK + key;
+    #pragma unroll
+    for (int part = 0; part < kValueRowsPerWarp; ++part) {
+      first_state[part] =
+          *reinterpret_cast<const float4*>(row + part * kLanesPerValueRow * 4);
+    }
   }
 
   // =========================================================================
@@ -297,7 +423,56 @@ __global__ void fused_kda_decode_ppu_kernel(
   // Every channel is still handled by exactly one thread with the same
   // per-channel arithmetic and bit-exact 3-tap conv-state writeback.
   // =========================================================================
-  {
+  if constexpr (TWO_VALUE_ROWS) {
+    // Four warps per operand allow the three convolutions and decay to run
+    // independently. Accumulate the Q/K norms before the consumer barrier.
+    const int operand = warp_id / 4;
+    const int channel = tid % kDimK;
+    const int offset = hk_off + channel;
+    if (operand < 3) {
+      const scalar_t* input = operand == 0 ? x_q : (operand == 1 ? x_k : x_v);
+      scalar_t* conv = operand == 0 ? cs_q : (operand == 1 ? cs_k : cs_v);
+      const float* weight = operand == 0 ? w_q_t : (operand == 1 ? w_k_t : w_v_t);
+      const float* bias = operand == 0 ? bias_q : (operand == 1 ? bias_k : bias_v);
+      const int64_t pos = static_cast<int64_t>(slot) * conv_slot + offset;
+      const scalar_t tap0 = conv[pos];
+      const scalar_t tap1 = conv[pos + kPackedDim];
+      const scalar_t tap2 = conv[pos + 2 * kPackedDim];
+      const scalar_t next = input[bos * x_row + offset];
+      float acc = bias ? bias[offset] : 0.0f;
+      acc += static_cast<float>(tap0) * conv_w(weight, offset, 0, dim);
+      acc += static_cast<float>(tap1) * conv_w(weight, offset, 1, dim);
+      acc += static_cast<float>(tap2) * conv_w(weight, offset, 2, dim);
+      acc += static_cast<float>(next) * conv_w(weight, offset, 3, dim);
+      conv[pos] = tap1;
+      conv[pos + kPackedDim] = tap2;
+      conv[pos + 2 * kPackedDim] = next;
+      const float value = ppu_silu(acc);
+      if (operand == 2) {
+        smem_bv[channel] = static_cast<scalar_t>(value);
+      } else {
+        float* vec = operand == 0 ? smem_q : smem_k;
+        float* partials = operand == 0 ? smem_reduction : smem_reduction2;
+        vec[channel] = value;
+        float sq = value * value;
+        #pragma unroll
+        for (int delta = 16; delta > 0; delta /= 2) {
+          sq += __shfl_down_sync(0xffffffff, sq, delta);
+        }
+        if (lane_id == 0) {
+          partials[warp_id % 4] = sq;
+        }
+      }
+    } else {
+      const float exp_a = __shfl_sync(
+          0xffffffff, lane_id == 0 ? __expf(a_log[i_h]) : 0.0f, 0);
+      const float raw = static_cast<float>(g[bos * dim + offset]) + dt_bias[offset];
+      smem_bg[channel] = __expf(lower_bound * ppu_sigmoid(exp_a * raw));
+    }
+    if (tid == 0) {
+      smem_b_beta[0] = ppu_sigmoid(static_cast<float>(beta[bos * beta_row + i_hv]));
+    }
+  } else {
     // Only lane 0 of each warp evaluates the transcendental; broadcast within
     // the warp (mirrors the ref kernel's __shfl_sync(...,0) optimisation).
     // Bit-exact: the same __expf result is broadcast, only instruction count
@@ -471,6 +646,20 @@ __global__ void fused_kda_decode_ppu_kernel(
   }
 
   __syncthreads();
+
+  if constexpr (TWO_VALUE_ROWS) {
+    const float4 qs = *reinterpret_cast<const float4*>(smem_reduction);
+    const float4 ks = *reinterpret_cast<const float4*>(smem_reduction2);
+    const float q_scale = rsqrtf(qs.x + qs.y + qs.z + qs.w + 1.0e-6f) * scale;
+    const float k_scale = rsqrtf(ks.x + ks.y + ks.z + ks.w + 1.0e-6f);
+    // The output norm partials have their own storage so faster warps
+    // cannot overwrite Q/K partials that other warps still need.
+    decode_two_value_rows(
+        h0_cta_base - k_idx, first_state, smem_q, smem_k, smem_bg, smem_bv,
+        smem_b_beta[0], g_out + i_n * onorm_row + hv_off, o_norm_weight,
+        norm_eps, o + i_n * dim + hv_off, q_scale, k_scale, smem_o + BV, smem_o);
+    return;
+  }
 
   float4 q_vec = *reinterpret_cast<const float4*>(&smem_q[k_idx]);
   float4 k_vec = *reinterpret_cast<const float4*>(&smem_k[k_idx]);

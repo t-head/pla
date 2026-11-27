@@ -59,6 +59,23 @@ namespace {
 
 using fused_kda_decode_ppu::fused_kda_decode_ppu_kernel;
 using fused_kda_decode_ppu::kHeadElems;
+using fused_kda_decode_ppu::kTwoValueRowsWarps;
+
+bool use_m890p_subwarp_decode() {
+  static const bool enabled = [] {
+    const char* flag = std::getenv("KDA_M890P_SUBWARP_DECODE");
+    return flag != nullptr && std::strcmp(flag, "1") == 0;
+  }();
+  if (!enabled) {
+    return false;
+  }
+
+  int device;
+  hggcDeviceProp props{};
+  return hggcGetDevice(&device) == hggcSuccess &&
+         hggcGetDeviceProperties(&props, device) == hggcSuccess &&
+         props.major == 8 && props.minor == 9 && props.multiProcessorCount == 39;
+}
 
 // ----------------------------------------------------------------------------
 // Launch helpers.
@@ -86,10 +103,10 @@ void launch_ppu_mega_cfg_variant(
   constexpr pla::KLastSharedLayout shared_layout(
       PIPE_STAGES, K, WARP_NUM, BV, 1, true, false, 1, sizeof(scalar_t));
   // P7 appends one aligned output vector after the common KDA fixed regions.
-  // The device uses this same layout for every offset, including the padding
-  // between scalar beta and the float4 decay vector.
+  // The two-value-row kernel also appends one RMSNorm partial per warp.
   constexpr int shared_mem_size = static_cast<int>(
-      shared_layout.total_bytes + (PARALLEL_EPILOGUE ? sizeof(float) * BV : 0));
+      shared_layout.total_bytes + (PARALLEL_EPILOGUE ? sizeof(float) * BV : 0) +
+      (WARP_NUM == kTwoValueRowsWarps ? sizeof(float) * WARP_NUM : 0));
 
   auto kernel =
       fused_kda_decode_ppu_kernel<scalar_t, WARP_NUM, BV, STAGE_NUM, CORE_ROWS,
@@ -297,6 +314,16 @@ void launch_kda_decode_mega(
       o_norm_weight, norm_eps, state, state_indices, out, scale, lower_bound,  \
       B, H, HV, x_row, beta_row, onorm_row, conv_slot, state_slot, stream
   if (act_dtype == pla::k_last::MegaDType::kBFloat16) {
+    if (B == 1 && H == 64 && HV == 64 && apply_onorm && use_lower_bound &&
+        lower_bound == -5.0f && use_m890p_subwarp_decode()) {
+      launch_ppu_mega_cfg_variant<
+          __ppu_bfloat16, kTwoValueRowsWarps, 2, 2, true, true, true>(
+          a_log, g, dt_bias, x_q, x_k, x_v, beta, w_q_t, w_k_t, w_v_t, bias_q,
+          bias_k, bias_v, cs_q, cs_k, cs_v, g_out, o_norm_weight, norm_eps,
+          state, state_indices, out, scale, lower_bound, B, H, HV, x_row,
+          beta_row, onorm_row, conv_slot, state_slot, stream);
+      return;
+    }
     dispatch_ppu_mega<__ppu_bfloat16>(PLA_MEGA_ARGS);
   } else {
     dispatch_ppu_mega<__half>(PLA_MEGA_ARGS);
