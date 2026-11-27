@@ -49,6 +49,7 @@
 #include <unordered_map>
 #include "generated/fused_sigmoid_gating_dispatch_k_last.h"
 #include "generated/tuned_dispatch.h"
+#include "kda_tc02.h"
 
 #define CHECK_DTYPE(x, dataType) TORCH_CHECK(x.dtype() == dataType, #x "'s data type should be " #dataType)
 
@@ -355,7 +356,6 @@ torch::Tensor fused_sigmoid_gating_delta_rule_forward_k_last(
 
     bool mtp_verify = T_max > 1 || disable_state_update || target_verify;
     check_dt_bias_dtype(dt_bias, q, is_kda, mtp_verify);
-
     // The MTP tables are split by chain/tree mode: an eagle-tree call always
     // carries retrieve_parent_token while a chain call never does. The host
     // cannot cheaply inspect the device-side parent values, so has_value is
@@ -363,6 +363,68 @@ torch::Tensor fused_sigmoid_gating_delta_rule_forward_k_last(
     // conservatively lands on the tree table (correctness is unaffected).
     TunedParams tp = mtp_verify ? get_tuned_k_last_mtp(B, H, HV, K, V, retrieve_parent_token.has_value())
                                 : get_tuned_k_last(B, H, HV, K, V);
+
+    // Shared vector and state-pool contract for TC02 KDA fast paths.
+    auto tc02_inputs = [&] {
+        return H == HV && q.scalar_type() == at::kBFloat16
+        && A_log.scalar_type() == at::kFloat && A_log.is_contiguous()
+        && a.is_contiguous() && b.is_contiguous() && dt_bias.is_contiguous()
+        && initial_state_source && initial_state_indices
+        && initial_state_indices->dim() == 1 && initial_state_indices->is_contiguous()
+        && q.stride(2) == K && k.stride(2) == K && v.stride(2) == V
+        && q.stride(3) == 1 && k.stride(3) == 1 && v.stride(3) == 1
+        && reinterpret_cast<uintptr_t>(initial_state_source->data_ptr()) % 16 == 0
+        && initial_state_source->stride(0)*initial_state_source->element_size() % 16 == 0;
+    };
+
+    if (is_kda && !mtp_verify && tc02_inputs()) {
+        const auto plan = pla::kda_decode_tc02_plan(
+            q.get_device(), B, H, state_dtype == at::kBFloat16, tp.bv);
+        if (plan != pla::KdaDecodeTc02Plan::Fallback) {
+            const pla::KdaDecodeTc02Args args{
+                q.data_ptr(), k.data_ptr(), v.data_ptr(), a.data_ptr(), b.data_ptr(), dt_bias.data_ptr(),
+                A_log.data_ptr<float>(), initial_state_source->data_ptr(), o.data_ptr(),
+                cu_seqlens ? cu_seqlens->data_ptr<int32_t>() : nullptr,
+                initial_state_indices->data_ptr<int32_t>(), initial_state_source->stride(0),
+                stride_q, stride_k, stride_v, stride_a, stride_b,
+                B, H, static_cast<int>(initial_state_source->size(0)),
+                static_cast<int>(q.size(0)*q.size(1)), scale_val,
+                softplus_beta_or_lower_bound, softplus_threshold, lower_bound.has_value(),
+                use_qk_l2norm_in_kernel, is_sglang_val, state_dtype == at::kBFloat16};
+            pla::launch_kda_decode_tc02(args, plan, pla::current_stream());
+            return o;
+        }
+    }
+
+    // Dense SGLang chains use a register-resident state tile. Branching,
+    // GQA, writeback and layouts outside the vector contract keep the general
+    // launcher; the optional fast path never changes their public semantics.
+    if (is_kda && mtp_verify && is_sglang_val && disable_state_update
+        && use_qk_l2norm_in_kernel && lower_bound && !retrieve_parent_token
+        && dt_bias.scalar_type() == at::kFloat
+        && intermediate_states_buffer && intermediate_state_indices
+        && intermediate_state_indices->dim() == 1 && intermediate_state_indices->is_contiguous()
+        && intermediate_states_buffer->dim() == 5 && intermediate_states_buffer->is_contiguous()
+        && reinterpret_cast<uintptr_t>(intermediate_states_buffer->data_ptr()) % 16 == 0
+        && tc02_inputs()) {
+        const int splits = pla::kda_verify_tc02_splits(q.get_device(), B, H, state_dtype == at::kBFloat16);
+        if (splits != 0) {
+            const pla::KdaVerifyTc02Args args{
+                q.data_ptr(), k.data_ptr(), v.data_ptr(), a.data_ptr(), b.data_ptr(),
+                A_log.data_ptr<float>(), dt_bias.data_ptr<float>(), initial_state_source->data_ptr(),
+                intermediate_states_buffer->data_ptr(), o.data_ptr(),
+                cu_seqlens ? cu_seqlens->data_ptr<int32_t>() : nullptr,
+                initial_state_indices->data_ptr<int32_t>(), intermediate_state_indices->data_ptr<int32_t>(),
+                initial_state_source->stride(0), intermediate_states_buffer->stride(0),
+                intermediate_states_buffer->stride(1), stride_q, stride_k, stride_v, stride_a,
+                B, H, T_max, static_cast<int>(q.size(0)*q.size(1)),
+                static_cast<int>(initial_state_source->size(0)),
+                static_cast<int>(intermediate_states_buffer->size(0)), scale_val, *lower_bound,
+                state_dtype == at::kBFloat16};
+            pla::launch_kda_verify_tc02(args, splits, pla::current_stream());
+            return o;
+        }
+    }
 
     int hv_per_h = HV / H;
     TORCH_CHECK(tp.bv > 0 && tp.wn > 0 && tp.sn > 0 && V % tp.bv == 0,

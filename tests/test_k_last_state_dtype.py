@@ -105,9 +105,12 @@ def make_case(state_dtype, activation_dtype, is_kda, mode, *,
     return args, backing, lengths, state_ids, cache_ids
 
 
-def reference(args, lengths, state_ids, cache_ids):
+def reference(args, lengths, state_ids, cache_ids, *, dtype=torch.float32, device=None):
     """Recur in the [V,K] layout; the rounded BF16 snapshot is read only when a branch reloads."""
-    q, k, v = (args[n][0].float() for n in ("q", "k", "v"))
+    if device is not None:
+        args = {name: value.to(device) if isinstance(value, torch.Tensor) else value
+                for name, value in args.items()}
+    q, k, v = (args[n][0].to(dtype=dtype) for n in ("q", "k", "v"))
     if args["use_qk_l2norm_in_kernel"]:
         q = q * torch.rsqrt(q.square().sum(-1, keepdim=True) + 1e-6)
         k = k * torch.rsqrt(k.square().sum(-1, keepdim=True) + 1e-6)
@@ -117,8 +120,8 @@ def reference(args, lengths, state_ids, cache_ids):
     state = args["initial_state_source"].clone()
     cache = args["intermediate_states_buffer"]
     cache = None if cache is None else cache.clone()
-    gate_x = args["a"][0].float() + args["dt_bias"].float()
-    exp_A = args["A_log"].float().exp()
+    gate_x = args["a"][0].to(dtype=dtype) + args["dt_bias"].to(dtype=dtype)
+    exp_A = args["A_log"].to(dtype=dtype).exp()
     if args["is_kda"]:
         exp_A = exp_A[:, None]
     if args.get("lower_bound") is not None:
@@ -127,7 +130,7 @@ def reference(args, lengths, state_ids, cache_ids):
         decay = (-exp_A * F.softplus(gate_x)).exp()
     if not args["is_kda"]:
         decay = decay[..., None]
-    beta = args["b"][0].float().sigmoid()
+    beta = args["b"][0].to(dtype=dtype).sigmoid()
     out = torch.zeros_like(v)
     parents = args["retrieve_parent_token"]
     bos = 0
@@ -136,19 +139,19 @@ def reference(args, lengths, state_ids, cache_ids):
         if slot < 0 or (not args.get("is_sglang", True) and slot == 0) or length == 0:
             bos += length
             continue
-        h = state[slot].float()
+        h = state[slot].to(dtype=dtype)
         for t in range(length):
             if parents is not None and t > 0:
                 parent = int(parents[n, t])
                 if parent >= 0 and parent != t - 1:
-                    h = cache[cache_ids[n], parent].float()
+                    h = cache[cache_ids[n], parent].to(dtype=dtype)
             i = bos + t
             h = h * decay[i, :, None, :]
             delta = (v[i] - (h * k[i, :, None, :]).sum(-1)) * beta[i, :, None]
             h = h + delta[..., None] * k[i, :, None, :]
             out[i] = (h * q[i, :, None, :]).sum(-1)
             # A separate cache is the SGLang contract; vLLM only writes snapshots into the main pool's 2-D slot table.
-            if cache is not None and args.get("is_sglang", True):
+            if cache is not None and args.get("is_sglang", True) and cache_ids[n] >= 0:
                 cache[cache_ids[n], t] = h
         if not args["disable_state_update"]:
             state[slot] = h
@@ -199,6 +202,34 @@ def test_k_last_state_dtype(state_dtype, activation_dtype, is_kda, mode, H, HV):
         torch.testing.assert_close(cache, expected_cache, atol=2e-3, rtol=8e-3)
         untouched = expected_cache == -7.0
         assert torch.equal(cache[untouched], expected_cache[untouched])
+
+
+@pytest.mark.parametrize("B,H", [(79, 8), (57, 19)])
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("norm", [False, True])
+@pytest.mark.parametrize("lower_bound", [None, -5.0])
+@pytest.mark.parametrize("packed_rows", [False, True])
+def test_kda_decode_indexed_large_batch(B, H, state_dtype, norm, lower_bound, packed_rows):
+    args, backing, lengths, _, cache_ids = make_case(
+        state_dtype, torch.bfloat16, True, "decode", H=H, HV=H, B=B,
+        seed=23023, padded=False)
+    state_ids = list(reversed(range(B)))
+    args["initial_state_indices"] = torch.tensor(state_ids, device="cuda", dtype=torch.int32)
+    args["use_qk_l2norm_in_kernel"] = norm
+    if lower_bound is not None:
+        args["lower_bound"] = lower_bound
+    if packed_rows:
+        mixed = torch.cat([args[n] for n in ("q", "k", "v")], dim=2)
+        args["q"], args["k"], args["v"] = mixed.split(H, dim=2)
+    expected_out, expected_state, _ = reference(args, lengths, state_ids, cache_ids)
+    before = backing.clone()
+    out = torch.empty_like(args["v"])
+    actual = forward(**args, out=out)
+    torch.cuda.synchronize()
+    assert actual.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(actual, expected_out, atol=1e-3, rtol=1e-2)
+    torch.testing.assert_close(args["initial_state_source"], expected_state, atol=2e-3, rtol=8e-3)
+    torch.testing.assert_close(backing[:, -256:], before[:, -256:], atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("state_dtype,cache_dtype,message", [
@@ -705,3 +736,107 @@ def test_regular_bf16_eight_byte_state_alignment(native, tunable, layout):
     torch.testing.assert_close(actual_out, expected_out, rtol=0, atol=0)
     torch.testing.assert_close(args["initial_state_source"], expected_state, rtol=0, atol=0)
     torch.testing.assert_close(args["intermediate_states_buffer"], expected_cache, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize('dtype', [torch.float32, torch.bfloat16])
+def test_empty_decode_ignores_unused_source_slots(dtype):
+    args, backing, _, _, _ = make_case(dtype, torch.bfloat16, True, 'decode', H=6, HV=6, B=2)
+    for name in ('q', 'k', 'v', 'a', 'b'):
+        args[name] = args[name][:, :0]
+    args['cu_seqlens'] = torch.zeros(3, dtype=torch.int32, device='cuda')
+    args['initial_state_indices'] = torch.tensor([2**31-1, 0], dtype=torch.int32, device='cuda')
+    backing.fill_(float('nan'))
+    args['out'] = torch.empty_like(args['v'])
+    before = backing.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result = forward(**args)
+    for _ in range(3):
+        graph.replay()
+    torch.cuda.synchronize()
+    assert result.numel() == 0
+    torch.testing.assert_close(backing, before, atol=0, rtol=0, equal_nan=True)
+
+
+@pytest.mark.parametrize('batch,heads', [(1, 3), (16, 3), (64, 12), (128, 32)])
+@pytest.mark.parametrize('dtype', [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize('packed', [False, True])
+def test_decode_512_updates(batch, heads, dtype, packed):
+    args, backing, _, _, _ = make_case(dtype, torch.bfloat16, True, 'decode',
+        H=heads, HV=heads, B=batch, seed=231123, padded=False)
+    if packed:
+        projection = torch.cat([args[n] for n in ('q', 'k', 'v')], dim=2)
+        args['q'], args['k'], args['v'] = projection.split(heads, dim=2)
+        args['lower_bound'] = -5.
+    args['a'].fill_(-12.)
+    args['b'].fill_(8.)
+    args['out'] = torch.empty_like(args['v'], memory_format=torch.contiguous_format)
+    state = args['initial_state_source']
+    untouched_slots = state[batch:].clone()
+    untouched_pitch = backing[:, -256:].clone()
+    for step in range(512):
+        for name in ('q', 'k', 'v'):
+            args[name].normal_()
+        # Use the actual input storage at each call, as in the existing
+        # one-step contract: BF16 decode rounds state at every call boundary.
+        if step % 64 == 0 or step == 511:
+            expected_out, expected, _ = reference(
+                args, [1] * batch, list(range(batch)), list(range(batch)))
+        actual = forward(**args)
+        if step % 64 == 0 or step == 511:
+            torch.testing.assert_close(actual[0], expected_out[0], atol=1e-3, rtol=1e-2)
+            torch.testing.assert_close(state[:batch], expected[:batch], atol=2e-3, rtol=8e-3)
+    torch.testing.assert_close(state[batch:], untouched_slots, atol=0, rtol=0)
+    torch.testing.assert_close(backing[:, -256:], untouched_pitch, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize('batch,heads,steps,ragged', [
+    (1, 3, 8, False), (3, 5, 4, True), (7, 5, 5, False),
+    (16, 3, 3, False), (16, 6, 1, False), (16, 12, 3, False),
+    (32, 8, 4, False), (11, 19, 2, False),
+    # Allocated checkpoint steps straddle the compact metadata field limit.
+    (1, 3, 252, False), (1, 3, 253, False),
+])
+@pytest.mark.parametrize('dtype', [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize('packed', [False, True])
+@pytest.mark.parametrize('weak', [False, True])
+def test_kda_readonly_chain(batch, heads, steps, ragged, dtype, packed, weak):
+    args, backing, lengths, ids, cache_ids = make_case(
+        dtype, torch.bfloat16, True, 'ragged' if ragged else 'verify',
+        H=heads, HV=heads, B=batch, T=steps, seed=231123, padded=True)
+    args['dt_bias'] = args['dt_bias'].float()
+    args['lower_bound'] = -5.
+    if weak:
+        args['a'].fill_(-12.)
+        args['b'].fill_(8.)
+    if packed:
+        mixed = torch.cat([args[n] for n in ('q', 'k', 'v')], dim=2)
+        args['q'], args['k'], args['v'] = mixed.split(heads, dim=2)
+        args['initial_state_source'] = args['initial_state_source'].contiguous()
+    if batch > 1:
+        cache_ids[0] = -1
+        args['intermediate_state_indices'][0] = -1
+    args['out'] = torch.empty_like(args['v'], memory_format=torch.contiguous_format)
+    expected, initial, cache = reference(args, lengths, ids, cache_ids, dtype=torch.float64, device='cpu')
+    if not ragged and not packed:
+        for name in ('q', 'k', 'v', 'a'):
+            args[name] = args[name].view(batch, steps, heads, 128)
+        args['b'] = args['b'].view(batch, steps, heads)
+        args['cu_seqlens'] = None
+        args['out'] = torch.empty_like(args['v'])
+        expected = expected.view_as(args['v'])
+    backing_before = backing.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = forward(**args)
+    for _ in range(3):
+        args['intermediate_states_buffer'].fill_(-7.)
+        graph.replay()
+    torch.cuda.synchronize()
+    assert actual.data_ptr() == args['out'].data_ptr()
+    torch.testing.assert_close(actual.cpu(), expected, atol=1e-3, rtol=1e-2)
+    torch.testing.assert_close(args['initial_state_source'].cpu(), initial, atol=0, rtol=0)
+    torch.testing.assert_close(backing, backing_before, atol=0, rtol=0)
+    torch.testing.assert_close(args['intermediate_states_buffer'].cpu(), cache, atol=2e-3, rtol=8e-3)
+    untouched = cache == -7.
+    torch.testing.assert_close(args['intermediate_states_buffer'].cpu()[untouched], cache[untouched], atol=0, rtol=0)

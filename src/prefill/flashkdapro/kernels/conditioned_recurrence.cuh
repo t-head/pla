@@ -32,168 +32,10 @@
 
 #pragma once
 
-#include "prefill/flashkdapro/common/conditioned_api.h"
+#include "conditioned_repair.cuh"
 
 namespace flashkda {
 namespace conditioned {
-using BF16 = cutlass::bfloat16_t;
-
-// Normalized BF16 geometry selects conservative parallel, disjoint-support,
-// or roundoff-certified orthogonal classes. The FP32 rejection is certified
-// against the stated reduction error; uncertain pairs use exact dyadic FP64
-// products. This structural screen is not a universal operator error bound.
-template <class Key>
-__device__ __forceinline__ bool exact_structural_pair(
-    const Key* keys, int count, int lane) {
-    if (count < 2) return false;
-    float af[4], bf[4], dot32 = 0.f, absolute32 = 0.f;
-    bool exact_products = true;
-    #pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        const int dk = lane+32*j;
-        af[j] = float(keys[dk]);
-        bf[j] = float(keys[128+dk]);
-        const float product = __fmul_rn(af[j],bf[j]);
-        const uint32_t am = __float_as_uint(af[j])&0x7fffffffu;
-        const uint32_t bm = __float_as_uint(bf[j])&0x7fffffffu;
-        const uint32_t pm = __float_as_uint(product)&0x7fffffffu;
-        exact_products = exact_products && am < 0x7f800000u && bm < 0x7f800000u &&
-            ((am == 0 || bm == 0) || (pm >= 0x00800000u && pm < 0x7f800000u));
-        dot32 = __fadd_rn(dot32,product);
-        absolute32 = __fadd_rn(absolute32,__uint_as_float(pm));
-    }
-    const float a1 = __shfl_sync(0xffffffff,af[0],1);
-    const float b1 = __shfl_sync(0xffffffff,bf[0],1);
-    bool nonparallel = false;
-    if (lane == 0) {
-        const float a0 = af[0], b0 = bf[0];
-        const uint32_t a0m = __float_as_uint(a0)&0x7fffffffu;
-        const uint32_t a1m = __float_as_uint(a1)&0x7fffffffu;
-        const uint32_t b0m = __float_as_uint(b0)&0x7fffffffu;
-        const uint32_t b1m = __float_as_uint(b1)&0x7fffffffu;
-        const bool finite_inputs =
-            (a0m == 0 || (a0m >= 0x00800000u && a0m < 0x7f800000u)) &&
-            (a1m == 0 || (a1m >= 0x00800000u && a1m < 0x7f800000u)) &&
-            (b0m == 0 || (b0m >= 0x00800000u && b0m < 0x7f800000u)) &&
-            (b1m == 0 || (b1m >= 0x00800000u && b1m < 0x7f800000u));
-        const float p = __fmul_rn(a0,b1), q = __fmul_rn(a1,b0);
-        const uint32_t pm = __float_as_uint(p)&0x7fffffffu;
-        const uint32_t qm = __float_as_uint(q)&0x7fffffffu;
-        const bool exact_p = a0m == 0 || b1m == 0 || (pm >= 0x00800000u && pm < 0x7f800000u);
-        const bool exact_q = a1m == 0 || b0m == 0 || (qm >= 0x00800000u && qm < 0x7f800000u);
-        const bool overlap = (a0m != 0 && b0m != 0) || (a1m != 0 && b1m != 0);
-        nonparallel = finite_inputs && exact_p && exact_q && overlap && p != q;
-    }
-    nonparallel = __any_sync(0xffffffff,nonparallel);
-    exact_products = __all_sync(0xffffffff,exact_products);
-    #pragma unroll
-    for (int offset = 16; offset; offset >>= 1) {
-        dot32 = __fadd_rn(dot32,__shfl_xor_sync(0xffffffff,dot32,offset));
-        absolute32 = __fadd_rn(absolute32,__shfl_xor_sync(0xffffffff,absolute32,offset));
-    }
-    // Normal products are exact (<=16 significant bits). Four local terms
-    // plus five warp additions have <=9 roundings/path. 16*u32 covers both
-    // reductions' relative error; 128*FLT_MIN covers all possible FTZ loss.
-    const float bound32 = __fadd_rn(__fmul_rn(absolute32,0x1p-20f),0x1p-119f);
-    const bool finite_sums = (__float_as_uint(dot32)&0x7f800000u) != 0x7f800000u &&
-                             (__float_as_uint(absolute32)&0x7f800000u) != 0x7f800000u;
-    // This certified rejection is disabled in the separate full-FP64 parity build.
-    const bool reject = nonparallel && exact_products && finite_sums && fabsf(dot32) > bound32;
-    if (__all_sync(0xffffffff,reject)) return false;
-
-    double a[4], b[4];
-    bool finite = true, nonzero_a = false, nonzero_b = false, overlap = false;
-    int pivot = 128;
-    #pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        const int dk = lane + 32*j;
-        const float av = af[j], bv = bf[j];
-        a[j] = double(av); b[j] = double(bv);
-        finite = finite && (__float_as_uint(av) & 0x7f800000u) != 0x7f800000u
-                        && (__float_as_uint(bv) & 0x7f800000u) != 0x7f800000u;
-        nonzero_a = nonzero_a || a[j] != 0.;
-        nonzero_b = nonzero_b || b[j] != 0.;
-        overlap = overlap || (a[j] != 0. && b[j] != 0.);
-        if (a[j] != 0. && dk < pivot) pivot = dk;
-    }
-    if (__any_sync(0xffffffff, !finite) ||
-        !__any_sync(0xffffffff, nonzero_a) ||
-        !__any_sync(0xffffffff, nonzero_b)) return true;
-    if (!__any_sync(0xffffffff,overlap)) return true;
-    double dot64 = 0., absolute64 = 0.;
-    #pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        const double product = a[j]*b[j];
-        dot64 += product;
-        absolute64 += fabs(product);
-    }
-    #pragma unroll
-    for (int offset = 16; offset; offset >>= 1) {
-        dot64 += __shfl_xor_sync(0xffffffff,dot64,offset);
-        absolute64 += __shfl_xor_sync(0xffffffff,absolute64,offset);
-    }
-    // 16*u64 safely encloses the same reduction's rounding error. The test
-    // selects every exact orthogonal pair, including cancellation residuals;
-    // this is a roundoff interval, not an empirical similarity threshold.
-    if (__any_sync(0xffffffff,fabs(dot64) <= absolute64*0x1p-49)) return true;
-    #pragma unroll
-    for (int offset = 16; offset; offset >>= 1) {
-        const int other = __shfl_xor_sync(0xffffffff, pivot, offset);
-        pivot = pivot < other ? pivot : other;
-    }
-    double pa = 0., pb = 0.;
-    #pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        if (pivot / 32 == j) { pa = a[j]; pb = b[j]; }
-    }
-    pa = __shfl_sync(0xffffffff, pa, pivot & 31);
-    pb = __shfl_sync(0xffffffff, pb, pivot & 31);
-    bool parallel = true;
-    #pragma unroll
-    for (int j = 0; j < 4; ++j)
-        parallel = parallel && a[j] * pb == b[j] * pa;
-    return __all_sync(0xffffffff, parallel);
-}
-
-__device__ __forceinline__ double warp_sum(double value) {
-    #pragma unroll
-    for (int offset = 16; offset; offset >>= 1)
-        value += __shfl_xor_sync(0xffffffff, value, offset);
-    return value;
-}
-__device__ __forceinline__ float warp_sum(float value) {
-    #pragma unroll
-    for (int offset = 16; offset; offset >>= 1)
-        value += __shfl_xor_sync(0xffffffff, value, offset);
-    return value;
-}
-__device__ __forceinline__ int slot(const ConditionedArguments& a, int seq) {
-    return a.indices ? a.indices[seq] : seq;
-}
-__device__ __forceinline__ int64_t activation(
-    const ConditionedArguments& a, int token, int head, int dk) {
-    return (int64_t(token) * a.heads + head) * 128 + dk;
-}
-__device__ __forceinline__ float activated_beta32(
-    const ConditionedArguments& a, int token, int head) {
-    const float raw = float(static_cast<const BF16*>(a.beta)[
-        int64_t(token) * a.beta_stride + head]);
-    return a.fla_normalization ? 1.f / (1.f + expf(-raw))
-                              : flashkda::sigmoid_tanh_approx_f32(raw);
-}
-__device__ __forceinline__ float activated_gate32(
-    const ConditionedArguments& a, int token, int head, int dk, float a_exp) {
-    if (a.lower_bound == 0.) return 0.f;
-    const float raw = float(static_cast<const BF16*>(a.g)[activation(a, token, head, dk)]);
-    const float z = a_exp * (raw + a.dt_bias[head * 128 + dk]);
-    return a.fla_normalization
-        ? float(a.lower_bound) / (1.f + expf(-z))
-        : float(a.lower_bound * 1.4426950408889634) *
-            flashkda::sigmoid_tanh_approx_f32(z);
-}
-__device__ __forceinline__ float decay32(const ConditionedArguments& a, float x) {
-    return a.fla_normalization ? expf(x) : flashkda::ex2_approx_ftz_f32(x);
-}
 // All tile flags are complete before this launch. Only selected heads copy
 // their original state; normal heads perform no state traffic.
 __global__ __launch_bounds__(128) void snapshot_kernel(
@@ -298,68 +140,15 @@ __global__ __launch_bounds__(128) void snapshot_kernel(
     }
     const bool empty = a.cu ? a.cu[seq] == a.cu[seq+1] : a.tokens == 0;
     if ((!flagged && !empty) || !a.initial_state) return;
-    const int state_slot = slot(a, seq);
-    const bool valid = state_slot >= 0 && state_slot < a.initial_slots;
-    const int64_t src = (int64_t(state_slot) * a.heads + head) * 128 * 128;
-    const int64_t dst = (int64_t(seq) * a.heads + head) * 128 * 128;
-    for (int i = tid; i < 128 * 128; i += 128) {
-        float value = 0.f;
-        if (valid) value = a.state_fp32 ? static_cast<const float*>(a.initial_state)[src + i]
-                                      : float(static_cast<const BF16*>(a.initial_state)[src + i]);
-        snapshot[dst + i] = value;
-    }
+    preserve_initial_state(a, seq, head, snapshot, tid);
 }
 
 __global__ __launch_bounds__(128) void preserve_kernel(ConditionedArguments a, float* snapshot) {
     const int seq = blockIdx.x, head = blockIdx.y;
-    const int initial_slot = slot(a, seq);
-    const bool valid = a.initial_state && initial_slot >= 0 && initial_slot < a.initial_slots;
-    for (int i = threadIdx.x; i < 128 * 128; i += 128) {
-        float value = 0.f;
-        if (valid) {
-            const int64_t off = (int64_t(initial_slot) * a.heads + head) * 128 * 128 + i;
-            value = a.state_fp32 ? static_cast<const float*>(a.initial_state)[off]
-                                : float(static_cast<const BF16*>(a.initial_state)[off]);
-        }
-        snapshot[(int64_t(seq) * a.heads + head) * 128 * 128 + i] = value;
-    }
+    preserve_initial_state(a, seq, head, snapshot, threadIdx.x);
 }
 
 // Keep the warp reduction and the rounded BF16 operands identical to repair.
-__device__ __forceinline__ void repair_norm(ConditionedArguments a, int token,
-                                            int head, int lane, float& qnorm, float& knorm) {
-    float qs = 0.f, ks = 0.f;
-    #pragma unroll
-    for (int j = 0; j < 8; ++j) {
-        const int dk = (lane & 15) * 8 + j;
-        const int64_t off = activation(a, token, head, dk);
-        const float qv = float(static_cast<const BF16*>(a.q)[off]);
-        const float kv = float(static_cast<const BF16*>(a.k)[off]);
-        qs += qv * qv; ks += kv * kv;
-    }
-    #pragma unroll
-    for (int mask = 8; mask; mask >>= 1) {
-        qs += __shfl_xor_sync(0xffffffff, qs, mask, 16);
-        ks += __shfl_xor_sync(0xffffffff, ks, mask, 16);
-    }
-    qnorm = a.fla_normalization ? sqrtf(qs + 1e-6f) : rsqrtf(qs + 1e-6f);
-    knorm = a.fla_normalization ? sqrtf(ks + 1e-6f) : rsqrtf(ks + 1e-6f);
-}
-
-__device__ __forceinline__ BF16 repair_component(float x, float norm, bool fla) {
-    return BF16(fla ? x / norm : x * norm);
-}
-
-__device__ __forceinline__ double repair_decay(ConditionedArguments a, float value) {
-    return a.fla_normalization ? exp(double(value)) : exp2(double(value));
-}
-
-struct RepairToken {
-    double decay[128];
-    BF16 q[128], k[128], v[128];
-    float beta;
-};
-
 __global__ __launch_bounds__(128) void select_repair_cache(
     ConditionedArguments a, const int32_t* flags, int32_t* owner, int capacity) {
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
@@ -398,12 +187,11 @@ __global__ __launch_bounds__(128) void prepare_repair_tokens(
         #pragma unroll
         for (int j = 0; j < 4; ++j) {
             const int dk = lane + 32 * j;
-            const int64_t off = activation(a, token, head, dk);
-            cached.q[dk] = repair_component(float(static_cast<const BF16*>(a.q)[off]),
+            cached.q[dk] = repair_component(float(static_cast<const BF16*>(a.q)[input_activation(a.q_stride, token, head, dk)]),
                                             qnorm, a.fla_normalization);
-            cached.k[dk] = repair_component(float(static_cast<const BF16*>(a.k)[off]),
+            cached.k[dk] = repair_component(float(static_cast<const BF16*>(a.k)[input_activation(a.k_stride, token, head, dk)]),
                                             knorm, a.fla_normalization);
-            cached.v[dk] = static_cast<const BF16*>(a.v)[off];
+            cached.v[dk] = static_cast<const BF16*>(a.v)[input_activation(a.v_stride, token, head, dk)];
             cached.decay[dk] = repair_decay(a, activated_gate32(a, token, head, dk, a_exp32));
         }
         if (lane == 0) cached.beta = activated_beta32(a, token, head);
@@ -527,7 +315,7 @@ __global__ __launch_bounds__(128) void check_repair_boundaries(
 // A task owns four DV columns, with one warp per column and four DK values
 // per lane. The persistent grid bounds normal unflagged launch overhead even
 // for large batches; flagged tasks never read state already written by fast K2.
-template <bool FloatState, bool MonitorValues = false, bool UseCache = false>
+template <bool FloatState, bool MonitorValues = false, bool UseCache = false, bool LocalShort = false>
 __global__ __launch_bounds__(128) void repair_kernel(
     ConditionedArguments a, const int32_t* flags, const float* snapshot,
     int32_t* output_flags, const int32_t* owner = nullptr,
@@ -544,26 +332,7 @@ __global__ __launch_bounds__(128) void repair_kernel(
         const int bos = a.cu ? a.cu[seq] : 0;
         const int eos = a.cu ? a.cu[seq + 1] : a.tokens;
         if (bos == eos) {
-            // No recurrence takes place. Preserve the original dtype boundary
-            // instead of publishing a BF16 fast-state view of an FP32 input.
-            const int initial_slot = slot(a,seq),final_slot = slot(a,seq);
-            if (a.final_state && final_slot >= 0 && final_slot < a.final_slots) {
-                #pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    float value = 0.f;
-                    if (a.initial_state) {
-                        if (snapshot) value = snapshot[(int64_t(sh)*128+dv)*128+lane+32*j];
-                        else if (initial_slot >= 0 && initial_slot < a.initial_slots) {
-                            const int64_t src=((int64_t(initial_slot)*a.heads+head)*128+dv)*128+lane+32*j;
-                            value=a.state_fp32?static_cast<const float*>(a.initial_state)[src]
-                                              :float(static_cast<const BF16*>(a.initial_state)[src]);
-                        }
-                    }
-                    const int64_t dst=((int64_t(final_slot)*a.heads+head)*128+dv)*128+lane+32*j;
-                    if (a.state_fp32) static_cast<float*>(a.final_state)[dst]=value;
-                    else static_cast<BF16*>(a.final_state)[dst]=BF16(value);
-                }
-            }
+            copy_empty_values(a, seq, head, dv_group * 4, 4, threadIdx.x, 128, snapshot);
             if (a.value_flags && threadIdx.x == 0)
                 a.value_flags[int64_t(sh)*32+dv_group]=0;
             if (output_flags && dv_group == 0 && threadIdx.x == 0) output_flags[sh] = 0;
@@ -647,25 +416,15 @@ __global__ __launch_bounds__(128) void repair_kernel(
             output_flags[sh] = bos < eos ? 1 : 0;
         const float a_exp32 = expf(a.a_log[head]);
         Acc state[4];
-        const int initial_slot = slot(a, seq);
-        #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            state[j] = Acc(0);
-            if (a.initial_state) {
-                if (snapshot) state[j] = Acc(snapshot[(int64_t(sh) * 128 + dv) * 128 + lane + 32*j]);
-                else if (initial_slot >= 0 && initial_slot < a.initial_slots) {
-                    const int64_t off = ((int64_t(initial_slot) * a.heads + head) * 128 + dv)
-                                      * 128 + lane + 32*j;
-                    state[j] = a.state_fp32 ? Acc(static_cast<const float*>(a.initial_state)[off])
-                                           : Acc(float(static_cast<const BF16*>(a.initial_state)[off]));
-                }
-            }
-        }
-        const bool cached = UseCache && sh == owner[0];
-        if (cached && owner[1] == 0) continue;
+        load_repair_state(a, state, seq, head, dv, lane, snapshot);
+        const bool local_short = LocalShort && eos - bos <= KDA_DIRECT_MAX_TOKENS;
+        const bool cached = local_short || (UseCache && sh == owner[0]);
+        if constexpr (UseCache)
+            if (!local_short && cached && owner[1] == 0) continue;
         constexpr int repair_tile = 16;
         __shared__ __align__(8) unsigned char storage[UseCache
-            ? repair_tile * sizeof(RepairToken) : 1];
+            ? repair_tile * sizeof(RepairToken)
+            : (LocalShort ? KDA_DIRECT_MAX_TOKENS * sizeof(RepairToken) : 1)];
         auto* staged = reinterpret_cast<RepairToken*>(storage);
         const int step = cached ? repair_tile : eos - bos;
         for (int first = bos; first < eos; first += step) {
@@ -673,72 +432,29 @@ __global__ __launch_bounds__(128) void repair_kernel(
             if (cached) {
                 for (int pos = 0; pos < last - first; ++pos) {
                     const int dk = threadIdx.x;
-                    const auto& input = prepared[first - bos + pos];
-                    staged[pos].decay[dk] = input.decay[dk];
-                    staged[pos].q[dk] = input.q[dk];
-                    staged[pos].k[dk] = input.k[dk];
-                    staged[pos].v[dk] = input.v[dk];
-                    if (dk == 0) staged[pos].beta = input.beta;
+                    if (local_short) {
+                        // Reuse gate/normalization work across the four value
+                        // warps, retaining the original FP32/FP64 boundaries.
+                        const int token = first + pos;
+                        prepare_repair_token(a, staged[pos], token, head, dk, lane, a_exp32);
+                    } else {
+                        const auto& input = prepared[first - bos + pos];
+                        staged[pos].decay[dk] = input.decay[dk];
+                        staged[pos].q[dk] = input.q[dk];
+                        staged[pos].k[dk] = input.k[dk];
+                        staged[pos].v[dk] = input.v[dk];
+                        if (dk == 0) staged[pos].beta = input.beta;
+                    }
                 }
                 __syncthreads();
             }
             for (int token = first; token < last; ++token) {
-                float qnorm = 0.f, knorm = 0.f;
-                if (!cached) repair_norm(a, token, head, lane, qnorm, knorm);
-                Acc q[4], k[4], prediction = Acc(0);
-                #pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    const int dk = lane + 32*j;
-                    if (cached) {
-                        const auto& load = staged[token - first];
-                        q[j] = Acc(float(load.q[dk]));
-                        k[j] = Acc(float(load.k[dk]));
-                        state[j] *= load.decay[dk];
-                    } else {
-                        const int64_t off = activation(a, token, head, dk);
-                        const float qv = float(static_cast<const BF16*>(a.q)[off]);
-                        const float kv = float(static_cast<const BF16*>(a.k)[off]);
-                        q[j] = Acc(float(repair_component(qv, qnorm, a.fla_normalization)));
-                        k[j] = Acc(float(repair_component(kv, knorm, a.fla_normalization)));
-                        const float activated = activated_gate32(a, token, head, dk, a_exp32);
-                        if constexpr (FloatState) state[j] *= decay32(a, activated);
-                        else state[j] *= repair_decay(a, activated);
-                    }
-                    if constexpr (FloatState) prediction = fmaf(state[j], k[j], prediction);
-                    else prediction = fma(state[j], k[j], prediction);
-                }
-                prediction = warp_sum(prediction);
-                const Acc b = Acc(cached ? staged[token - first].beta : activated_beta32(a, token, head));
-                const Acc value = Acc(float(cached ? staged[token - first].v[dv]
-                    : static_cast<const BF16*>(a.v)[activation(a, token, head, dv)]));
-                const Acc delta = b * (value - prediction);
-                Acc output = Acc(0);
-                #pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    if constexpr (FloatState) {
-                        state[j] = fmaf(delta, k[j], state[j]);
-                        output = fmaf(state[j], q[j], output);
-                    } else {
-                        state[j] = fma(delta, k[j], state[j]);
-                        output = fma(state[j], q[j], output);
-                    }
-                }
-                output = warp_sum(output);
-                if (lane == 0) static_cast<BF16*>(a.out)[activation(a, token, head, dv)] =
-                    BF16(float(output * a.scale));
+                repair_step<FloatState>(a, state, cached ? staged + (token - first) : nullptr,
+                                        token, head, dv, lane, a_exp32);
             }
             if (cached) __syncthreads();
         }
-        const int state_slot = slot(a, seq);
-        if (a.final_state && state_slot >= 0 && state_slot < a.final_slots) {
-            #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const int64_t off = ((int64_t(state_slot) * a.heads + head) * 128 + dv)
-                                  * 128 + lane + 32*j;
-                if (a.state_fp32) static_cast<float*>(a.final_state)[off] = float(state[j]);
-                else static_cast<BF16*>(a.final_state)[off] = BF16(float(state[j]));
-            }
-        }
+        store_repair_state(a, state, seq, head, dv, lane);
     }
 }
 }  // namespace conditioned
@@ -751,11 +467,14 @@ void launch_conditioned_workspace_snapshot(ConditionedArguments a, const void* w
             a, ws, total_tiles, flags, snapshot);
 }
 void launch_conditioned_repair(ConditionedArguments a, const int32_t* flags,
-                               const float* snapshot, hggcStream_t stream) {
+                               const float* snapshot, hggcStream_t stream, bool cache_short_tokens) {
     const int tasks = a.sequences * a.heads * 32;
     if (tasks) {
         if (a.value_guard)
             conditioned::repair_kernel<false, true><<<tasks < 256 ? tasks : 256, 128, 0, stream>>>(a, flags, snapshot, nullptr);
+        else if (cache_short_tokens)
+            conditioned::repair_kernel<false, false, false, true>
+                <<<tasks < 256 ? tasks : 256, 128, 0, stream>>>(a, flags, snapshot, nullptr);
         else
             conditioned::repair_kernel<false, false><<<tasks < 256 ? tasks : 256, 128, 0, stream>>>(a, flags, snapshot, nullptr);
     }
@@ -793,6 +512,9 @@ void launch_conditioned_direct(ConditionedArguments a, bool float_state, hggcStr
     if (!tasks) return;
     if (float_state)
         conditioned::repair_kernel<true, false><<<tasks < 256 ? tasks : 256, 128, 0, stream>>>(a, nullptr, initial_snapshot, output_flags);
+    else if (a.tokens <= KDA_DIRECT_MAX_TOKENS)
+        conditioned::repair_kernel<false, false, false, true>
+            <<<tasks < 256 ? tasks : 256, 128, 0, stream>>>(a, nullptr, initial_snapshot, output_flags);
     else
         conditioned::repair_kernel<false, false><<<tasks < 256 ? tasks : 256, 128, 0, stream>>>(a, nullptr, initial_snapshot, output_flags);
 }

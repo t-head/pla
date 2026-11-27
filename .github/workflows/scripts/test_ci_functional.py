@@ -30,8 +30,8 @@ class FunctionalCITests(unittest.TestCase):
 
     def test_inventory_matches_checkin_counts_and_assets(self):
         selected = cases()
-        self.assertEqual(Counter(case.phase for case in selected), {"decode": 25, "prefill": 17})
-        self.assertEqual(len({case.name for case in selected}), 42)
+        self.assertEqual(Counter(case.phase for case in selected), {"decode": 26, "prefill": 18})
+        self.assertEqual(len({case.name for case in selected}), 44)
         runner.validate_inventory(selected)
         self.assertEqual(sum("--kernel=cuda" in case.argv for case in selected), 1)
         self.assertFalse(any("--max-cases" in arg for case in selected for arg in case.argv))
@@ -41,6 +41,15 @@ class FunctionalCITests(unittest.TestCase):
         self.assertEqual((case.phase, case.timeout, case.report), ("decode", 1800, "markers"))
         self.assertEqual(case.argv, ("tests/test_kda_replayssm_vllm.py", "--phase=functional"))
         self.assertIn("pla/decode/kda_replayssm_vllm", runner.EXTENSION_DIRS)
+
+    def test_kda_records_and_tc02_prefill_are_registered(self):
+        selected = {case.name: case for case in cases()}
+        for name, phase, script in (
+            ("kda-state-records", "decode", "test_kda_state_records.py"),
+            ("kda-prefill-tc02", "prefill", "test_kda_prefill_tc02.py"),
+        ):
+            case = selected[name]
+            self.assertEqual((case.phase, case.report, case.argv), (phase, "pytest", (script,)))
 
     def test_gdn_replay_uses_one_extension_and_exercises_each_api(self):
         self.assertEqual({path for path in runner.EXTENSION_DIRS if path.startswith("pla/decode/gdn_replayssm")},
@@ -83,12 +92,12 @@ class FunctionalCITests(unittest.TestCase):
             "commit_cancellation", "graph_metadata")]
         all_cases = names("all")
         gate_checks = {"precision_finite_gate_overflow_Q4", "precision_finite_gate_overflow_generic"}
-        self.assertEqual(len(all_cases), 65)
-        self.assertEqual(len(set(all_cases)), 65)
+        self.assertEqual(len(all_cases), 83)
+        self.assertEqual(len(set(all_cases)), 83)
         self.assertEqual(names("precision"), precision)
         self.assertEqual(names("functional"), [name for name in all_cases
                          if name not in precision or name in gate_checks])
-        self.assertEqual(len(names("functional")), 59)
+        self.assertEqual(len(names("functional")), 77)
         self.assertEqual(names("functional", True), [name for name in names("functional")
                          if not name.startswith("diagnostics_")])
         phase_arg = next(node for node in ast.walk(main) if isinstance(node, ast.Call)
