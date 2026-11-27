@@ -1882,7 +1882,8 @@ void flashkda_fwd_impl(
             reinterpret_cast<void*>(ws.data_ptr<at::BFloat16>()),
             /*force_plain=*/cp.engage, /*cp_fma_front=*/cp.fma_front,
             /*fp16_kd_qd=*/fp16_state, kr_layout, target_stream,
-            conditioned && conditioned->value_guard ? conditioned->v : nullptr, cp.short_k1_lb8);
+            conditioned && conditioned->value_guard ? conditioned->v : nullptr,
+            cp.short_k1_lb8, conditioned != nullptr);
     };
 
     // A rejected launch (over-budget smem, bad grid) would otherwise be silent
