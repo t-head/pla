@@ -36,6 +36,14 @@
 #include <cstdint>
 
 namespace flashkda {
+// Existing direct precision-repair window, also used by local token staging.
+inline constexpr int KDA_DIRECT_MAX_TOKENS = 3;
+// Optional, write-only radix checkpoint. Indices remain live device inputs.
+struct TrackState {
+    float* state = nullptr;
+    const void* chunk_idx = nullptr;
+    bool int64 = false;
+};
 // Call-local, by-value descriptors. Device offsets/indices remain live inputs
 // on every Graph replay; no mutable metadata is cached in this descriptor.
 struct ConditionedArguments {
@@ -48,6 +56,7 @@ struct ConditionedArguments {
     const float* value_scales = nullptr;
     int32_t* value_flags = nullptr;
     int tokens, heads, sequences, beta_stride;
+    int64_t q_stride, k_stride, v_stride;
     int initial_slots, final_slots;
     bool state_fp32, fla_normalization;
     bool value_guard = false, preserve_initial = false, publish_fast_state = false;
@@ -58,7 +67,8 @@ void launch_conditioned_workspace_snapshot(ConditionedArguments args, const void
                                              int total_tiles, int32_t* flags,
                                              float* snapshot, hggcStream_t stream);
 void launch_conditioned_repair(ConditionedArguments args, const int32_t* flags,
-                               const float* snapshot, hggcStream_t stream);
+                               const float* snapshot, hggcStream_t stream,
+                               bool cache_short_tokens = false);
 int64_t conditioned_cache_bytes(int capacity);
 void launch_conditioned_repair_cached(ConditionedArguments args, const int32_t* flags,
                                       const float* snapshot, void* workspace,

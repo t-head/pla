@@ -427,6 +427,62 @@ commit_kda_replayssm_after_verify(
 )
 ```
 
+## Decode: native request-row Verify/Commit records
+
+`pla.decode.kda_replayssm_vllm` is independent of a vLLM installation. Its
+`kda_replay_verify` and `KDAReplayCommitContext.commit` operate on paged FP32
+checkpoints and caller-owned request-row records. Select the record type when
+allocating a layer's `replay_records`; the Verify/Commit calls stay the same:
+
+| Record type | Per-token recurrence data | Full acceptance |
+| --- | --- | --- |
+| `KDAReplayRecords` (default) | BF16 raw K/V, FP32 log gate and beta | Replay the accepted prefix |
+| `KDACompactRecords` | FP32 normalized key, decay, value and beta; one FP32 terminal matrix per request | Publish the cached terminal state |
+| `KDACorrectionRecords` | FP32 normalized key, decay and rank-one correction vector | Fold corrections without recomputing state projections |
+
+Compact and correction records store recurrence vectors instead of a full
+matrix at every speculative step. They can use more memory than the default
+raw Replay records and are explicit choices, with no model/size dispatch.
+Compact keeps FP32 values because fused convolution produces FP32 operands.
+
+```python
+from pla.decode.kda_replayssm_vllm import (
+    KDACompactRecords, KDACorrectionRecords,
+    KDAReplayCommitContext, kda_replay_verify,
+)
+
+layer.replay_records = KDACompactRecords.allocate(R, H, Q, device)
+# Use KDACorrectionRecords.allocate(R, H, Q, device) for correction records.
+context = KDAReplayCommitContext.create([layer], Q, R, conv_state_layout="SD")
+out = kda_replay_verify(
+    mixed_qkv=mixed_qkv, raw_g=raw_g, raw_beta=raw_beta,
+    conv_weight=conv_weight, conv_state=layer.kv_cache[0],
+    checkpoint_state=layer.kv_cache[1], A_log=A_log, dt_bias=dt_bias,
+    lower_bound=lower_bound, records=layer.replay_records,
+    query_start_loc=query_start_loc, state_indices=state_indices,
+    conv_state_layout="SD",
+)
+plan = context.commit(num_sampled, state_indices, query_start_loc,
+                      token_capacity=mixed_qkv.shape[0])
+```
+
+All formats use FP32 recurrence arithmetic, BF16 output, the same convolution
+snapshots, accepted-prefix planning, sampler mapping and paged boundary recovery.
+Verify leaves persistent checkpoint/conv pages unchanged. Compact writes its
+private terminal buffer; Commit publishes the accepted prefix into the PLA
+checkpoint pool and leaves the records unchanged. Zero acceptance changes no
+persistent state. Partial acceptance replays operands for compact records or
+folds correction vectors for correction records. A full compact commit still
+replays any earlier page-boundary prefix that must also be published.
+
+Record capacity is `[R,H,Q,128]`, `1 <= Q <= 32`; per-request lengths may vary
+or be zero. Create the context outside graph capture and retain the same
+buffers/format across replays. All context layers must use one record format.
+External FlashKDA/RecoverSSM buffers have different layouts and cannot be passed
+directly. The legacy SGLang CACHE_RING signature above continues to use raw
+Replay records. Diagnostic FP64 repair applies only to the default raw format;
+the two optional formats retain FP32 arithmetic.
+
 ## Prefill: FlashQLA
 
 This implementation draws on the algorithm in the official
@@ -520,22 +576,35 @@ flashkda_fwd(
 )
 ```
 
-- `q/k/v/g`: contiguous bf16 `[T,H,128]`; `g` is the raw gate.
+- `q/k/v/g`: bf16 `[T,H,128]`; `g` is the raw gate. Arbitrary strided views
+  are accepted. Packed QKV token rows are consumed directly; other layouts
+  are staged on the current stream.
 - `beta`: bf16 `[T,H]` with contiguous heads and an int32-addressable token
   stride; it contains raw pre-sigmoid values.
 - `A_log`: contiguous fp32 `[H]`; `dt_bias`: contiguous fp32 `[H,128]`.
-- `out`: contiguous bf16 `[T,H,128]`, with no overlap with V or beta.
+- `out`: contiguous bf16 `[T,H,128]`, with no storage shared with inputs or states.
 - `scale` is finite; `lower_bound` is in `[-5,0]`.
 - `cu_seqlens` is optional contiguous `[N+1]`. int32 is native; int64 is accepted
   after range checking and conversion. `raw_cu_seqlens` is an optional matching
   host tuple. A padded physical suffix is zeroed.
-- `initial_state` and `final_state` are contiguous bf16/fp32
-  `[N,H,128,128]` and must share a dtype when both are present. They may alias
-  only as the exact same view.
+- `initial_state` and `final_state` are bf16/fp32 `[N,H,128,128]`, with arbitrary
+  strides, and must share a dtype when both are present. They may alias only
+  as the exact same view.
 - `state_pool [slots,H,128,128]` plus contiguous int32 `state_indices [N]`
   provides indexed in-place state. It is mutually exclusive with
   `initial_state`/`final_state`; active writable indices must be in range and
   unique.
+- Keyword-only `state_accum_dtype` selects TC02 resident-state precision:
+  `None` or `torch.float32` keeps the FP32 default; `torch.bfloat16` explicitly
+  enables BF16 carries. External state storage is independent of resident
+  precision. Preparation uses mixed precision; numerical repair
+  can recompute sensitive recurrences at higher precision; empty sequences
+  preserve external state exactly. TC01 retains its existing default backend
+  and rejects the explicit BF16 option.
+
+For packed BF16 context-parallel execution, provide matching `raw_cu_seqlens`
+host metadata. With device-only offsets, BF16 AUTO uses serial execution and
+avoids a host readback. Warm up the same plan before CUDA Graph capture.
 
 FlashKDAPro uses chunk size 16. Runtime capability `8.0` selects the tc01 path and
 `8.9` selects the tc02 path; other capabilities are rejected. On tc01,

@@ -104,24 +104,42 @@ struct IndexArg {
   int64_t stride = 1;
 };
 
+enum class RecordFormat : int { kReplay = 0, kCompact, kCorrection };
+inline constexpr int kPreparedRecordStride = 2 * 128 + 4;  // q, v, beta; float4-aligned rows
+
 // Native replay consumes paged checkpoints and request-row records.
 struct NativeVerify {
   int64_t state_slot_stride;
   int slots, tokens, null_block_id;
   int* precision_flags = nullptr;  // [request, head, value_tile=4], private scratch
+  RecordFormat format = RecordFormat::kReplay;
+  float* terminal = nullptr;      // compact only: [request, head, value, key]
+  float* prepared = nullptr;      // optional: [token, head, kPreparedRecordStride]
+  int row_splits = 1;
 };
+
+struct RecordVerifyPlan {
+  int row_splits = 1;
+  bool prepare = false;
+};
+RecordVerifyPlan record_verify_plan(int heads, int requests, int steps);
 
 // Columns in the persistent device table, one row per layer.
 enum ReplayColumn {
   kState = 0, kStateStride, kConv, kConvSlot, kConvChannel, kConvWindow,
   kRawV, kRawK, kGate, kBeta, kWindows, kReplayColumns
 };
+// Optional formats append one terminal-state pointer. Keep the default table
+// and kernels unchanged; correction records use a null terminal pointer.
+constexpr int kTerminal = kReplayColumns;
+constexpr int kStateRecordColumns = kReplayColumns + 1;
 
 struct NativeFold {
   const int64_t* layers;
   IndexArg final_indices;
   int slots;
   int* precision_flags = nullptr;  // [request, head_and_layer, value_tile=4]
+  IndexArg offsets{nullptr, false, 1};
 };
 
 void launch_verify_native(
@@ -141,13 +159,16 @@ void launch_fold_native(const int64_t* layers, IndexArg source,
                         IndexArg boundary, IndexArg boundary_lengths,
                         int nlayers, int batch, int heads, int Q, int slots,
                         int null_block_id, bool has_align, int* precision_flags,
-                        hggcStream_t stream);
+                        hggcStream_t stream,
+                        RecordFormat format = RecordFormat::kReplay,
+                        IndexArg offsets = {nullptr, false, 1});
 
 void launch_conv_native(const int64_t* layers, IndexArg lengths,
                         IndexArg final_indices, IndexArg boundary,
                         IndexArg boundary_lengths, int nlayers, int batch,
                         int heads, int Q, int slots, int null_block_id,
-                        hggcStream_t stream);
+                        hggcStream_t stream,
+                        RecordFormat format = RecordFormat::kReplay);
 
 void launch_fold(
     float* h0, const void* rawv, const void* rawk,

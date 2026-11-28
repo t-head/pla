@@ -722,10 +722,24 @@ __global__ void FLASHKDA_K1_LAUNCH_BOUNDS flashkda_prepare_kernel(
     // INV = INV*(I+L2)*(I+L4)*(I+L8), pow = L^2, L^4, L^8
     if constexpr (!FmaFront) if (tid < 32) {
         int lane = tid;
+#if defined(FLASHKDA_ARCH_150)
+        // Reuse the exact FP16 MMA result while it is still in registers.
+        // The proof adds no shared-memory read or explicit memory barrier.
+        auto power_is_zero = [](auto const& fragment) {
+            auto words = cute::recast<uint32_t>(fragment);
+            CUTE_STATIC_ASSERT_V(cute::size(words) == cute::Int<4>{});
+            const uint32_t magnitude = (words(0) | words(1) | words(2) | words(3)) & 0x7fff7fffu;
+            return __all_sync(0xffffffff, magnitude == 0);
+        };
+        bool zero_power = false;
+#endif
         // pow = L @ L
         {
             auto acc = fk::make_acc16_f16acc_1warp(lane);
             fk::gemm16_ss_1warp_f16acc(view16(sL), view16_T(sL), lane, acc);
+#if defined(FLASHKDA_ARCH_150)
+            zero_power = power_is_zero(acc);
+#endif
             fk::store_acc16_f16acc_1warp(acc, reinterpret_cast<__half*>(sPow), 16, lane);
         }
         __syncwarp();
@@ -736,6 +750,10 @@ __global__ void FLASHKDA_K1_LAUNCH_BOUNDS flashkda_prepare_kernel(
         }
         #pragma unroll
         for (int it = 0; it < 3; ++it) {
+#if defined(FLASHKDA_ARCH_150)
+            // Zero remains zero when squared; risky inverses keep the full path.
+            if (!risk && zero_power) break;
+#endif
             // tmp = INV @ pow ; INV += tmp
             {
                 auto acc = fk::make_acc16_f16acc_1warp(lane);
@@ -764,6 +782,9 @@ __global__ void FLASHKDA_K1_LAUNCH_BOUNDS flashkda_prepare_kernel(
                 // pow = pow @ pow
                 auto acc = fk::make_acc16_f16acc_1warp(lane);
                 fk::gemm16_ss_1warp_f16acc(view16(sPow), view16_T(sPow), lane, acc);
+#if defined(FLASHKDA_ARCH_150)
+                zero_power = power_is_zero(acc);
+#endif
                 // Both input fragments have already been loaded by the warp MMA.
                 auto* target = DirectNeumann ? sPow : sTmp;
                 fk::store_acc16_f16acc_1warp(acc, reinterpret_cast<__half*>(target), 16, lane);

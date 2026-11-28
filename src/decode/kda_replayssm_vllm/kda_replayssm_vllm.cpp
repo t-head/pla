@@ -20,6 +20,7 @@ namespace {
 using torch::Tensor;
 using pla::kda_mtp::IndexArg;
 using pla::kda_mtp::PlanInputs;
+using pla::kda_mtp::RecordFormat;
 using Optional = std::optional<Tensor>;
 constexpr int D = 128;
 
@@ -79,18 +80,40 @@ Tensor cache(const Tensor& conv, const Tensor& state, const std::string& layout,
               (ds.size(2) - 1) * ds.stride(2) + 1, "conv pages must not overlap");
   return ds;
 }
-void records(const Tensor& rv, const Tensor& rk, const Tensor& g, const Tensor& b,
-             const Tensor& windows, const Tensor& ref, int H, int Q, int R) {
+RecordFormat record_format(int mode) {
+  TORCH_CHECK(mode >= 0 && mode <= 2, "invalid KDA record format");
+  return static_cast<RecordFormat>(mode);
+}
+std::vector<Tensor> record_tensors(const Tensor& rv, const Tensor& rk, const Tensor& g,
+                                   const Optional& b, const Tensor& windows,
+                                   const Optional& terminal) {
+  std::vector<Tensor> result{rv, rk, g, windows};
+  if (b) result.push_back(*b);
+  if (terminal) result.push_back(*terminal);
+  return result;
+}
+void records(const Tensor& rv, const Tensor& rk, const Tensor& g, const Optional& b,
+             const Tensor& windows, const Optional& terminal, RecordFormat format,
+             const Tensor& ref, int H, int Q, int R) {
   TORCH_CHECK(Q >= 1 && Q <= 32 && R >= 0, "records require Q in [1,32] and R >= 0");
-  for (auto& t : {rv, rk, g, b, windows}) tensor(t, ref);
-  dense(rv, torch::kBFloat16, {R, H, Q, D});
-  dense(rk, torch::kBFloat16, {R, H, Q, D});
+  const auto tensors = record_tensors(rv, rk, g, b, windows, terminal);
+  for (const auto& t : tensors) tensor(t, ref);
+  const auto dtype = format == RecordFormat::kReplay ? torch::kBFloat16 : torch::kFloat32;
+  dense(rv, dtype, {R, H, Q, D});
+  dense(rk, dtype, {R, H, Q, D});
   dense(g, torch::kFloat32, {R, H, Q, D});
-  dense(b, torch::kFloat32, {R, H, Q});
+  TORCH_CHECK(bool(b) == (format != RecordFormat::kCorrection),
+              "only correction records omit beta");
+  if (b) dense(*b, torch::kFloat32, {R, H, Q});
   dense(windows, torch::kBFloat16, {R, Q, 3 * H * D, 3});
-  for (auto& t : {rv, rk, g, b})
+  TORCH_CHECK(bool(terminal) == (format == RecordFormat::kCompact),
+              "only compact records require a private terminal state");
+  if (terminal) dense(*terminal, torch::kFloat32, {R, H, D, D});
+  for (const auto& t : tensors) {
+    if (t.data_ptr() == windows.data_ptr()) continue;
     TORCH_CHECK(reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0,
                 "replay records must be 16-byte aligned");
+  }
 }
 
 // Conservative byte-span overlap check for writable outputs/records. Read-only
@@ -116,20 +139,25 @@ void disjoint(const std::vector<Tensor>& writes, const std::vector<Tensor>& read
 }
 
 std::vector<int64_t> layer_descriptor(Tensor conv, Tensor state, Tensor rv, Tensor rk,
-                                    Tensor gate, Tensor beta, Tensor windows,
-                                    std::string layout, int H, int slots, int Q, int R) {
+                                    Tensor gate, Optional beta, Tensor windows,
+                                    std::string layout, int H, int slots, int Q, int R,
+                                    int mode, Optional terminal) {
+  const auto format = record_format(mode);
   auto ds = cache(conv, state, layout, H, slots);
-  records(rv, rk, gate, beta, windows, state, H, Q, R);
-  disjoint({rv, rk, gate, beta, windows}, {conv, state});
+  records(rv, rk, gate, beta, windows, terminal, format, state, H, Q, R);
+  disjoint(record_tensors(rv, rk, gate, beta, windows, terminal), {conv, state});
   auto ptr = [](const Tensor& t) { return reinterpret_cast<int64_t>(t.data_ptr()); };
-  return {ptr(state), state.stride(0), ptr(conv), ds.stride(0), ds.stride(1),
-          ds.stride(2), ptr(rv), ptr(rk), ptr(gate), ptr(beta), ptr(windows)};
+  std::vector<int64_t> result{ptr(state), state.stride(0), ptr(conv), ds.stride(0), ds.stride(1),
+          ds.stride(2), ptr(rv), ptr(rk), ptr(gate), beta ? ptr(*beta) : 0, ptr(windows)};
+  if (format != RecordFormat::kReplay) result.push_back(terminal ? ptr(*terminal) : 0);
+  return result;
 }
 
 Tensor verify(Tensor x, Tensor g, Tensor beta, Tensor weight, Tensor conv, Tensor state,
             Tensor a, Tensor dt, Optional output, Tensor rv, Tensor rk, Tensor gate,
-            Tensor rb, Tensor windows, Tensor cu, Tensor source, std::string layout,
-            double scale, double lower_bound, int null) {
+            Optional rb, Tensor windows, Tensor cu, Tensor source, std::string layout,
+            double scale, double lower_bound, int null, int mode, Optional terminal) {
+  const auto format = record_format(mode);
   Tensor out = output ? *output : pla::bypass::output(
       {x.size(0), state.size(1) * D}, x.options().dtype(torch::kBFloat16));
   if (pla::instrument::show_params()) {
@@ -139,7 +167,8 @@ Tensor verify(Tensor x, Tensor g, Tensor beta, Tensor weight, Tensor conv, Tenso
       pla::instrument::dump_metadata("kda_replay_verify", {{"mixed_qkv", &x}, {"raw_g", &g},
           {"raw_beta", &beta}, {"conv_weight", &weight}, {"conv_state", &conv},
           {"checkpoint_state", &state}, {"A_log", &a}, {"dt_bias", &dt}, {"out", &out},
-          {"rawv", &rv}, {"rawk", &rk}, {"g", &gate}, {"beta", &rb},
+          {"rawv", &rv}, {"rawk", &rk}, {"g", &gate}, {"beta", rb ? &*rb : nullptr},
+          {"terminal_state", terminal ? &*terminal : nullptr},
           {"conv_snapshots", &windows}, {"query_start_loc", &cu}, {"state_indices", &source}},
           "instrument=HGTX conv_layout=" + layout);
   }
@@ -151,7 +180,7 @@ Tensor verify(Tensor x, Tensor g, Tensor beta, Tensor weight, Tensor conv, Tenso
   const int H = state.size(1), slots = state.size(0), Q = rv.size(2), R = rv.size(0);
   auto cs = cache(conv, state, layout, H, slots);
   const c10::cuda::CUDAGuard guard(state.device());
-  records(rv, rk, gate, rb, windows, state, H, Q, R);
+  records(rv, rk, gate, rb, windows, terminal, format, state, H, Q, R);
   for (auto& t : {x, g, beta, weight, a, dt, out, cu, source}) tensor(t, state);
   TORCH_CHECK(x.dim() == 2 && x.size(0) <= INT32_MAX &&
               x.size(1) == 3 * H * D && x.stride(1) == 1 &&
@@ -176,7 +205,9 @@ Tensor verify(Tensor x, Tensor g, Tensor beta, Tensor weight, Tensor conv, Tenso
   indices(cu, state); indices(source, state);
   const int N = source.numel();
   TORCH_CHECK(cu.numel() == N + 1 && N <= R, "query index count exceeds record capacity");
-  disjoint({out, rv, rk, gate, rb, windows},
+  auto writes = record_tensors(rv, rk, gate, rb, windows, terminal);
+  writes.push_back(out);
+  disjoint(writes,
            {x, g, beta, weight, conv, state, a, dt, cu, source});
   const pla::sanity::Context sanity("kda_replay_verify", state);
   if (sanity.values_enabled()) {
@@ -212,20 +243,32 @@ Tensor verify(Tensor x, Tensor g, Tensor beta, Tensor weight, Tensor conv, Tenso
   Tensor precision_flags;
   int* precision_flags_ptr = nullptr;
   if constexpr (pla::kda_mtp::kNativeNumericalProtection) {
-    if (pla::kda_mtp::current_device_is_ppu15()) {
+    if (format == RecordFormat::kReplay && pla::kda_mtp::current_device_is_ppu15()) {
       precision_flags = torch::empty({N, H, 4}, state.options().dtype(torch::kInt32));
       precision_flags_ptr = precision_flags.data_ptr<int>();
     }
   }
+  auto record_plan = format == RecordFormat::kReplay
+      ? pla::kda_mtp::RecordVerifyPlan{} : pla::kda_mtp::record_verify_plan(H, N, Q);
+  // PREPARE loads each four-tap filter with float4. Contiguous offset views
+  // can be unaligned; retain their existing scalar-weight verify path.
+  if (record_plan.prepare && (reinterpret_cast<uintptr_t>(weight.data_ptr()) & 15) != 0)
+    record_plan = {};
+  Tensor prepared;
+  if (record_plan.prepare)
+    prepared = torch::empty({T, H, pla::kda_mtp::kPreparedRecordStride}, state.options());
   pla::kda_mtp::launch_verify_native(xp, xp + channel_bytes, xp + 2 * channel_bytes,
       g.data_ptr(), beta.data_ptr(), weight.data_ptr<float>(),
       weight.data_ptr<float>() + H * D * 4, weight.data_ptr<float>() + 2 * H * D * 4,
       cp, cp + channel_bytes * cs.stride(1), cp + 2 * channel_bytes * cs.stride(1),
       a.data_ptr<float>(), dt.data_ptr<float>(), state.data_ptr<float>(), out.data_ptr(),
       wp, wp + channel_bytes * windows.stride(2), wp + 2 * channel_bytes * windows.stride(2),
-      rv.data_ptr(), rk.data_ptr(), gate.data_ptr<float>(), rb.data_ptr<float>(),
+      rv.data_ptr(), rk.data_ptr(), gate.data_ptr<float>(), rb ? rb->data_ptr<float>() : nullptr,
       index(source), index(cu), H, N, Q, scale, lower_bound, strides,
-      {state.stride(0), slots, T, null, precision_flags_ptr}, pla::current_stream());
+      {state.stride(0), slots, T, null, precision_flags_ptr, format,
+       terminal ? terminal->data_ptr<float>() : nullptr,
+       prepared.defined() ? prepared.data_ptr<float>() : nullptr, record_plan.row_splits},
+      pla::current_stream());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
 }
@@ -233,7 +276,8 @@ Tensor verify(Tensor x, Tensor g, Tensor beta, Tensor weight, Tensor conv, Tenso
 void commit(Tensor table, Tensor candidate, Tensor plan, Tensor sampled, Tensor source,
             Tensor cu, Optional mapping, Optional blocks, Optional computed,
             int64_t block_size, int H, int slots, int Q, int null,
-            int64_t token_capacity) {
+            int64_t token_capacity, int mode) {
+  const auto format = record_format(mode);
   if (pla::instrument::show_params()) {
       pla::instrument::dump_case(source.numel(), Q, D, D, H, H, "bf16", true, &cu);
       pla::instrument::dump_metadata("kda_replay_commit", {{"layers", &table},
@@ -248,7 +292,8 @@ void commit(Tensor table, Tensor candidate, Tensor plan, Tensor sampled, Tensor 
   TORCH_CHECK(token_capacity >= 0 && token_capacity <= INT32_MAX,
               "token_capacity must be between 0 and INT32_MAX");
   TORCH_CHECK(table.is_cuda() && table.dim() == 2 && table.size(0) > 0 &&
-              table.size(1) == pla::kda_mtp::kReplayColumns && table.is_contiguous() &&
+              table.size(1) == (format == RecordFormat::kReplay ?
+                  pla::kda_mtp::kReplayColumns : pla::kda_mtp::kStateRecordColumns) && table.is_contiguous() &&
               table.scalar_type() == torch::kInt64, "invalid layer pointer table");
   const c10::cuda::CUDAGuard guard(table.device());
   TORCH_CHECK(plan.dim() == 2 && plan.size(0) == 4 && Q >= 1 && Q <= 32 &&
@@ -329,7 +374,7 @@ void commit(Tensor table, Tensor candidate, Tensor plan, Tensor sampled, Tensor 
   Tensor precision_flags;
   int* precision_flags_ptr = nullptr;
   if constexpr (pla::kda_mtp::kNativeNumericalProtection) {
-    if (pla::kda_mtp::current_device_is_ppu15()) {
+    if (format == RecordFormat::kReplay && pla::kda_mtp::current_device_is_ppu15()) {
       // Initialize the contiguous buffer once instead of issuing one tiny reset
       // store from every fold CTA. The operation is captured with graph replay.
       precision_flags = torch::zeros({N, table.size(0) * H, 4},
@@ -342,9 +387,9 @@ void commit(Tensor table, Tensor candidate, Tensor plan, Tensor sampled, Tensor 
   const IndexArg lens{p, false, 1}, final{p + R, false, 1}, boundary{p + 2 * R, false, 1}, bc{p + 3 * R, false, 1};
   pla::kda_mtp::launch_fold_native(table.data_ptr<int64_t>(), index(source), lens, final, boundary, bc,
                                  table.size(0), N, H, Q, slots, null, block_size != 0,
-                                 precision_flags_ptr, stream);
+                                 precision_flags_ptr, stream, format, index(cu));
   pla::kda_mtp::launch_conv_native(table.data_ptr<int64_t>(), lens, final, boundary, bc,
-                                 table.size(0), N, H, Q, slots, null, stream);
+                                 table.size(0), N, H, Q, slots, null, stream, format);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 }  // namespace
@@ -353,7 +398,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   (void)pla::bypass::enabled();
   (void)pla::instrument::show_params();
   (void)perf_instrument();
-  m.def("verify", &verify);
-  m.def("layer_descriptor", &layer_descriptor);
-  m.def("commit", &commit);
+  namespace py = pybind11;
+  m.def("verify", &verify, py::arg("x"), py::arg("g"), py::arg("beta"),
+        py::arg("weight"), py::arg("conv"), py::arg("state"), py::arg("a"), py::arg("dt"),
+        py::arg("output"), py::arg("rv"), py::arg("rk"), py::arg("gate"), py::arg("rb"),
+        py::arg("windows"), py::arg("cu"), py::arg("source"), py::arg("layout"),
+        py::arg("scale"), py::arg("lower_bound"), py::arg("null"),
+        py::arg("mode") = 0, py::arg("terminal") = py::none());
+  m.def("layer_descriptor", &layer_descriptor, py::arg("conv"), py::arg("state"),
+        py::arg("rv"), py::arg("rk"), py::arg("gate"), py::arg("beta"), py::arg("windows"),
+        py::arg("layout"), py::arg("H"), py::arg("slots"), py::arg("Q"), py::arg("R"),
+        py::arg("mode") = 0, py::arg("terminal") = py::none());
+  m.def("commit", &commit, py::arg("table"), py::arg("candidate"), py::arg("plan"),
+        py::arg("sampled"), py::arg("source"), py::arg("cu"), py::arg("mapping"),
+        py::arg("blocks"), py::arg("computed"), py::arg("block_size"), py::arg("H"),
+        py::arg("slots"), py::arg("Q"), py::arg("null"), py::arg("token_capacity"),
+        py::arg("mode") = 0);
 }

@@ -111,6 +111,8 @@ class DispatchTests(unittest.TestCase):
         self.addCleanup(modules.stop)
         torch = types.ModuleType('torch')
         torch.Tensor = HostTensor
+        torch.dtype = type('dtype', (), {})
+        torch.float32, torch.bfloat16 = 'torch.float32', 'torch.bfloat16'
         torch.int32, torch.int64 = 'torch.int32', 'torch.int64'
         torch.cuda = types.SimpleNamespace(
             get_device_capability=Mock(return_value=(8, 0)),

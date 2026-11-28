@@ -370,22 +370,36 @@ __device__ __forceinline__ bool copyable_pair(unsigned pair) {
     return copyable_bias(static_cast<unsigned short>(pair)) && copyable_bias(pair >> 16);
 }
 
+template <bool PreparedBiasProof, bool BiasCarriesPrepared = false>
 __global__ void __launch_bounds__(MERGE_THREADS, 1) flashkda_cp_merge_proof_kernel(
     const BF16* chain, const void* initial, const int32_t* indices, bool state_fp32,
-    BF16* carries, const int* mapping, const int32_t* zero_slices, int heads, int segments) {
+    BF16* carries, const int* mapping, const int32_t* zero_slices, int heads, int segments, const int32_t* skip_heads) {
     const int tid = threadIdx.x, seq = blockIdx.y, head = blockIdx.z;
+    if (skip_heads && skip_heads[seq * heads + head]) return;
     const int first = mapping[2 * seq], count = mapping[2 * seq + 1];
     const int64_t stride = int64_t(heads) * DV * DK;
     const int64_t lane_offset = int64_t(head) * DV * DK + int(blockIdx.x) * BVM * DK + tid * 8;
     static_assert(MERGE_THREADS * sizeof(uint4) == MergeSmem::C_BYTES);
     const uint4 init = initial_vector(initial, indices, state_fp32, seq, stride, lane_offset);
     bool copy = finite_pair(init.x) && finite_pair(init.y) && finite_pair(init.z) && finite_pair(init.w);
-    for (int i = 0; i < count - 1; ++i) {
-        const int index = ((first + i) * heads + head) * 2;
-        const uint4 bias = *reinterpret_cast<const uint4*>(chain + int64_t(first + i) * stride + lane_offset);
-        copy &= zero_slices[index] && zero_slices[index + 1]
-             && copyable_pair(bias.x) && copyable_pair(bias.y)
-             && copyable_pair(bias.z) && copyable_pair(bias.w);
+    if constexpr (PreparedBiasProof) {
+        // The producer proves complete row slices. Partition those checks
+        // across the CTA and include them in the existing all-thread vote.
+        // Uncertain bias uses the original full merge, retaining its handling
+        // of signed zero, subnormals and nonfinite values.
+        for (int i = tid; i < count - 1; i += MERGE_THREADS) {
+            const int index = ((first + i) * heads + head) * 2;
+            const int lo = zero_slices[index], hi = zero_slices[index + 1];
+            copy &= (lo & 5) == 5 && (hi & 5) == 5;
+        }
+    } else {
+        for (int i = 0; i < count - 1; ++i) {
+            const int index = ((first + i) * heads + head) * 2;
+            const uint4 bias = *reinterpret_cast<const uint4*>(chain + int64_t(first + i) * stride + lane_offset);
+            copy &= zero_slices[index] && zero_slices[index + 1]
+                 && copyable_pair(bias.x) && copyable_pair(bias.y)
+                 && copyable_pair(bias.z) && copyable_pair(bias.w);
+        }
     }
     __shared__ int warp_copy[MERGE_THREADS / WARP];
     const int agree = __all_sync(0xffffffff, copy);
@@ -399,10 +413,11 @@ __global__ void __launch_bounds__(MERGE_THREADS, 1) flashkda_cp_merge_proof_kern
         return;
     }
     *reinterpret_cast<uint4*>(carries + int64_t(first) * stride + lane_offset) = init;
-    for (int i = 0; i < count - 1; ++i) {
-        const int64_t offset = int64_t(first + i) * stride + lane_offset;
-        *reinterpret_cast<uint4*>(carries + offset + stride) = *reinterpret_cast<const uint4*>(chain + offset);
-    }
+    if constexpr (!BiasCarriesPrepared)
+        for (int i = 0; i < count - 1; ++i) {
+            const int64_t offset = int64_t(first + i) * stride + lane_offset;
+            *reinterpret_cast<uint4*>(carries + offset + stride) = *reinterpret_cast<const uint4*>(chain + offset);
+        }
 }
 
 }  // namespace flashkda_cute_cp
@@ -459,11 +474,15 @@ void launch_flashkda_cp_merge_short_auto(
 void launch_flashkda_cp_merge_zero_flags(
     const void* chain, const void* initial, void* carries, const int32_t* indices,
     bool state_fp32, const int* mapping, const int32_t* zero_slices,
-    int heads, int sequences, int segments, hggcStream_t stream) {
+    int heads, int sequences, int segments, hggcStream_t stream, bool prepared_bias, const int32_t* skip_heads) {
     namespace cp = flashkda_cute_cp;
-    auto kernel = cp::flashkda_cp_merge_proof_kernel;
-    hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, cp::MergeSmem::BYTES);
-    kernel<<<dim3(cp::DV / cp::BVM, sequences, heads), cp::MERGE_THREADS, cp::MergeSmem::BYTES, stream>>>(
-        static_cast<const cp::BF16*>(chain), initial, indices, state_fp32,
-        static_cast<cp::BF16*>(carries), mapping, zero_slices, heads, segments);
+    auto launch=[&](auto prepared) {
+        auto kernel=cp::flashkda_cp_merge_proof_kernel<decltype(prepared)::value, decltype(prepared)::value>;
+        hggcFuncSetAttribute(kernel,hggcFuncAttributeMaxDynamicSharedMemorySize,cp::MergeSmem::BYTES);
+        kernel<<<dim3(cp::DV/cp::BVM,sequences,heads),cp::MERGE_THREADS,cp::MergeSmem::BYTES,stream>>>(
+            static_cast<const cp::BF16*>(chain),initial,indices,state_fp32,
+            static_cast<cp::BF16*>(carries),mapping,zero_slices,heads,segments,skip_heads);
+    };
+    if (prepared_bias) launch(std::true_type{});
+    else launch(std::false_type{});
 }

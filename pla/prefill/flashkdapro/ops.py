@@ -85,6 +85,9 @@ def flashkda_fwd(
     state_pool: Optional[torch.Tensor] = None,      # [slots,H,DV,DK] bf16/fp32 (in-place)
     state_indices: Optional[torch.Tensor] = None,   # [N] int32 cache slots
     raw_cu_seqlens: Optional[Tuple[int, ...]] = None,  # trusted Host offsets
+    *, state_accum_dtype: Optional[torch.dtype] = None,
+    track_state: Optional[torch.Tensor] = None,
+    track_chunk_idx: Optional[torch.Tensor] = None,
 ) -> None:
     """FlashKDA prefill forward. Writes ``out`` (and ``final_state`` if given).
 
@@ -109,7 +112,8 @@ def flashkda_fwd(
             starts from a zero state.
         final_state: ``[N, H, DV, DK]`` bf16 or fp32, any strides. Written with
             the state after the last chunk; ``None`` skips computing it. When
-            both states are given their dtypes must match. It must not share
+            both states are given their dtypes may differ with FP32 resident
+            accumulation on TC02. It must not share
             storage with ``out``.
         cu_seqlens: ``[N+1]`` int32 prefix offsets for packed/varlen input.
             Legacy int64 input is accepted when its endpoint fits in int32.
@@ -122,6 +126,21 @@ def flashkda_fwd(
         state_indices: ``[N]`` contiguous int32 cache slots. Indices must be in
             range and unique within the batch. Serving owns this invariant, so
             the hot path intentionally performs no device-to-host validation.
+        state_accum_dtype: TC02 resident-state precision, independent of state
+            storage. None/float32 retain FP32; bfloat16 opts into BF16 carries.
+            Preparation and numerical repair use their own arithmetic.
+            Empty rows preserve storage exactly. TC01 keeps its default backend.
+        track_state: Optional TC02 write-only, contiguous FP32 ``[N,H,128,128]``
+            checkpoint, 16B aligned and disjoint from every other argument.
+            Enables serial recurrence with checkpoint export for either resident
+            precision; omitting it retains the ordinary dispatch.
+        track_chunk_idx: Contiguous device int32/int64 ``[N]``, supplied together
+            with track_state. Index j snapshots before sequence-local 64-token
+            chunk j. Zero copies the external input state (or zeros), including
+            empty requests; positive j must be strictly interior. Other indices,
+            including -1, leave the corresponding checkpoint row untouched.
+            Indices are read afresh on every Graph replay; snapshots are never
+            fed back into the recurrence.
         raw_cu_seqlens: Trusted Host copy of ``cu_seqlens`` values. Serving can
             pass the request metadata offsets so the CP planner never reads the
             device tensor back to the CPU. Plans and their device descriptor
@@ -156,9 +175,17 @@ def flashkda_fwd(
     Explicit splits do not select state automatically. A non-state algorithm
     override keeps H4 AUTO serial and disables device-only AUTO CP.
     """
+    if state_accum_dtype not in (None, torch.float32, torch.bfloat16):
+        raise ValueError("state_accum_dtype must be None, torch.float32, or torch.bfloat16")
+    if (track_state is None) != (track_chunk_idx is None):
+        raise ValueError("track_state and track_chunk_idx must be supplied together")
     if not q.is_cuda:
         raise ValueError("q must be a CUDA tensor")
     backend = select_backend(torch.cuda.get_device_capability(q.device))
+    if track_state is not None and torch.cuda.get_device_capability(q.device) != (8, 9):
+        raise ValueError("state tracking requires TC02")
+    if state_accum_dtype is torch.bfloat16 and torch.cuda.get_device_capability(q.device) != (8, 9):
+        raise ValueError("BF16 state accumulation requires TC02")
     if backend == 'fla':
         # An explicit IMPL takes precedence over the frozen rules; rule diversion runs only without an explicit override,
         # and the decision consumes only host integers and tensor shapes (no hot-path D2H); replay does not re-select.
@@ -178,7 +205,9 @@ def flashkda_fwd(
                          ("final_state", final_state),
                          ("cu_seqlens", cu_seqlens),
                          ("state_pool", state_pool),
-                         ("state_indices", state_indices)):
+                         ("state_indices", state_indices),
+                         ("track_state", track_state),
+                         ("track_chunk_idx", track_chunk_idx)):
         if tensor is not None and tensor.device != q.device:
             raise ValueError(f"{name} must be on {q.device}, got {tensor.device}")
 
@@ -218,8 +247,12 @@ def flashkda_fwd(
         else:
             cu32 = cu_seqlens.contiguous()
 
+    precision = {"state_accum_fp32": False} if state_accum_dtype is torch.bfloat16 else {}
+    if track_state is not None:
+        precision.update(track_state=track_state, track_chunk_idx=track_chunk_idx)
     flashkda_cute.flashkda_fwd(
         q, k, v, g, beta, A_log, dt_bias, out,
         float(scale), float(lower_bound), initial_state, final_state, cu32,
         state_indices, raw_cu_seqlens,
+        **precision
     )
