@@ -17,6 +17,18 @@ def _raw_admitted(heads, key_heads, lengths, tokens):
 
     if (heads, key_heads) == (64, 8):
         return batch == 2 and 8192 <= tokens <= 12288
+    if (heads, key_heads) == (12, 4) and 8 <= batch <= 64 and tokens >= 8704:
+        prefill = tuple(length for length in lengths if length > 1)
+        if not (3 <= len(prefill) <= 6 and 2 * len(prefill) <= batch):
+            return False
+        # Fold enough coefficient work to offset launch cost, within the
+        # validated weak-decay precision range.
+        if (sum(prefill) >= 8704 and min(prefill) >= 2048
+                and 3072 <= max(prefill) <= 3584):
+            return True
+        # Retain the calibrated long mixed batch.
+        return (batch == 15 and len(prefill) == 4 and 19456 <= tokens <= 20480
+                and all(4096 <= length <= 6144 for length in prefill))
     if (heads, key_heads) == (32, 4) and batch == 3 and tokens == 8192:
         # The long row dominates this grid. Fold the per-chunk coefficients
         # while retaining the existing automatic CP decision.
